@@ -496,13 +496,25 @@ fn enabled() -> bool {
 /// from a plain one at the type level. Anything that does not qualify gets a plain copy, so
 /// this is safe to call for every `q8_0` tensor a file contains.
 pub fn q8_0_storage(src: &[BlockQ8_0], dims: &[usize]) -> super::QStorage {
+    interleaved(src, dims).unwrap_or_else(|| super::QStorage::Cpu(Box::new(src.to_vec())))
+}
+
+/// Same layout decision as [`q8_0_storage`], for a block stream this call owns.
+///
+/// Quantizing in process produces the blocks rather than borrowing them from a mapped file, so
+/// the plain path can move the vector instead of copying the whole weight.
+pub fn q8_0_storage_owned(src: Vec<BlockQ8_0>, dims: &[usize]) -> super::QStorage {
+    interleaved(&src, dims).unwrap_or_else(|| super::QStorage::Cpu(Box::new(src)))
+}
+
+fn interleaved(src: &[BlockQ8_0], dims: &[usize]) -> Option<super::QStorage> {
     if enabled() && is_eligible(dims) {
         // Interleaving is an optimization; a shape we mis-judged just keeps the plain layout.
         if let Ok(packed) = Q8_0x4::from_q8_0(src, dims[0], dims[1]) {
-            return super::QStorage::Cpu(Box::new(packed));
+            return Some(super::QStorage::Cpu(Box::new(packed)));
         }
     }
-    super::QStorage::Cpu(Box::new(src.to_vec()))
+    None
 }
 
 #[cfg(test)]
@@ -638,6 +650,49 @@ mod tests {
             )
         };
         assert_eq!(stored_bytes(&**storage), want, "ineligible shape must be stored verbatim");
+    }
+
+    /// The point of the in-process hook: a weight quantized by `QTensor::quantize_f32` must be
+    /// byte-for-byte the storage the GGUF loader would have built for the same weight, so a
+    /// model has the same layout (and so the same kernel) whichever way it was loaded.
+    #[test]
+    fn quantize_f32_matches_the_gguf_layout() {
+        for (n, k) in [(8, 128), (6, 64) /* ineligible: n % NCOLS != 0 */] {
+            let raw: Vec<f32> =
+                (0..n * k).map(|i| ((i * 37 % 211) as f32 - 105.0) / 64.0).collect();
+            let mut plain = vec![BlockQ8_0::zeros(); n * k / QK8_0];
+            BlockQ8_0::from_float(&raw, &mut plain).unwrap();
+
+            let from_file = q8_0_storage(&plain, &[n, k]);
+            let in_process =
+                crate::quantized::QTensor::quantize_f32(&raw, &vec![n, k].into(), GgmlDType::Q8_0)
+                    .unwrap();
+            let crate::quantized::QStorage::Cpu(from_file) = &from_file;
+            let crate::quantized::QStorage::Cpu(in_process_storage) = &in_process.storage;
+            assert_eq!(
+                stored_bytes(&**in_process_storage),
+                stored_bytes(&**from_file),
+                "[{n}, {k}]: in-process layout must match the loader's"
+            );
+
+            // And it still answers matmuls and hands back canonical bytes.
+            let m = 3;
+            let lhs: Vec<f32> = (0..m * k).map(|i| ((i * 53 % 173) as f32 - 86.0) / 32.0).collect();
+            let want = ref_matmul(&plain, &lhs, m, k, n);
+            let mut got = vec![0f32; m * n];
+            in_process.matmul_t((m, k, n), &lhs, &mut got).unwrap();
+            for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                let tol = 1e-3 * w.abs().max(1.0);
+                assert!((g - w).abs() <= tol, "[{n}, {k}] idx={i}: got {g}, want {w}");
+            }
+            let canonical = unsafe {
+                std::slice::from_raw_parts(
+                    plain.as_ptr() as *const u8,
+                    std::mem::size_of_val(plain.as_slice()),
+                )
+            };
+            assert_eq!(in_process.data().unwrap().as_ref(), canonical, "[{n}, {k}] canonical");
+        }
     }
 
     #[test]
