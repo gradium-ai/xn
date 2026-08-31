@@ -248,9 +248,9 @@ fn matmul_interleaved(
     kb: usize,
 ) {
     let ngroups = n / NCOLS;
+    let nth = crate::threadpool::size();
 
-    // Each worker owns a contiguous run of column groups, so it walks one unbroken span of the
-    // weight buffer and writes a disjoint set of dst columns.
+    // Each worker writes a disjoint set of dst columns.
     // Pointers travel as `usize` so the closure stays `Send + Sync` without a wrapper type.
     let job = Job {
         w: w.as_ptr() as usize,
@@ -261,26 +261,21 @@ fn matmul_interleaved(
         kb,
     };
 
-    if ngroups == 1 {
-        // SAFETY: one range, covering the output exactly once.
+    if nth == 1 || ngroups == 1 {
+        // SAFETY: single worker, so the one range covers the output exactly once.
         unsafe { job.run(0, ngroups) };
         return;
     }
-    // A single-participant pool runs this inline, so a one-worker build pays no join.
-    crate::threadpool::dispatch(|ith, nth| {
-        let duty = ngroups.div_ceil(nth);
-        let g0 = (duty * ith).min(ngroups);
-        let g1 = (g0 + duty).min(ngroups);
-        if g0 == g1 {
-            return;
-        }
-        // SAFETY: the `[g0, g1)` ranges are disjoint across `ith`, so the columns written
-        // through `job.c` never alias. Bounds were checked by the caller.
-        unsafe { job.run(g0, g1) };
+    // Column groups are handed out on demand rather than split evenly: on a hybrid CPU an
+    // equal split makes every matmul wait for the slowest core.
+    crate::threadpool::par_units(ngroups, |g| {
+        // SAFETY: each group goes to exactly one worker, so the columns written through
+        // `job.c` never alias. Bounds were checked by the caller.
+        unsafe { job.run(g, g + 1) };
     });
 }
 
-/// One matmul's operands, as addresses so the dispatched closure needs no wrapper type.
+/// One matmul's operands, as addresses so the dispatch closure needs no wrapper type.
 #[derive(Clone, Copy)]
 struct Job {
     w: usize,
