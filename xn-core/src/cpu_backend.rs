@@ -226,38 +226,41 @@ impl crate::Backend for crate::CpuDevice {
         len: usize,
         op: UnaryOp,
     ) -> Result<()> {
+        let chunk = unary_chunk(op, len);
         match op {
-            UnaryOp::Cos => apply_inplace_unary(&mut dst[..len], |v| *v = v.cos()),
-            UnaryOp::Sin => apply_inplace_unary(&mut dst[..len], |v| *v = v.sin()),
-            UnaryOp::Exp => apply_inplace_unary(&mut dst[..len], |v| *v = v.exp()),
-            UnaryOp::Log => apply_inplace_unary(&mut dst[..len], |v| *v = v.ln()),
-            UnaryOp::Neg => apply_inplace_unary(&mut dst[..len], |v| *v = T::zero() - *v),
-            UnaryOp::Sqr => apply_inplace_unary(&mut dst[..len], |v| *v = *v * *v),
-            UnaryOp::Sqrt => apply_inplace_unary(&mut dst[..len], |v| *v = v.sqrt()),
-            UnaryOp::Rsqrt => apply_inplace_unary(&mut dst[..len], |v| *v = T::one() / v.sqrt()),
-            UnaryOp::Abs => apply_inplace_unary(&mut dst[..len], |v| *v = v.abs()),
+            UnaryOp::Cos => apply_inplace_unary(chunk, &mut dst[..len], |v| *v = v.cos()),
+            UnaryOp::Sin => apply_inplace_unary(chunk, &mut dst[..len], |v| *v = v.sin()),
+            UnaryOp::Exp => apply_inplace_unary(chunk, &mut dst[..len], |v| *v = v.exp()),
+            UnaryOp::Log => apply_inplace_unary(chunk, &mut dst[..len], |v| *v = v.ln()),
+            UnaryOp::Neg => apply_inplace_unary(chunk, &mut dst[..len], |v| *v = T::zero() - *v),
+            UnaryOp::Sqr => apply_inplace_unary(chunk, &mut dst[..len], |v| *v = *v * *v),
+            UnaryOp::Sqrt => apply_inplace_unary(chunk, &mut dst[..len], |v| *v = v.sqrt()),
+            UnaryOp::Rsqrt => {
+                apply_inplace_unary(chunk, &mut dst[..len], |v| *v = T::one() / v.sqrt())
+            }
+            UnaryOp::Abs => apply_inplace_unary(chunk, &mut dst[..len], |v| *v = v.abs()),
             UnaryOp::GeluErf => {
                 let sqrt_2_inv = std::f32::consts::FRAC_1_SQRT_2;
-                apply_inplace_unary(&mut dst[..len], |v| {
+                apply_inplace_unary(chunk, &mut dst[..len], |v| {
                     let x = v.to_f32();
                     let erf_val = libm::erff(x * sqrt_2_inv);
                     *v = T::from_f32(x * 0.5 * (1.0 + erf_val));
                 })
             }
-            UnaryOp::Elu { alpha } => apply_inplace_unary(&mut dst[..len], |v| {
+            UnaryOp::Elu { alpha } => apply_inplace_unary(chunk, &mut dst[..len], |v| {
                 let x = v.to_f32();
                 *v = T::from_f32(if x > 0.0 { x } else { alpha * (x.exp() - 1.0) });
             }),
-            UnaryOp::Relu => apply_inplace_unary(&mut dst[..len], |v| {
+            UnaryOp::Relu => apply_inplace_unary(chunk, &mut dst[..len], |v| {
                 if *v < T::zero() {
                     *v = T::zero()
                 }
             }),
-            UnaryOp::Silu => apply_inplace_unary(&mut dst[..len], |v| {
+            UnaryOp::Silu => apply_inplace_unary(chunk, &mut dst[..len], |v| {
                 *v = *v / (T::one() + (T::zero() - *v).exp())
             }),
-            UnaryOp::Tanh => apply_inplace_unary(&mut dst[..len], |v| *v = v.tanh()),
-            UnaryOp::Sigmoid => apply_inplace_unary(&mut dst[..len], |v| {
+            UnaryOp::Tanh => apply_inplace_unary(chunk, &mut dst[..len], |v| *v = v.tanh()),
+            UnaryOp::Sigmoid => apply_inplace_unary(chunk, &mut dst[..len], |v| {
                 *v = T::one() / (T::one() + (T::zero() - *v).exp())
             }),
         }
@@ -270,37 +273,45 @@ impl crate::Backend for crate::CpuDevice {
         len: usize,
         op: UnaryOp,
     ) -> Result<()> {
+        let chunk = unary_chunk(op, len);
         match op {
-            UnaryOp::Cos => apply_unary(&mut dst[..len], &src[..len], |s| s.cos()),
-            UnaryOp::Sin => apply_unary(&mut dst[..len], &src[..len], |s| s.sin()),
-            UnaryOp::Exp => apply_unary(&mut dst[..len], &src[..len], |s| s.exp()),
-            UnaryOp::Log => apply_unary(&mut dst[..len], &src[..len], |s| s.ln()),
-            UnaryOp::Neg => apply_unary(&mut dst[..len], &src[..len], |s| T::zero() - s),
-            UnaryOp::Sqr => apply_unary(&mut dst[..len], &src[..len], |s| s * s),
-            UnaryOp::Sqrt => apply_unary(&mut dst[..len], &src[..len], |s| s.sqrt()),
-            UnaryOp::Rsqrt => apply_unary(&mut dst[..len], &src[..len], |s| T::one() / s.sqrt()),
-            UnaryOp::Abs => apply_unary(&mut dst[..len], &src[..len], |s| s.abs()),
+            UnaryOp::Cos => apply_unary(chunk, &mut dst[..len], &src[..len], |s| s.cos()),
+            UnaryOp::Sin => apply_unary(chunk, &mut dst[..len], &src[..len], |s| s.sin()),
+            UnaryOp::Exp => apply_unary(chunk, &mut dst[..len], &src[..len], |s| s.exp()),
+            UnaryOp::Log => apply_unary(chunk, &mut dst[..len], &src[..len], |s| s.ln()),
+            UnaryOp::Neg => apply_unary(chunk, &mut dst[..len], &src[..len], |s| T::zero() - s),
+            UnaryOp::Sqr => apply_unary(chunk, &mut dst[..len], &src[..len], |s| s * s),
+            UnaryOp::Sqrt => apply_unary(chunk, &mut dst[..len], &src[..len], |s| s.sqrt()),
+            UnaryOp::Rsqrt => {
+                apply_unary(chunk, &mut dst[..len], &src[..len], |s| T::one() / s.sqrt())
+            }
+            UnaryOp::Abs => apply_unary(chunk, &mut dst[..len], &src[..len], |s| s.abs()),
             UnaryOp::GeluErf => {
                 let sqrt_2_inv = std::f32::consts::FRAC_1_SQRT_2;
-                apply_unary(&mut dst[..len], &src[..len], |s| {
+                apply_unary(chunk, &mut dst[..len], &src[..len], |s| {
                     let x = s.to_f32();
                     let erf_val = libm::erff(x * sqrt_2_inv);
                     T::from_f32(x * 0.5 * (1.0 + erf_val))
                 })
             }
-            UnaryOp::Elu { alpha } => apply_unary(&mut dst[..len], &src[..len], |s| {
+            UnaryOp::Elu { alpha } => apply_unary(chunk, &mut dst[..len], &src[..len], |s| {
                 let x = s.to_f32();
                 T::from_f32(if x > 0.0 { x } else { alpha * (x.exp() - 1.0) })
             }),
             UnaryOp::Relu => {
                 let zero = T::zero();
-                apply_unary(&mut dst[..len], &src[..len], |s| if s < zero { zero } else { s })
+                apply_unary(
+                    chunk,
+                    &mut dst[..len],
+                    &src[..len],
+                    |s| if s < zero { zero } else { s },
+                )
             }
-            UnaryOp::Silu => apply_unary(&mut dst[..len], &src[..len], |s| {
+            UnaryOp::Silu => apply_unary(chunk, &mut dst[..len], &src[..len], |s| {
                 s / (T::one() + (T::zero() - s).exp())
             }),
-            UnaryOp::Tanh => apply_unary(&mut dst[..len], &src[..len], |s| s.tanh()),
-            UnaryOp::Sigmoid => apply_unary(&mut dst[..len], &src[..len], |s| {
+            UnaryOp::Tanh => apply_unary(chunk, &mut dst[..len], &src[..len], |s| s.tanh()),
+            UnaryOp::Sigmoid => apply_unary(chunk, &mut dst[..len], &src[..len], |s| {
                 T::one() / (T::one() + (T::zero() - s).exp())
             }),
         }
@@ -352,16 +363,18 @@ impl crate::Backend for crate::CpuDevice {
     ) -> Result<()> {
         let zero = T::zero();
         let one = T::one();
+        // An fma per element, so the fixed chunk applies (see `unary_chunk`).
+        let chunk = ELEMWISE_CHUNK;
         if add == zero && scale == one {
             Self::copy(dst, src, len)
         } else if add == zero {
-            apply_unary(&mut dst[..len], &src[..len], |s| s * scale);
+            apply_unary(chunk, &mut dst[..len], &src[..len], |s| s * scale);
             Ok(())
         } else if scale == one {
-            apply_unary(&mut dst[..len], &src[..len], |s| s + add);
+            apply_unary(chunk, &mut dst[..len], &src[..len], |s| s + add);
             Ok(())
         } else {
-            apply_unary(&mut dst[..len], &src[..len], |s| s * scale + add);
+            apply_unary(chunk, &mut dst[..len], &src[..len], |s| s * scale + add);
             Ok(())
         }
     }
@@ -602,25 +615,30 @@ impl crate::Backend for crate::CpuDevice {
         }
         let cos = &cos[pos * d / 2..];
         let sin = &sin[pos * d / 2..];
-        src.par_chunks(t * d).zip(dst.par_chunks_mut(t * d)).enumerate().for_each(
-            |(bh_i, (src, dst))| {
-                for i_t in 0..t {
-                    for i_d in 0..d / 2 {
-                        let i1 = i_t * d + i_d;
-                        let i2 = i1 + d / 2;
-                        let i_cs = i_t * (d / 2) + i_d;
-                        let i_cs = if unbatched_rope {
-                            let b_i = bh_i / h;
-                            i_cs + b_i * t * d / 2
-                        } else {
-                            i_cs
-                        };
-                        dst[i1] = src[i1] * cos[i_cs] - src[i2] * sin[i_cs];
-                        dst[i2] = src[i1] * sin[i_cs] + src[i2] * cos[i_cs];
-                    }
+        // Same gating as `rope_i`.
+        let row = |bh_i: usize, src: &[T], dst: &mut [T]| {
+            let base = if unbatched_rope { (bh_i / h) * t * d / 2 } else { 0 };
+            for i_t in 0..t {
+                for i_d in 0..d / 2 {
+                    let i1 = i_t * d + i_d;
+                    let i2 = i1 + d / 2;
+                    let i_cs = base + i_t * (d / 2) + i_d;
+                    dst[i1] = src[i1] * cos[i_cs] - src[i2] * sin[i_cs];
+                    dst[i2] = src[i1] * sin[i_cs] + src[i2] * cos[i_cs];
                 }
-            },
-        );
+            }
+        };
+        if use_parallelism(b * h * t * d) {
+            src.par_chunks(t * d)
+                .zip(dst.par_chunks_mut(t * d))
+                .enumerate()
+                .for_each(|(bh_i, (s, d))| row(bh_i, s, d));
+        } else {
+            src.chunks(t * d)
+                .zip(dst.chunks_mut(t * d))
+                .enumerate()
+                .for_each(|(bh_i, (s, d))| row(bh_i, s, d));
+        }
         Ok(())
     }
 
@@ -644,21 +662,30 @@ impl crate::Backend for crate::CpuDevice {
         }
         let cos = &cos[pos * d / 2..];
         let sin = &sin[pos * d / 2..];
-        src.par_chunks(t * d).zip(dst.par_chunks_mut(t * d)).enumerate().for_each(
-            |(bh_i, (src, dst))| {
-                for i_over_2 in 0..t * d / 2 {
-                    let i = 2 * i_over_2;
-                    let rope_i = if unbatched_rope {
-                        let b_i = bh_i / h;
-                        i_over_2 + b_i * t * d / 2
-                    } else {
-                        i_over_2
-                    };
-                    dst[i] = src[i] * cos[rope_i] - src[i + 1] * sin[rope_i];
-                    dst[i + 1] = src[i] * sin[rope_i] + src[i + 1] * cos[rope_i];
-                }
-            },
-        );
+        // One (b, h) row per chunk. During single-token decode a row is `d` elements and there
+        // are only b*h of them, so the rayon fork/join costs far more than the arithmetic;
+        // gate it the same way the elementwise ops are gated.
+        let row = |bh_i: usize, src: &[T], dst: &mut [T]| {
+            // The batch offset is invariant across the row, so compute it once.
+            let base = if unbatched_rope { (bh_i / h) * t * d / 2 } else { 0 };
+            for i_over_2 in 0..t * d / 2 {
+                let i = 2 * i_over_2;
+                let rope_i = base + i_over_2;
+                dst[i] = src[i] * cos[rope_i] - src[i + 1] * sin[rope_i];
+                dst[i + 1] = src[i] * sin[rope_i] + src[i + 1] * cos[rope_i];
+            }
+        };
+        if use_parallelism(b * h * t * d) {
+            src.par_chunks(t * d)
+                .zip(dst.par_chunks_mut(t * d))
+                .enumerate()
+                .for_each(|(bh_i, (s, d))| row(bh_i, s, d));
+        } else {
+            src.chunks(t * d)
+                .zip(dst.chunks_mut(t * d))
+                .enumerate()
+                .for_each(|(bh_i, (s, d))| row(bh_i, s, d));
+        }
         Ok(())
     }
 
@@ -1580,6 +1607,49 @@ const ELEMWISE_PAR_THRESHOLD: usize = 32 * 1024;
 /// Chunk size for parallel elementwise ops; large enough that the per-chunk dispatch cost is
 /// negligible and the inner loop auto-vectorizes.
 const ELEMWISE_CHUNK: usize = 64 * 1024;
+/// Floor on a pool-derived chunk (see `unary_chunk`): below this the per-chunk dispatch cost
+/// stops being negligible and the inner loop has too few iterations to auto-vectorize well.
+const ELEMWISE_MIN_CHUNK: usize = 4 * 1024;
+/// Chunks per thread for a pool-derived chunk. Splitting exactly `current_num_threads()` ways
+/// leaves rayon nothing to steal, and the cores here are not interchangeable: an E core takes
+/// several times longer over its chunk than a P core, and with one chunk each the whole op
+/// waits for it. Oversubscribing keeps the fast cores fed. This matters most with a small pool,
+/// where the chunks are large -- on a 4-thread pool, 1M `silu_` goes 487us -> 421us and 128K
+/// `silu_` 96us -> 80us just from this factor.
+const ELEMWISE_CHUNKS_PER_THREAD: usize = 4;
+
+/// Chunk size for a unary op over `len` elements.
+///
+/// `ELEMWISE_CHUNK` is a fixed 64K, so a length just past the parallelism threshold yields a
+/// single chunk -- rayon is entered but everything runs on one worker -- and the whole pool
+/// only gets work at `threads * ELEMWISE_CHUNK` (640K on a 10-thread pool). For a
+/// transcendental that is a lot of idle threads: one element costs tens of cycles, so a serial
+/// pass over 48K of them already costs ~50us against a ~20us fork/join, and splitting to match
+/// the pool is worth 1.6-1.9x from 32K to 128K.
+///
+/// The cheap ops keep the fixed chunk on purpose. An `Exp` element is ~20x a `Sqr` element, so
+/// for those a serial pass over the same 48K costs only a few us -- an order of magnitude below
+/// the fork/join -- and a real split is a 4-10x *loss*. Sizing their chunks by the pool is the
+/// one thing that must not happen here.
+fn unary_chunk(op: UnaryOp, len: usize) -> usize {
+    let transcendental = matches!(
+        op,
+        UnaryOp::Cos
+            | UnaryOp::Sin
+            | UnaryOp::Exp
+            | UnaryOp::Log
+            | UnaryOp::GeluErf
+            | UnaryOp::Elu { .. }
+            | UnaryOp::Silu
+            | UnaryOp::Tanh
+            | UnaryOp::Sigmoid
+    );
+    if !transcendental {
+        return ELEMWISE_CHUNK;
+    }
+    let threads = rayon::current_num_threads().max(1);
+    len.div_ceil(threads * ELEMWISE_CHUNKS_PER_THREAD).max(ELEMWISE_MIN_CHUNK)
+}
 
 /// Apply a binary operation in-place: dst[i] = op(dst[i], src[i])
 #[inline(always)]
@@ -1608,7 +1678,7 @@ where
 
 /// Apply a unary operation in-place: dst[i] = op(dst[i])
 #[inline(always)]
-fn apply_inplace_unary<T: Copy + Send + Sync, F>(dst: &mut [T], f: F)
+fn apply_inplace_unary<T: Copy + Send + Sync, F>(chunk: usize, dst: &mut [T], f: F)
 where
     F: Fn(&mut T) + Sync,
 {
@@ -1617,7 +1687,7 @@ where
             f(d);
         }
     } else {
-        crate::threadpool::par_chunks_mut(dst, ELEMWISE_CHUNK, |_, dst| {
+        crate::threadpool::par_chunks_mut(dst, chunk, |_, dst| {
             for d in dst.iter_mut() {
                 f(d);
             }
@@ -1627,7 +1697,7 @@ where
 
 /// Apply a unary operation: dst[i] = op(src[i])
 #[inline(always)]
-fn apply_unary<T: Copy + Send + Sync, F>(dst: &mut [T], src: &[T], f: F)
+fn apply_unary<T: Copy + Send + Sync, F>(chunk: usize, dst: &mut [T], src: &[T], f: F)
 where
     F: Fn(T) -> T + Sync,
 {
@@ -1636,17 +1706,11 @@ where
             *d = f(*s);
         }
     } else {
-        crate::threadpool::par_chunks_zip(
-            dst,
-            ELEMWISE_CHUNK,
-            src,
-            ELEMWISE_CHUNK,
-            |_, dst, src| {
-                for (d, s) in dst.iter_mut().zip(src) {
-                    *d = f(*s);
-                }
-            },
-        );
+        crate::threadpool::par_chunks_zip(dst, chunk, src, chunk, |_, dst, src| {
+            for (d, s) in dst.iter_mut().zip(src) {
+                *d = f(*s);
+            }
+        });
     }
 }
 
