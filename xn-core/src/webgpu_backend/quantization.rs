@@ -31,14 +31,28 @@
 //! `vec4<u32>` (16 weights per load), followed by one `f32` scale per block --
 //! both in a single allocation, because the cost of a compute pass grows sharply
 //! with the number of distinct buffers it references and a decode frame issues
-//! ~48 quantized dispatches into one pass. Quantization itself
-//! goes through [`BlockQ8_0::from_float`], the same code the CPU path uses, so
-//! the two produce identical numbers.
+//! ~48 quantized dispatches into one pass.
+//!
+//! There are two ways in. From a GGUF the blocks are already quantized, so
+//! [`Q8Tensor::from_q8_0`] just repacks them into the split layout on the host --
+//! no dequantize, no dense upload, no readback. From dense weights
+//! [`Q8Tensor::quantize`] has to bring them back off the device to run
+//! [`BlockQ8_0::from_float`] (the same code the CPU path uses, so the two produce
+//! identical numbers), and that readback is impossible in a browser: completion
+//! arrives through the event loop, so blocking on it deadlocks. A q8 model in a
+//! browser therefore has to come from a GGUF. Natively it is simply the cheaper
+//! path -- measured through `ptts-ws-server`, load-to-serving is 0.33s from the
+//! gguf against 0.58-0.83s from the safetensors, off a file less than half the
+//! size.
 
 use super::{Device, GEMV_TPC_COLS, Pc, div_ceil};
-use crate::quantized::GgmlType;
 use crate::quantized::k_quants::{BlockQ8_0, QK8_0};
+use crate::quantized::{GgmlDType, GgmlType, QTensor};
 use crate::{Result, Tensor, WithDTypeF};
+
+/// Bytes of one `q8_0` block in ggml's canonical on-disk order, `{f16 d; i8 qs[32]}`.
+const CANONICAL_BLOCK_BYTES: usize = 2 + QK8_0;
+const _: () = assert!(std::mem::size_of::<BlockQ8_0>() == CANONICAL_BLOCK_BYTES);
 
 /// Bytes of quantized weight per 32-value block in the split layout: 32 quants
 /// packed four per `u32`, plus one `f32` scale.
@@ -67,20 +81,77 @@ impl Q8Tensor {
     /// `q8_0` block size.
     pub fn quantize<T: WithDTypeF>(w: &Tensor<T, Device>) -> Result<Self> {
         let (n, k) = w.shape().dims2()?;
+        Self::check_k(k)?;
+        let dev = w.device().clone();
+        // The one readback in this file, and the reason `quantize` cannot be used
+        // in a browser: `from_float` is a host routine, so the weight has to come
+        // back off the device. `from_q8_0` avoids it entirely.
+        let host: Vec<f32> = w.to_vec()?.into_iter().map(|v| v.to_f32()).collect();
+
+        let blocks_per_row = k / QK8_0;
+        let mut blocks = vec![BlockQ8_0::zeros(); n * blocks_per_row];
+        for j in 0..n {
+            BlockQ8_0::from_float(
+                &host[j * k..(j + 1) * k],
+                &mut blocks[j * blocks_per_row..(j + 1) * blocks_per_row],
+            )?;
+        }
+        Self::pack(n, k, &blocks, &dev)
+    }
+
+    /// Build from already-quantized `q8_0` blocks, as a GGUF file stores them.
+    ///
+    /// Nothing touches the device except the final upload, which is what makes a
+    /// q8 model loadable in a browser: [`Self::quantize`] has to read the dense
+    /// weight back to the host to quantize it, and a browser cannot block on a
+    /// readback. It is also strictly less work -- no dequantize, no upload of the
+    /// dense weight, no round trip, and no requantization.
+    pub fn from_q8_0(qt: &QTensor, dev: &Device) -> Result<Self> {
+        if qt.dtype() != GgmlDType::Q8_0 {
+            crate::bail!("webgpu q8_0: expected a q8_0 tensor, got {:?}", qt.dtype());
+        }
+        let (n, k) = qt.shape().dims2()?;
+        Self::check_k(k)?;
+        let n_blocks = n * k / QK8_0;
+        let bytes = qt.data()?;
+        let want = n_blocks * CANONICAL_BLOCK_BYTES;
+        if bytes.len() != want {
+            crate::bail!(
+                "webgpu q8_0: [{n}, {k}] wants {want} bytes of blocks, file has {}",
+                bytes.len()
+            );
+        }
+        // Parsed field by field rather than cast from the byte slice: a block is
+        // 34 bytes and 2-aligned, so a cast would rest on an alignment the `Cow`
+        // does not promise.
+        let mut blocks = vec![BlockQ8_0::zeros(); n_blocks];
+        for (i, blk) in blocks.iter_mut().enumerate() {
+            let off = i * CANONICAL_BLOCK_BYTES;
+            blk.d = half::f16::from_le_bytes([bytes[off], bytes[off + 1]]);
+            for (j, q) in blk.qs.iter_mut().enumerate() {
+                *q = bytes[off + 2 + j] as i8;
+            }
+        }
+        Self::pack(n, k, &blocks, dev)
+    }
+
+    fn check_k(k: usize) -> Result<()> {
         if !k.is_multiple_of(QK8_0) {
             crate::bail!("webgpu q8_0: k={k} is not a multiple of the {QK8_0}-value block size");
         }
-        let dev = w.device().clone();
-        let host: Vec<f32> = w.to_vec()?.into_iter().map(|v| v.to_f32()).collect();
+        Ok(())
+    }
 
+    /// Split `blocks` into quants packed four per `u32` followed by one `f32`
+    /// scale each, and upload both as one allocation.
+    fn pack(n: usize, k: usize, blocks: &[BlockQ8_0], dev: &Device) -> Result<Self> {
         let blocks_per_row = k / QK8_0;
         let quant_words = n * k / 4;
         let mut quants = vec![0u32; quant_words];
         let mut scales = vec![0f32; n * blocks_per_row];
-        let mut row = vec![BlockQ8_0::zeros(); blocks_per_row];
         for j in 0..n {
-            BlockQ8_0::from_float(&host[j * k..(j + 1) * k], &mut row)?;
-            for (b, blk) in row.iter().enumerate() {
+            for b in 0..blocks_per_row {
+                let blk = &blocks[j * blocks_per_row + b];
                 scales[j * blocks_per_row + b] = blk.d.to_f32();
                 // Four signed bytes per word, little-endian, matching the
                 // shader's `unpack4xI8`.
@@ -214,6 +285,64 @@ macro_rules! backend_q8 {
                     q.dense = Some(l);
                 }
                 Ok(q)
+            }
+
+            /// Takes `q8_0` blocks straight from a GGUF when the file has them,
+            /// as the cpu backend already does.
+            ///
+            /// The default would call `nn::Linear::load`, which dequantizes the
+            /// blocks to f32 on the host and uploads them, and then `from_linear`
+            /// reads that back to requantize it. Besides undoing itself twice,
+            /// the readback deadlocks in a browser, so this override is what
+            /// makes a q8 model loadable there at all.
+            fn linear_load<V: std::borrow::Borrow<crate::nn::Path<Self::B>>>(
+                vb: V,
+                in_features: usize,
+                out_features: usize,
+            ) -> Result<Self::LinearQ> {
+                let vb = vb.borrow();
+                let qt = vb.qtensor("weight")?;
+                // A gguf that leaves one of these layers dense would otherwise
+                // fall through to `quantize`, whose readback deadlocks in a
+                // browser. Say which layer and what dtype it is instead; natively
+                // the fallback is fine, so this is wasm-only.
+                #[cfg(target_arch = "wasm32")]
+                if let Some(qt) = &qt
+                    && qt.dtype() != GgmlDType::Q8_0
+                {
+                    crate::bail!(
+                        "webgpu q8_0: {}weight is {:?} in this gguf, not q8_0, and a browser \
+                         cannot quantize it at load (that needs a readback). Use a gguf that \
+                         quantizes every attention projection and feed-forward weight, or pick \
+                         an f16/f32 dtype.",
+                        vb.prefix(),
+                        qt.dtype(),
+                    )
+                }
+                if let Some(qt) = qt
+                    && qt.dtype() == GgmlDType::Q8_0
+                {
+                    if qt.shape().dims() != [out_features, in_features] {
+                        crate::bail!(
+                            "webgpu q8_0: weight has shape {:?}, expected [{out_features}, {in_features}]",
+                            qt.shape()
+                        )
+                    }
+                    let device = vb.device().clone();
+                    let weight = Q8Tensor::from_q8_0(&qt, &device)?;
+                    // `nn::Linear::load` reads only `weight`, so the dense path
+                    // gets no bias either; matching it keeps the two equivalent.
+                    let mut q = Q8Linear::new(weight, None, device);
+                    // Called once per layer on both paths: `XN_WEBGPU_Q8_LAYERS`
+                    // counts every call, so asking twice would skew the split.
+                    if Q8Linear::<Self::T>::dense_mode() {
+                        q.dense =
+                            Some(crate::nn::Linear::load(vb, in_features, out_features)?);
+                    }
+                    return Ok(q);
+                }
+                let l = crate::nn::Linear::load(vb, in_features, out_features)?;
+                Self::from_linear(l)
             }
         }
     };
