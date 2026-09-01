@@ -32,3 +32,28 @@ what forces full validation of the entry point and its bindings.
 
 Headless Chrome does WebGPU on macOS with `--enable-unsafe-webgpu`; the
 `CVDisplayLinkCreateWithCGDisplay` errors it logs are harmless.
+
+# Backend harness
+
+`harness/` runs the backend itself in a browser -- device creation, the uniform
+parameter ring, batching, the buffer pool, the async readback -- against expected
+values computed on the spot. The shader check above only proves the WGSL compiles;
+this proves the orchestration works.
+
+```
+cd harness
+cargo build --release --target wasm32-unknown-unknown
+wasm-bindgen --target web --out-dir pkg \
+  target/wasm32-unknown-unknown/release/xn_webgpu_browser_harness.wasm
+cd pkg && node server.js &
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --headless=new --enable-unsafe-webgpu --no-first-run \
+  --user-data-dir=/tmp/xn-harness-cd http://localhost:8733/
+```
+
+`"failed": 0` is the pass condition. Ops run through the ordinary synchronous
+`Backend` trait, because they only record into the batch; only readbacks are
+awaited, via `Device::tensor_to_vec`.
+
+The harness is a standalone crate (its own `[workspace]`), since the xn workspace
+only ever builds for native.

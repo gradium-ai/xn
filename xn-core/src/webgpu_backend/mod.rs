@@ -29,7 +29,7 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::needless_range_loop)]
 
-use crate::{BinaryOp, DType, Result, UnaryOp, WithDType, WithDTypeF};
+use crate::{BinaryOp, DType, Result, Tensor, UnaryOp, WithDType, WithDTypeF};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
@@ -265,6 +265,51 @@ impl Pc {
     }
 }
 
+/// Resolves when a wgpu completion callback fires.
+///
+/// Hand-rolled rather than pulling in a futures channel crate for this one use.
+/// The waker is stored so a browser's event loop can drive the future; on native
+/// the callback runs inside `poll`, so the future is usually already ready.
+#[derive(Default)]
+struct SignalState {
+    done: bool,
+    waker: Option<std::task::Waker>,
+}
+
+struct Signal(Arc<Mutex<SignalState>>);
+
+impl Signal {
+    /// Returns the future and the callback that completes it.
+    fn new() -> (Self, impl FnOnce() + Send + 'static) {
+        let state = Arc::new(Mutex::new(SignalState::default()));
+        let fired = state.clone();
+        let fire = move || {
+            let mut st = fired.lock().unwrap();
+            st.done = true;
+            if let Some(w) = st.waker.take() {
+                w.wake();
+            }
+        };
+        (Signal(state), fire)
+    }
+}
+
+impl std::future::Future for Signal {
+    type Output = ();
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let mut st = self.0.lock().unwrap();
+        if st.done {
+            std::task::Poll::Ready(())
+        } else {
+            st.waker = Some(cx.waker().clone());
+            std::task::Poll::Pending
+        }
+    }
+}
+
 struct CachedPipeline {
     pipeline: wgpu::ComputePipeline,
     bindings: u32,
@@ -412,34 +457,70 @@ fn device_type_score(t: wgpu::DeviceType) -> u32 {
 }
 
 impl Device {
+    /// Blocks on device creation. Kept on wasm as a failing stub rather than
+    /// removed, so the synchronous `Runner` entry points still compile there and
+    /// the reason surfaces as a message rather than a missing symbol.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(ordinal: usize) -> Result<Self> {
         pollster::block_on(Self::new_async(ordinal))
     }
 
-    async fn new_async(ordinal: usize) -> Result<Self> {
+    #[cfg(target_arch = "wasm32")]
+    pub fn new(_ordinal: usize) -> Result<Self> {
+        crate::bail!("webgpu: a browser cannot block on device creation; use Device::new_async")
+    }
+
+    pub async fn new_async(ordinal: usize) -> Result<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+
+        // A browser exposes no adapter enumeration -- `navigator.gpu` hands back
+        // one adapter for a set of options -- so wasm asks for the high-performance
+        // one and ignores `ordinal`.
+        #[cfg(target_arch = "wasm32")]
+        let adapter = {
+            let _ = ordinal;
+            instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                })
+                .await
+                .map_err(wgpuerr("request_adapter"))?
+        };
 
         // Rank adapters by preference (discrete > integrated > cpu). `ordinal`
         // selects among the ranked list. `XN_WEBGPU_DEVICE` overrides it with a
         // raw enumeration index.
-        let adapters = instance.enumerate_adapters(wgpu::Backends::all());
-        if adapters.is_empty() {
-            crate::bail!("webgpu: no adapters found (is a GPU driver installed?)");
-        }
-        let mut ranked: Vec<(u32, usize)> = adapters
-            .iter()
-            .enumerate()
-            .map(|(i, a)| (device_type_score(a.get_info().device_type), i))
-            .collect();
-        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        let idx = match std::env::var("XN_WEBGPU_DEVICE").ok().and_then(|v| v.parse::<usize>().ok())
-        {
-            Some(i) if i < adapters.len() => i,
-            _ => ranked.get(ordinal).map(|r| r.1).unwrap_or(ranked[0].1),
+        #[cfg(not(target_arch = "wasm32"))]
+        let adapter = {
+            let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+            if adapters.is_empty() {
+                crate::bail!("webgpu: no adapters found (is a GPU driver installed?)");
+            }
+            let mut ranked: Vec<(u32, usize)> = adapters
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (device_type_score(a.get_info().device_type), i))
+                .collect();
+            ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            let idx = match std::env::var("XN_WEBGPU_DEVICE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                Some(i) if i < adapters.len() => i,
+                _ => ranked.get(ordinal).map(|r| r.1).unwrap_or(ranked[0].1),
+            };
+            adapters[idx].clone()
         };
-        let adapter = &adapters[idx];
         let info = adapter.get_info();
-        let device_name = format!("{} ({:?})", info.name, info.backend);
+        // Browsers mask the adapter name, so fall back to what they do report
+        // rather than rendering an empty pair of parentheses.
+        let device_name = if info.name.is_empty() {
+            format!("{:?} {:?}", info.device_type, info.backend)
+        } else {
+            format!("{} ({:?})", info.name, info.backend)
+        };
         // What the adapter offers, which is not yet what the backend uses: the
         // kernels are f32-only, so this is currently reporting-only. It is the
         // gate an f16 compute path would have to check.
@@ -806,10 +887,16 @@ impl Device {
             ctx.params.clear();
         }
         // Drive the queue to completion so host reads and buffer recycling are
-        // safe. `poll(Wait)` blocks until all submitted work has finished.
+        // safe.
         let t = (self.profile && had_work).then(std::time::Instant::now);
-        self.device.poll(wgpu::PollType::Wait).map_err(wgpuerr("poll"))?;
+        self.poll_blocking()?;
         let poll_ns = t.map_or(0, |t| t.elapsed().as_nanos());
+        // Recycling a buffer the GPU has not finished with would corrupt it, so
+        // it happens only where completion is actually known. On wasm nothing can
+        // block, so this sync flush leaves the buffers queued and `flush_async`
+        // recycles them after awaiting.
+        #[cfg(not(target_arch = "wasm32"))]
+        Self::recycle(&self.pool, ctx);
         if let Some(t0) = t0 {
             let mut p = self.pstats.lock().unwrap();
             p.submits += 1;
@@ -818,12 +905,63 @@ impl Device {
             p.submit_ns += submit_ns;
             p.poll_ns += poll_ns;
         }
-        if !ctx.free_bufs.is_empty() {
-            let mut pool = self.pool.lock().unwrap();
-            for b in ctx.free_bufs.drain(..) {
-                pool.free.entry(b.class).or_default().push(b);
+        Ok(())
+    }
+
+    /// Move buffers freed by this batch back into the pool. Only sound once the
+    /// batch that referenced them has completed.
+    fn recycle(pool: &Mutex<BufferPool>, ctx: &mut OpCtx) {
+        if ctx.free_bufs.is_empty() {
+            return;
+        }
+        let mut pool = pool.lock().unwrap();
+        for b in ctx.free_bufs.drain(..) {
+            pool.free.entry(b.class).or_default().push(b);
+        }
+    }
+
+    /// Block until the queue has drained. Native only: a browser has no way to
+    /// block, so wasm builds must reach a completion point by awaiting instead
+    /// (see `flush_async`).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_blocking(&self) -> Result<()> {
+        self.device.poll(wgpu::PollType::Wait).map_err(wgpuerr("poll"))?;
+        Ok(())
+    }
+
+    /// On wasm this only services callbacks that are already due; it cannot wait.
+    /// Any code path that needs completion has to await `flush_async`.
+    #[cfg(target_arch = "wasm32")]
+    fn poll_blocking(&self) -> Result<()> {
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        Ok(())
+    }
+
+    /// Submit any pending work and await its completion. The browser-safe
+    /// counterpart to `flush`.
+    pub async fn flush_async(&self) -> Result<()> {
+        {
+            let mut ctx = self.ctx.lock().unwrap();
+            if ctx.open {
+                if !ctx.params.is_empty() {
+                    self.queue.write_buffer(&self.params_ring, 0, &ctx.params);
+                }
+                ctx.pass = None;
+                let enc = ctx.encoder.take().expect("open batch has an encoder");
+                self.queue.submit(Some(enc.finish()));
+                ctx.open = false;
+                ctx.params.clear();
             }
         }
+        let (signal, fire) = Signal::new();
+        self.queue.on_submitted_work_done(fire);
+        // Native needs a poll to service the callback; in a browser the event
+        // loop does it while this future is pending.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.device.poll(wgpu::PollType::Wait).map_err(wgpuerr("poll (flush_async)"))?;
+        signal.await;
+        // Completion is known now, so queued buffers can go back in the pool.
+        Self::recycle(&self.pool, &mut self.ctx.lock().unwrap());
         Ok(())
     }
 
@@ -842,6 +980,7 @@ impl Device {
     /// `poll(Wait)` -- measured ~1.3 ms per readback on Apple M5 even for a
     /// handful of bytes, because the second wait is a fresh submission rather
     /// than work already in flight.
+    #[cfg(not(target_arch = "wasm32"))]
     fn read_buffer<T: WithDType>(&self, buf: &wgpu::Buffer, len: usize) -> Result<Vec<T>> {
         if len == 0 {
             return Ok(Vec::new());
@@ -867,20 +1006,7 @@ impl Device {
         let bytes = len * T::BYTE_SIZE;
         let padded = round4(bytes) as u64;
         let class = size_class(padded as usize);
-        let staging = {
-            let mut pool = self.staging.lock().unwrap();
-            pool.get_mut(&class).and_then(|v| v.pop())
-        }
-        .unwrap_or_else(|| {
-            // Class-sized, like the storage pool, so any same-class readback
-            // can reuse it.
-            self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("xn-readback"),
-                size: class,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        });
+        let staging = self.take_staging(class);
         let mut own_ns = t0.map_or(0, |t| t.elapsed().as_nanos());
         {
             // Append the copy to the pending batch and submit once. Any open
@@ -903,13 +1029,7 @@ impl Device {
         // callback rather than waiting on a new submission.
         self.device.poll(wgpu::PollType::Wait).map_err(wgpuerr("poll (readback)"))?;
         rx.recv().map_err(wgpuerr("map recv"))?.map_err(wgpuerr("map_async"))?;
-        let mapped = slice.get_mapped_range();
-        let mut out = Vec::<T>::with_capacity(len);
-        unsafe {
-            std::ptr::copy_nonoverlapping(mapped.as_ptr(), out.as_mut_ptr() as *mut u8, bytes);
-            out.set_len(len);
-        }
-        drop(mapped);
+        let out = copy_mapped::<T>(&slice, len, bytes);
         staging.unmap();
         self.staging.lock().unwrap().entry(class).or_default().push(staging);
         if let Some(t1) = t1 {
@@ -922,6 +1042,100 @@ impl Device {
             *p.readback_elems.entry(len).or_insert(0) += 1;
         }
         Ok(out)
+    }
+
+    /// In a browser the map callback is delivered by the event loop, so blocking
+    /// on it here would deadlock rather than merely be slow. Every other op in
+    /// the backend only records into the batch, so a browser caller can drive the
+    /// whole op set through the synchronous `Backend` trait and await only
+    /// [`Device::read_buffer_async`] where it wants values back.
+    #[cfg(target_arch = "wasm32")]
+    fn read_buffer<T: WithDType>(&self, _buf: &wgpu::Buffer, len: usize) -> Result<Vec<T>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        crate::bail!(
+            "webgpu: a blocking readback of {len} {:?} would deadlock in a browser; \
+             use Device::read_buffer_async",
+            T::DTYPE
+        )
+    }
+
+    /// Read `len` elements of `T` back without blocking.
+    ///
+    /// The browser-safe counterpart to `read_buffer`: same single-round-trip
+    /// staging copy appended to the pending batch, but the completion is awaited
+    /// rather than polled for. This is the only op in the backend that has to be
+    /// async -- everything else merely records into the batch -- so a browser
+    /// caller can drive the whole op set synchronously and await only where it
+    /// actually wants values back.
+    pub async fn read_buffer_async<T: WithDType>(
+        &self,
+        buf: &wgpu::Buffer,
+        len: usize,
+    ) -> Result<Vec<T>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let bytes = len * T::BYTE_SIZE;
+        let padded = round4(bytes) as u64;
+        let class = size_class(padded as usize);
+        let staging = self.take_staging(class);
+        {
+            let mut ctx = self.ctx.lock().unwrap();
+            self.begin_if_needed(&mut ctx);
+            ctx.pass = None;
+            ctx.encoder.as_mut().unwrap().copy_buffer_to_buffer(buf, 0, &staging, 0, padded);
+        }
+        self.flush_async().await?;
+
+        let slice = staging.slice(..padded);
+        let (signal, fire) = Signal::new();
+        let status = Arc::new(Mutex::new(None));
+        let st = status.clone();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            *st.lock().unwrap() = Some(r);
+            fire();
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        self.device.poll(wgpu::PollType::Wait).map_err(wgpuerr("poll (readback async)"))?;
+        signal.await;
+        match status.lock().unwrap().take() {
+            Some(Ok(())) => {}
+            Some(Err(e)) => return Err(wgpuerr("map_async")(e)),
+            None => crate::bail!("webgpu: readback completed without a status"),
+        }
+        let out = copy_mapped::<T>(&slice, len, bytes);
+        staging.unmap();
+        self.staging.lock().unwrap().entry(class).or_default().push(staging);
+        Ok(out)
+    }
+
+    /// A tensor's contents, read back without blocking.
+    ///
+    /// The browser-safe counterpart to `Tensor::to_vec`. Ops only record into the
+    /// batch, so a browser caller runs them through the ordinary synchronous
+    /// `Backend` trait and awaits this only where it wants values back.
+    pub async fn tensor_to_vec<T: WithDType>(&self, t: &Tensor<T, Self>) -> Result<Vec<T>> {
+        let len = t.shape().elem_count();
+        let buffer = {
+            let storage = t.storage()?;
+            storage.buffer.clone()
+        };
+        self.read_buffer_async::<T>(&buffer, len).await
+    }
+
+    /// An idle `MAP_READ` staging buffer of this size class, or a new one.
+    fn take_staging(&self, class: u64) -> wgpu::Buffer {
+        if let Some(b) = self.staging.lock().unwrap().get_mut(&class).and_then(|v| v.pop()) {
+            return b;
+        }
+        self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("xn-readback"),
+            size: class,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
     }
 
     /// Upload a `u32` array (kernel `info` dims/strides scratch) into a buffer.
@@ -1081,6 +1295,17 @@ impl<T: WithDType> Drop for Storage<T> {
         // defer recycling it until the next flush completes on the GPU.
         self.device.defer_free(PooledBuf { buffer: self.buffer.clone(), class: self.class });
     }
+}
+
+/// Copy `len` elements of `T` out of a mapped buffer range.
+fn copy_mapped<T: WithDType>(slice: &wgpu::BufferSlice<'_>, len: usize, bytes: usize) -> Vec<T> {
+    let mapped = slice.get_mapped_range();
+    let mut out = Vec::<T>::with_capacity(len);
+    unsafe {
+        std::ptr::copy_nonoverlapping(mapped.as_ptr(), out.as_mut_ptr() as *mut u8, bytes);
+        out.set_len(len);
+    }
+    out
 }
 
 /// Round a byte count up to the WebGPU 4-byte copy/write alignment.

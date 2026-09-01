@@ -1,25 +1,4 @@
-[build]
-rustflags = ["-C", "target-cpu=native"]
-
+# `getrandom` needs to be told which entropy source to use on wasm; there is no
+# OS one. Applies only to the wasm target so native builds are unaffected.
 [target.wasm32-unknown-unknown]
-rustflags = ["-C", "target-feature=+simd128,+relaxed-simd", "--cfg", "getrandom_backend=\"wasm_js\""]
-
-[target.wasm32-wasip1]
-runner = "wasmtime"
-rustflags = ["-C", "target-feature=+simd128,+relaxed-simd"]
-
-# `cc-rs` build scripts (e.g. for `onig_sys`) need a sysroot when targeting
-# wasi. These vars are target-prefixed so they're harmless on host builds.
-[env]
-WASI_SYSROOT = "/usr/share/wasi-sysroot"
-CC_wasm32_wasip1 = "clang"
-CFLAGS_wasm32_wasip1 = "--sysroot=/usr/share/wasi-sysroot --target=wasm32-wasip1"
-
-[target.x86_64-apple-darwin]
-rustflags = ["-C", "target-feature=-avx,-avx2"]
-
-# Android: modern arm64 cores (Cortex-A76+ / Apple/Qualcomm M-series) support
-# ARMv8.2 FP16 — gemm-f16 requires it. 2016+ flagships always have it; plain
-# Cortex-A53/A55 phones do not and are not our target.
-[target.aarch64-linux-android]
-rustflags = ["-C", "target-feature=+fp16"]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

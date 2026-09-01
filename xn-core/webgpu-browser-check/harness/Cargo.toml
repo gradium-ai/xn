@@ -1,0 +1,24 @@
+[package]
+name = "xn-webgpu-browser-harness"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone: the xn workspace builds for native, this only ever builds for wasm.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+xn = { path = "../../", features = ["webgpu"] }
+half = "2.7.1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+[profile.release]
+opt-level = "s"
