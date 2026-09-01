@@ -57,3 +57,31 @@ awaited, via `Device::tensor_to_vec`.
 
 The harness is a standalone crate (its own `[workspace]`), since the xn workspace
 only ever builds for native.
+
+# Capability check (any device)
+
+`caps.html` is standalone -- no wasm, no build -- and answers whether a given
+device can run this backend. It checks the limits the kernels actually need, then
+does a minimal dispatch in the same binding shape they use (one read_write and
+one read-only storage buffer, plus a uniform at a non-zero dynamic offset).
+
+```
+node serve.js 8734      # serves this directory on 0.0.0.0:8734
+```
+
+The required limits are all below WebGPU's guaranteed minimums, so a conformant
+implementation should pass. What varies by device is `shader-f16` (optional; f32
+otherwise, at twice the weight bytes) and whether the driver is blocklisted.
+
+## Testing on a phone
+
+WebGPU needs a secure context, so `http://<LAN-IP>:8734` will report "not a
+secure context" and `navigator.gpu` will be missing. Two ways round it:
+
+- USB, no certificates: `adb reverse tcp:8734 tcp:8734`, then open
+  `http://localhost:8734` on the phone. localhost is a secure context.
+- An https tunnel (cloudflared, ngrok) pointed at port 8734.
+
+Chrome enabled WebGPU by default on Android 12+ with Qualcomm and ARM GPUs in
+Chrome 121; older Chrome or an unsupported driver shows up as a missing
+`navigator.gpu` or a null adapter, which the page reports distinctly.

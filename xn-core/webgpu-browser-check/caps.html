@@ -1,0 +1,157 @@
+<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>xn WebGPU capability check</title>
+<style>
+ :root{color-scheme:light dark}
+ body{font:15px/1.5 system-ui,sans-serif;margin:0;padding:1rem;max-width:44rem}
+ h1{font-size:1.15rem;margin:0 0 .75rem}
+ .verdict{padding:.7rem .9rem;border-radius:.5rem;font-weight:600;margin:.75rem 0}
+ .ok{background:#0a7f3f22;color:#0a7f3f}.bad{background:#b0202022;color:#c02020}
+ .warn{background:#9a6b0022;color:#9a6b00}
+ table{border-collapse:collapse;width:100%;margin:.5rem 0;font-size:14px}
+ td,th{text-align:left;padding:.3rem .5rem;border-bottom:1px solid #8884}
+ td:nth-child(2),td:nth-child(3){text-align:right;font-variant-numeric:tabular-nums}
+ .fail{color:#c02020;font-weight:600}.pass{color:#0a7f3f}
+ pre{white-space:pre-wrap;word-break:break-word;font-size:12px;background:#8881;padding:.6rem;border-radius:.4rem}
+</style>
+<body>
+<h1>xn WebGPU capability check</h1>
+<div id=verdict class=verdict>checking…</div>
+<div id=body></div>
+<script>
+// What the backend actually needs. Sources, all in xn-core:
+//   256 invocations  -- 26 of 29 kernels are @workgroup_size(256)
+//   2048 B workgroup -- layernorm and reduce_arg each hold 2 x array<_,256>;
+//                       gemm_tiled holds 2 x 16x16 f32
+//   5 storage buffers -- qgemv_q8 is the widest (MAX_BINDINGS)
+//   1 uniform buffer  -- the kernel parameter ring, at binding 8
+//   uniform offset alignment <= 256 -- PARAMS_SLOT_SIZE
+const NEEDS = [
+  ['maxComputeInvocationsPerWorkgroup', 256, 'atLeast'],
+  ['maxComputeWorkgroupSizeX',          256, 'atLeast'],
+  ['maxComputeWorkgroupStorageSize',   2048, 'atLeast'],
+  ['maxStorageBuffersPerShaderStage',      5, 'atLeast'],
+  ['maxUniformBuffersPerShaderStage',      1, 'atLeast'],
+  ['minUniformBufferOffsetAlignment',    256, 'atMost'],
+];
+
+const el = (t, p, c) => { const n = document.createElement(t); if (c) n.className = c; if (p != null) n.textContent = p; return n; };
+
+(async () => {
+  const v = document.getElementById('verdict'), b = document.getElementById('body');
+  const set = (cls, txt) => { v.className = 'verdict ' + cls; v.textContent = txt; };
+
+  if (!window.isSecureContext) {
+    set('bad', 'Not a secure context. WebGPU is unavailable over plain http from a LAN address — use localhost (adb reverse) or https.');
+    b.append(el('pre', 'origin: ' + location.origin));
+    return;
+  }
+  if (!navigator.gpu) {
+    set('bad', 'navigator.gpu is missing: this browser has no WebGPU. On Android you need Chrome 121 or newer.');
+    b.append(el('pre', navigator.userAgent));
+    return;
+  }
+  let adapter;
+  try { adapter = await navigator.gpu.requestAdapter(); } catch (e) {}
+  if (!adapter) {
+    set('bad', 'requestAdapter() returned null: WebGPU is present but no adapter is usable, usually a driver blocklist.');
+    b.append(el('pre', navigator.userAgent));
+    return;
+  }
+
+  const lim = adapter.limits;
+  const rows = NEEDS.map(([name, need, kind]) => {
+    const have = lim[name];
+    const ok = have === undefined ? false : (kind === 'atLeast' ? have >= need : have <= need);
+    return { name, need, have, ok, kind };
+  });
+  const failed = rows.filter(r => !r.ok);
+  const f16 = adapter.features.has('shader-f16');
+
+  if (failed.length) set('bad', 'Will not run: ' + failed.length + ' required limit(s) not met.');
+  else if (!f16) set('warn', 'Will run, in f32 only — this device does not advertise shader-f16, so weights stay 4 bytes and use twice the memory and bandwidth.');
+  else set('ok', 'Will run, with f16. Every required limit is met and shader-f16 is available.');
+
+  const t = el('table');
+  t.append((() => { const h = el('tr'); ['limit','needs','device',''].forEach(x => h.append(el('th', x))); return h; })());
+  for (const r of rows) {
+    const tr = el('tr');
+    tr.append(el('td', r.name));
+    tr.append(el('td', (r.kind === 'atMost' ? '≤ ' : '≥ ') + r.need));
+    tr.append(el('td', r.have === undefined ? '—' : String(r.have)));
+    tr.append(el('td', r.ok ? 'ok' : 'FAIL', r.ok ? 'pass' : 'fail'));
+    t.append(tr);
+  }
+  b.append(el('h1', 'Required limits'), t);
+
+  const info = adapter.info || {};
+  b.append(el('h1', 'Adapter'), el('pre',
+    'vendor: ' + (info.vendor || '?') +
+    '\narchitecture: ' + (info.architecture || '?') +
+    '\ndevice: ' + (info.device || '?') +
+    '\ndescription: ' + (info.description || '?') +
+    '\nshader-f16: ' + f16 +
+    '\nsubgroups: ' + adapter.features.has('subgroups') +
+    '\ntimestamp-query: ' + adapter.features.has('timestamp-query') +
+    '\n\nmaxBufferSize: ' + (lim.maxBufferSize / (1 << 20)).toFixed(0) + ' MiB' +
+    '\nmaxStorageBufferBindingSize: ' + (lim.maxStorageBufferBindingSize / (1 << 20)).toFixed(0) + ' MiB' +
+    '\n\nfeatures: ' + [...adapter.features].sort().join(', ') +
+    '\n\nUA: ' + navigator.userAgent));
+
+  // A minimal end-to-end compute, in exactly the shape the kernels use: one
+  // read_write and one read-only storage binding, plus a uniform at a non-zero
+  // dynamic offset. Passing this means the backend's binding model works here.
+  try {
+    const dev = await adapter.requestDevice({ requiredFeatures: f16 ? ['shader-f16'] : [] });
+    const align = lim.minUniformBufferOffsetAlignment;
+    const code = `${f16 ? 'enable f16;' : ''}
+struct P { n: u32, k: f32 };
+@group(0) @binding(8) var<uniform> pc: P;
+@group(0) @binding(0) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(1) var<storage, read> src: array<f32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+  let i = g.x; if i >= pc.n { return; }
+  dst[i] = src[i] * pc.k;
+}`;
+    const mod = dev.createShaderModule({ code });
+    const ci = await mod.getCompilationInfo();
+    const msgs = ci.messages.filter(m => m.type === 'error').map(m => m.message);
+    if (msgs.length) throw new Error('shader: ' + msgs.join('; '));
+    const bgl = dev.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', hasDynamicOffset: true, minBindingSize: align } },
+    ]});
+    const pipe = dev.createComputePipeline({ layout: dev.createPipelineLayout({ bindGroupLayouts: [bgl] }), compute: { module: mod, entryPoint: 'main' } });
+    const N = 256, U = GPUBufferUsage;
+    const dst = dev.createBuffer({ size: N*4, usage: U.STORAGE | U.COPY_SRC });
+    const src = dev.createBuffer({ size: N*4, usage: U.STORAGE | U.COPY_DST });
+    const uni = dev.createBuffer({ size: align*2, usage: U.UNIFORM | U.COPY_DST });
+    dev.queue.writeBuffer(src, 0, new Float32Array(Array.from({length:N}, (_,i)=>i)));
+    const p = new ArrayBuffer(align); const dv = new DataView(p);
+    dv.setUint32(0, N, true); dv.setFloat32(4, 2.5, true);
+    dev.queue.writeBuffer(uni, align, p);
+    const bg = dev.createBindGroup({ layout: bgl, entries: [
+      { binding: 0, resource: { buffer: dst } },
+      { binding: 1, resource: { buffer: src } },
+      { binding: 8, resource: { buffer: uni, offset: 0, size: align } },
+    ]});
+    const enc = dev.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(pipe); pass.setBindGroup(0, bg, [align]); pass.dispatchWorkgroups(1); pass.end();
+    const stage = dev.createBuffer({ size: N*4, usage: U.MAP_READ | U.COPY_DST });
+    enc.copyBufferToBuffer(dst, 0, stage, 0, N*4);
+    dev.queue.submit([enc.finish()]);
+    await stage.mapAsync(GPUMapMode.READ);
+    const got = new Float32Array(stage.getMappedRange());
+    const bad = Array.from(got).findIndex((x, i) => Math.abs(x - i * 2.5) > 1e-6);
+    b.append(el('h1', 'End-to-end compute'), el('pre',
+      bad === -1 ? 'ok — dispatch with a uniform at a non-zero dynamic offset produced correct results'
+                 : 'MISMATCH at index ' + bad + ': got ' + got[bad]));
+    if (bad !== -1 && !failed.length) set('bad', 'Limits are fine but a minimal dispatch produced wrong results — likely a driver bug.');
+  } catch (e) {
+    b.append(el('h1', 'End-to-end compute'), el('pre', 'FAILED: ' + (e && (e.stack || e.message || e))));
+    if (!failed.length) set('bad', 'Limits are fine but a minimal dispatch failed. See below.');
+  }
+})();
+</script>
