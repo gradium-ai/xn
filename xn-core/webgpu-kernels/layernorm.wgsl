@@ -2,11 +2,13 @@
 // remove_mean == 1: y = (x - mean) / sqrt(var + eps) * weight + bias
 // remove_mean == 0: y =  x        / sqrt(var + eps) * weight + bias
 struct Params { ncols: u32, eps: f32, remove_mean: u32 };
-var<push_constant> pc: Params;
-@group(0) @binding(0) var<storage, read_write> src: array<S>;
+// WebGPU has no push constants; parameters arrive in a uniform windowed to
+// this dispatch's slot by a dynamic offset.
+@group(0) @binding(8) var<uniform> pc: Params;
+@group(0) @binding(0) var<storage, read> src: array<S>;
 @group(0) @binding(1) var<storage, read_write> dst: array<S>;
-@group(0) @binding(2) var<storage, read_write> weight: array<S>;
-@group(0) @binding(3) var<storage, read_write> bias: array<S>;
+@group(0) @binding(2) var<storage, read> weight: array<S>;
+@group(0) @binding(3) var<storage, read> bias: array<S>;
 
 var<workgroup> sh_sum: array<f32, 256>;
 var<workgroup> sh_sq: array<f32, 256>;

@@ -15,17 +15,19 @@
 // See quantization.rs for why the weights are split into separate quant and
 // scale buffers rather than read as ggml's 34-byte blocks.
 struct Params { m: u32, n: u32, k: u32, has_bias: u32, scale_off: u32 };
-var<push_constant> pc: Params;
+// WebGPU has no push constants; parameters arrive in a uniform windowed to
+// this dispatch's slot by a dynamic offset.
+@group(0) @binding(8) var<uniform> pc: Params;
 @group(0) @binding(0) var<storage, read_write> dst: array<S>;
 // Activations, vec4 view. k is a multiple of 32 for q8_0, so the row starts
 // 16-byte aligned and there is no scalar tail.
-@group(0) @binding(1) var<storage, read_write> lhs4: array<S4>;
-@group(0) @binding(2) var<storage, read_write> q: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read> lhs4: array<S4>;
+@group(0) @binding(2) var<storage, read> q: array<vec4<u32>>;
 // Same buffer as `q`, viewed as f32: the scales follow the quants, starting at
 // word `pc.scale_off`. One buffer instead of two keeps the number of distinct
 // buffers a compute pass references down, which measurably dominates.
-@group(0) @binding(3) var<storage, read_write> scales: array<f32>;
-@group(0) @binding(4) var<storage, read_write> bias: array<S>;
+@group(0) @binding(3) var<storage, read> scales: array<f32>;
+@group(0) @binding(4) var<storage, read> bias: array<S>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {

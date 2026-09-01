@@ -1,10 +1,12 @@
 // Row-wise RMSNorm, f32 accumulation. One workgroup per row.
 // dst = x * rsqrt(mean(x^2) + eps) * alpha
 struct Params { ncols: u32, eps: f32 };
-var<push_constant> pc: Params;
-@group(0) @binding(0) var<storage, read_write> src: array<S>;
+// WebGPU has no push constants; parameters arrive in a uniform windowed to
+// this dispatch's slot by a dynamic offset.
+@group(0) @binding(8) var<uniform> pc: Params;
+@group(0) @binding(0) var<storage, read> src: array<S>;
 @group(0) @binding(1) var<storage, read_write> dst: array<S>;
-@group(0) @binding(2) var<storage, read_write> alpha: array<S>;
+@group(0) @binding(2) var<storage, read> alpha: array<S>;
 
 var<workgroup> sh: array<f32, 256>;
 

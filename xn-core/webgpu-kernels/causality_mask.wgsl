@@ -1,7 +1,9 @@
 // Apply causal mask in place: set dst to -inf where idx2 > offset + idx1.
 // Linear index decomposes as (b, idx1, idx2) over (bh, t1, t2).
 struct Params { bh: u32, t1: u32, t2: u32, offset: u32 };
-var<push_constant> pc: Params;
+// WebGPU has no push constants; parameters arrive in a uniform windowed to
+// this dispatch's slot by a dynamic offset.
+@group(0) @binding(8) var<uniform> pc: Params;
 @group(0) @binding(0) var<storage, read_write> dst: array<S>;
 
 @compute @workgroup_size(256)

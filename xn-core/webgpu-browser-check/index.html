@@ -1,0 +1,35 @@
+<!doctype html><meta charset=utf-8><title>wgsl validation</title><body><script>
+(async () => {
+  const report = { results: [] };
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    const hasF16 = adapter.features.has('shader-f16');
+    const dev = await adapter.requestDevice({ requiredFeatures: hasF16 ? ['shader-f16'] : [] });
+    report.shaderF16 = hasF16;
+    // Surface device-level errors too, not just compilation messages.
+    dev.addEventListener('uncapturederror', e => report.results.push({ name: '<device>', errors: [String(e.error.message)] }));
+    const names = await (await fetch('/index.json')).json();
+    for (const name of names) {
+      const code = await (await fetch('/' + name + '.wgsl')).text();
+      dev.pushErrorScope('validation');
+      const mod = dev.createShaderModule({ code });
+      const info = await mod.getCompilationInfo();
+      const msgs = info.messages.filter(m => m.type === 'error' || m.type === 'warning')
+        .map(m => `${m.type} L${m.lineNum}: ${m.message.trim()}`);
+      // Creating the pipeline with an auto layout is what actually forces full
+      // validation of the entry point and its bindings.
+      let pipeErr = null;
+      try {
+        dev.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: 'main' } });
+      } catch (e) { pipeErr = String(e); }
+      const scoped = await dev.popErrorScope();
+      if (msgs.length || pipeErr || scoped) {
+        report.results.push({ name, errors: msgs, pipeline: pipeErr, scoped: scoped ? scoped.message : null });
+      }
+    }
+    report.total = names.length;
+    report.failed = report.results.length;
+  } catch (e) { report.error = String(e); }
+  await fetch('/', { method: 'POST', body: JSON.stringify(report, null, 1) });
+})();
+</script>

@@ -125,3 +125,7 @@ required-features = ["webgpu"]
 [[example]]
 name = "webgpu_q8_shootout"
 required-features = ["webgpu"]
+
+[[example]]
+name = "webgpu_dump_shaders"
+required-features = ["webgpu"]

@@ -18,11 +18,13 @@ struct Params {
     lhs_cs: u32, lhs_rs: u32, rhs_cs: u32, rhs_rs: u32,
     dst_rs: u32, dst_cs: u32, lhs_o: u32, rhs_o: u32,
 };
-var<push_constant> pc: Params;
+// WebGPU has no push constants; parameters arrive in a uniform windowed to
+// this dispatch's slot by a dynamic offset.
+@group(0) @binding(8) var<uniform> pc: Params;
 @group(0) @binding(0) var<storage, read_write> dst: array<S>;
-@group(0) @binding(1) var<storage, read_write> lhs: array<S>;
-@group(0) @binding(2) var<storage, read_write> rhs: array<S>;
-@group(0) @binding(3) var<storage, read_write> rhs4: array<S4>;
+@group(0) @binding(1) var<storage, read> lhs: array<S>;
+@group(0) @binding(2) var<storage, read> rhs: array<S>;
+@group(0) @binding(3) var<storage, read> rhs4: array<S4>;
 
 var<workgroup> sh: array<f32, 256>;
 

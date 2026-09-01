@@ -24,3 +24,8 @@ pocket-tts-wasm/pkg/
 tmp/
 *.wav
 .DS_Store
+
+# Shaders copied in for the browser check.
+xn-core/webgpu-browser-check/*.wgsl
+xn-core/webgpu-browser-check/index.json
+xn-core/webgpu-browser-check/cd/

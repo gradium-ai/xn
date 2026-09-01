@@ -12,8 +12,9 @@
 //!     exactly how the Vulkan backend behaves on a device without 16-bit
 //!     support.
 //!   * Kernels are WGSL compute shaders (see `webgpu-kernels/`), compiled
-//!     lazily on first use and cached. Parameters are passed as push constants
-//!     (the `PUSH_CONSTANTS` native feature), matching the Vulkan/Metal layout.
+//!     lazily on first use and cached. Parameters travel in a uniform buffer
+//!     addressed by a dynamic offset -- WebGPU has no push constants -- staged
+//!     host-side and uploaded once per batch.
 //!
 //! Unlike the native GPU backends, WebGPU storage buffers cannot be persistently
 //! host-mapped, so uploads go through `Queue::write_buffer` and readbacks copy
@@ -50,7 +51,12 @@ fn dtype_preamble(suffix: &str) -> Option<&'static str> {
         "f32" => Some(concat!(
             "alias S = f32;\n",
             "alias S4 = vec4<f32>;\n",
-            "const S_NEG_BIG: S = -3.4028235e38;\n",
+            // Exactly -f32::MAX. Browsers evaluate the literal as an abstract
+            // float and range-check it strictly, so the shortest round-trip form
+            // Rust prints for f32::MIN (-3.4028235e38) is rejected as out of
+            // range even though it rounds back to f32::MIN. Naga accepts it,
+            // which is how this reached a browser as a bug in every f32 kernel.
+            "const S_NEG_BIG: S = -3.4028234663852886e38;\n",
         )),
         "f16" => Some(concat!(
             "enable f16;\n",
@@ -83,50 +89,146 @@ fn cast_preamble(src: &str, dst: &str) -> Option<String> {
     Some(format!("{enable}alias SRC = {src_ty};\nalias S = {dst_ty};\n"))
 }
 
-/// WGSL source for a kernel and its storage-buffer binding count, by base name
-/// (no dtype suffix). `None` for an unknown kernel so a wrong dispatch fails
-/// loudly rather than silently doing nothing.
-fn kernel_src(base: &str) -> Option<(&'static str, u32)> {
-    let def = match base {
-        "fill" => (include_str!("../../webgpu-kernels/fill.wgsl"), 1),
-        "unary" => (include_str!("../../webgpu-kernels/unary.wgsl"), 2),
-        "binary" => (include_str!("../../webgpu-kernels/binary.wgsl"), 3),
-        "scale_add" => (include_str!("../../webgpu-kernels/scale_add.wgsl"), 2),
-        "broadcast" => (include_str!("../../webgpu-kernels/broadcast.wgsl"), 4),
-        "softmax" => (include_str!("../../webgpu-kernels/softmax.wgsl"), 2),
-        "rmsnorm" => (include_str!("../../webgpu-kernels/rmsnorm.wgsl"), 3),
-        "layernorm" => (include_str!("../../webgpu-kernels/layernorm.wgsl"), 4),
-        "rope" => (include_str!("../../webgpu-kernels/rope.wgsl"), 4),
-        "rope_i" => (include_str!("../../webgpu-kernels/rope_i.wgsl"), 4),
-        "reduce" => (include_str!("../../webgpu-kernels/reduce.wgsl"), 2),
-        "reduce_arg" => (include_str!("../../webgpu-kernels/reduce_arg.wgsl"), 2),
-        "transpose" => (include_str!("../../webgpu-kernels/transpose.wgsl"), 2),
-        "copy2d" => (include_str!("../../webgpu-kernels/copy2d.wgsl"), 2),
-        "copy_strided" => (include_str!("../../webgpu-kernels/copy_strided.wgsl"), 3),
-        "index_select" => (include_str!("../../webgpu-kernels/index_select.wgsl"), 3),
-        "causality_mask" => (include_str!("../../webgpu-kernels/causality_mask.wgsl"), 1),
-        "scatter_set" => (include_str!("../../webgpu-kernels/scatter_set.wgsl"), 3),
-        "gemm_tiled" => (include_str!("../../webgpu-kernels/gemm_tiled.wgsl"), 3),
-        // rhs is bound twice: scalar + a vec4 view for the aligned fast path.
-        "gemv" => (include_str!("../../webgpu-kernels/gemv.wgsl"), 4),
-        "gemv_tpc" => (include_str!("../../webgpu-kernels/gemv_tpc.wgsl"), 4),
-        "conv1d" => (include_str!("../../webgpu-kernels/conv1d.wgsl"), 3),
-        "conv_transpose1d" => (include_str!("../../webgpu-kernels/conv_transpose1d.wgsl"), 3),
-        "im2col1d" => (include_str!("../../webgpu-kernels/im2col1d.wgsl"), 2),
-        "col2im1d" => (include_str!("../../webgpu-kernels/col2im1d.wgsl"), 2),
-        "cast" => (include_str!("../../webgpu-kernels/cast.wgsl"), 2),
-        // dst, lhs (vec4 view), packed quants, scales, bias.
-        "qgemv_q8" => (include_str!("../../webgpu-kernels/qgemv_q8.wgsl"), 5),
-        "qgemm_q8" => (include_str!("../../webgpu-kernels/qgemm_q8.wgsl"), 5),
+/// Every kernel base name. Kept beside `kernel_src` so the two stay in step;
+/// used by [`all_shader_sources`] to hand the whole set to a validator.
+pub const KERNEL_NAMES: &[&str] = &[
+    "fill",
+    "unary",
+    "unary_inplace",
+    "binary",
+    "binary_inplace",
+    "scale_add",
+    "broadcast",
+    "softmax",
+    "rmsnorm",
+    "layernorm",
+    "rope",
+    "rope_i",
+    "reduce",
+    "reduce_arg",
+    "transpose",
+    "copy2d",
+    "copy_strided",
+    "index_select",
+    "causality_mask",
+    "scatter_set",
+    "gemm_tiled",
+    "gemv",
+    "gemv_tpc",
+    "conv1d",
+    "conv_transpose1d",
+    "im2col1d",
+    "col2im1d",
+    "qgemv_q8",
+    "qgemm_q8",
+];
+
+/// Composed WGSL for every kernel in every dtype, as `(dispatch name, source)`.
+///
+/// The backend compiles kernels lazily, and a browser's WGSL implementation is
+/// stricter than Naga's, so this exists to hand the whole set to one for
+/// validation without having to execute every op first. Cast kernels take two
+/// dtypes and so are named separately.
+pub fn all_shader_sources() -> Vec<(String, String)> {
+    let dtypes = ["f32", "f16"];
+    let mut out = Vec::new();
+    for name in KERNEL_NAMES {
+        for dt in dtypes {
+            let Some(def) = kernel_src(name) else { continue };
+            let Some(preamble) = dtype_preamble(dt) else { continue };
+            let ops = if def.needs_ops { OPS_SRC } else { "" };
+            out.push((format!("{name}_{dt}"), format!("{preamble}{ops}{}", def.src)));
+        }
+    }
+    for src in dtypes {
+        for dst in dtypes {
+            let def = kernel_src("cast").expect("cast kernel");
+            let preamble = cast_preamble(src, dst).expect("cast preamble");
+            out.push((format!("cast_{src}_{dst}"), format!("{preamble}{}", def.src)));
+        }
+    }
+    out
+}
+
+/// Shared elementwise op bodies, prepended for kernels that ask for them. WGSL
+/// has no include mechanism, so snippets are composed here.
+const OPS_SRC: &str = include_str!("../../webgpu-kernels/ops.wgsl");
+
+/// A kernel's source and how it binds.
+struct KernelDef {
+    src: &'static str,
+    /// Storage bindings, always at indices `0..bindings`.
+    bindings: u32,
+    /// Bit `i` set means binding `i` is written. Every other binding is declared
+    /// read-only in WGSL and in the layout, which is what lets a kernel bind one
+    /// buffer to several slots: WebGPU permits aliasing only when no aliased
+    /// binding is writable (gemv binds its weights twice, scalar and vec4).
+    writable: u32,
+    /// Whether `ops.wgsl` is needed.
+    needs_ops: bool,
+}
+
+/// WGSL source for a kernel by base name (no dtype suffix). `None` for an unknown
+/// kernel so a wrong dispatch fails loudly rather than silently doing nothing.
+fn kernel_src(base: &str) -> Option<KernelDef> {
+    // (source, bindings, index of the written binding, needs ops.wgsl)
+    let def: (&'static str, u32, u32, bool) = match base {
+        "fill" => (include_str!("../../webgpu-kernels/fill.wgsl"), 1, 0, false),
+        "unary" => (include_str!("../../webgpu-kernels/unary.wgsl"), 2, 1, true),
+        "unary_inplace" => (include_str!("../../webgpu-kernels/unary_inplace.wgsl"), 1, 0, true),
+        "binary" => (include_str!("../../webgpu-kernels/binary.wgsl"), 3, 2, true),
+        "binary_inplace" => (include_str!("../../webgpu-kernels/binary_inplace.wgsl"), 2, 0, true),
+        "scale_add" => (include_str!("../../webgpu-kernels/scale_add.wgsl"), 2, 1, false),
+        "broadcast" => (include_str!("../../webgpu-kernels/broadcast.wgsl"), 4, 2, true),
+        "softmax" => (include_str!("../../webgpu-kernels/softmax.wgsl"), 2, 1, false),
+        "rmsnorm" => (include_str!("../../webgpu-kernels/rmsnorm.wgsl"), 3, 1, false),
+        "layernorm" => (include_str!("../../webgpu-kernels/layernorm.wgsl"), 4, 1, false),
+        "rope" => (include_str!("../../webgpu-kernels/rope.wgsl"), 4, 3, false),
+        "rope_i" => (include_str!("../../webgpu-kernels/rope_i.wgsl"), 4, 3, false),
+        "reduce" => (include_str!("../../webgpu-kernels/reduce.wgsl"), 2, 1, false),
+        "reduce_arg" => (include_str!("../../webgpu-kernels/reduce_arg.wgsl"), 2, 1, false),
+        "transpose" => (include_str!("../../webgpu-kernels/transpose.wgsl"), 2, 1, false),
+        "copy2d" => (include_str!("../../webgpu-kernels/copy2d.wgsl"), 2, 1, false),
+        "copy_strided" => (include_str!("../../webgpu-kernels/copy_strided.wgsl"), 3, 1, false),
+        "index_select" => (include_str!("../../webgpu-kernels/index_select.wgsl"), 3, 1, false),
+        "causality_mask" => (include_str!("../../webgpu-kernels/causality_mask.wgsl"), 1, 0, false),
+        "scatter_set" => (include_str!("../../webgpu-kernels/scatter_set.wgsl"), 3, 0, false),
+        "gemm_tiled" => (include_str!("../../webgpu-kernels/gemm_tiled.wgsl"), 3, 0, false),
+        "gemv" => (include_str!("../../webgpu-kernels/gemv.wgsl"), 4, 0, false),
+        "gemv_tpc" => (include_str!("../../webgpu-kernels/gemv_tpc.wgsl"), 4, 0, false),
+        "conv1d" => (include_str!("../../webgpu-kernels/conv1d.wgsl"), 3, 0, false),
+        "conv_transpose1d" => {
+            (include_str!("../../webgpu-kernels/conv_transpose1d.wgsl"), 3, 0, false)
+        }
+        "im2col1d" => (include_str!("../../webgpu-kernels/im2col1d.wgsl"), 2, 0, false),
+        "col2im1d" => (include_str!("../../webgpu-kernels/col2im1d.wgsl"), 2, 0, false),
+        "cast" => (include_str!("../../webgpu-kernels/cast.wgsl"), 2, 0, false),
+        "qgemv_q8" => (include_str!("../../webgpu-kernels/qgemv_q8.wgsl"), 5, 0, false),
+        "qgemm_q8" => (include_str!("../../webgpu-kernels/qgemm_q8.wgsl"), 5, 0, false),
         _ => return None,
     };
-    Some(def)
+    let (src, bindings, dst_binding, needs_ops) = def;
+    Some(KernelDef { src, bindings, writable: 1u32 << dst_binding, needs_ops })
 }
 
 /// Largest storage-binding count any kernel uses (`qgemv_q8`). The device
 /// allows far more; this only sizes the layout table.
-const MAX_BINDINGS: usize = 5;
-const PUSH_CONSTANT_SIZE: u32 = 128;
+/// Most storage bindings any kernel declares (`qgemv_q8`). Browsers cap
+/// `maxStorageBuffersPerShaderStage` far lower than native adapters do -- Chrome
+/// on Metal reports 10 against native wgpu's 31 -- so this is checked rather
+/// than assumed.
+const MAX_BINDINGS: u32 = 5;
+/// Binding index for the kernel-parameter uniform, the same in every kernel so
+/// storage bindings never have to be renumbered around it.
+const PARAMS_BINDING: u32 = 8;
+/// Bytes reserved per dispatch in the parameter ring. Must be at least the
+/// largest `Params` struct (gemm's 14 u32 = 56 B) and a multiple of the device's
+/// `min_uniform_buffer_offset_alignment`, which is 256 on every adapter wgpu
+/// reports; asserted against the real limit at device creation.
+const PARAMS_SLOT_SIZE: u64 = 256;
+/// Dispatches worth of parameters held before a flush is forced. A decode frame
+/// records a few hundred, so this only bounds pathological batches.
+const PARAMS_RING_SLOTS: u64 = 4096;
 const WORKGROUP_SIZE: u32 = 256;
 /// GEMM tile size; must match `TILE` / the `@workgroup_size` in gemm_tiled.wgsl.
 const TILE: u32 = 16;
@@ -166,6 +268,9 @@ impl Pc {
 struct CachedPipeline {
     pipeline: wgpu::ComputePipeline,
     bindings: u32,
+    /// Built from the kernel's writable mask, so it is per-kernel rather than
+    /// shared per binding count.
+    bgl: wgpu::BindGroupLayout,
 }
 
 /// A pooled buffer plus its size class.
@@ -252,18 +357,24 @@ struct OpCtx {
     /// Buffers (dropped tensors + scratch) to recycle into the pool on the next
     /// flush, once the batch referencing them has finished executing.
     free_bufs: Vec<PooledBuf>,
+    /// Kernel parameters for every dispatch in this batch, one `PARAMS_SLOT_SIZE`
+    /// slot each, uploaded in a single write just before the batch is submitted.
+    ///
+    /// WebGPU has no push constants, so parameters travel in a uniform buffer
+    /// addressed by a dynamic offset. Staging them host-side and writing once per
+    /// batch keeps that to one `write_buffer` rather than one per dispatch.
+    params: Vec<u8>,
 }
 
 pub struct DeviceInner {
     device: wgpu::Device,
+    /// Ring of kernel-parameter slots, bound with a dynamic offset.
+    params_ring: wgpu::Buffer,
     /// Idle `MAP_READ` staging buffers by size class. Creating one per readback
     /// dominated `readback_ns`; a readback only borrows it between `map_async`
     /// and `unmap`, so they recycle cleanly.
     staging: Mutex<HashMap<u64, Vec<wgpu::Buffer>>>,
     queue: wgpu::Queue,
-    // bind_group_layouts[n] / pipeline_layouts[n] describe `n` storage bindings.
-    bind_group_layouts: Vec<wgpu::BindGroupLayout>,
-    pipeline_layouts: Vec<wgpu::PipelineLayout>,
     pipelines: Mutex<HashMap<String, CachedPipeline>>,
     pool: Mutex<BufferPool>,
     ctx: Mutex<OpCtx>,
@@ -334,14 +445,20 @@ impl Device {
         // gate an f16 compute path would have to check.
         let adapter_f16 = adapter.features().contains(wgpu::Features::SHADER_F16);
 
-        // Push constants (native feature) carry kernel parameters; f32 storage
-        // buffers hold tensor data. Request a limit that fits the largest push
-        // block (gemm: 14 u32 = 56 B) with headroom.
-        let limits =
-            wgpu::Limits { max_push_constant_size: PUSH_CONSTANT_SIZE, ..adapter.limits() };
+        // Kernel parameters travel in a uniform buffer, not push constants, so
+        // the backend asks for no non-standard features beyond optional f16 and
+        // stays inside what a browser exposes.
+        let limits = adapter.limits();
+        let uniform_align = u64::from(limits.min_uniform_buffer_offset_alignment);
+        if !PARAMS_SLOT_SIZE.is_multiple_of(uniform_align) {
+            crate::bail!(
+                "webgpu: parameter slot size {PARAMS_SLOT_SIZE} is not a multiple of this \
+                 adapter's min_uniform_buffer_offset_alignment ({uniform_align})"
+            );
+        }
         // f16 compute is opt-in per adapter. When it is missing the backend stays
         // f32-only and 16-bit storage falls back to the host, as before.
-        let mut features = wgpu::Features::PUSH_CONSTANTS;
+        let mut features = wgpu::Features::empty();
         if adapter_f16 {
             features |= wgpu::Features::SHADER_F16;
         }
@@ -356,48 +473,18 @@ impl Device {
             .await
             .map_err(wgpuerr("request_device (push-constant support required)"))?;
 
-        // A storage-buffer bind group layout + pipeline layout for each binding
-        // count. Every binding is a read_write storage buffer (info/ids buffers
-        // are declared read_write in WGSL too), so a single layout per count
-        // serves every kernel with that many bindings.
-        let mut bind_group_layouts = Vec::with_capacity(MAX_BINDINGS + 1);
-        let mut pipeline_layouts = Vec::with_capacity(MAX_BINDINGS + 1);
-        for n in 0..=MAX_BINDINGS {
-            let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..n)
-                .map(|i| wgpu::BindGroupLayoutEntry {
-                    binding: i as u32,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                })
-                .collect();
-            let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some(&format!("xn-bgl-{n}")),
-                entries: &entries,
-            });
-            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some(&format!("xn-pl-{n}")),
-                bind_group_layouts: &[&bgl],
-                push_constant_ranges: &[wgpu::PushConstantRange {
-                    stages: wgpu::ShaderStages::COMPUTE,
-                    range: 0..PUSH_CONSTANT_SIZE,
-                }],
-            });
-            bind_group_layouts.push(bgl);
-            pipeline_layouts.push(pl);
-        }
-
         let profile = std::env::var("XN_WEBGPU_PROFILE").is_ok_and(|v| !v.is_empty() && v != "0");
 
+        let params_ring = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("xn-params"),
+            size: PARAMS_SLOT_SIZE * PARAMS_RING_SLOTS,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let inner = DeviceInner {
             device,
+            params_ring,
             queue,
-            bind_group_layouts,
-            pipeline_layouts,
             pipelines: Mutex::new(HashMap::new()),
             pool: Mutex::new(BufferPool::default()),
             staging: Mutex::new(HashMap::new()),
@@ -406,6 +493,7 @@ impl Device {
                 pass: None,
                 open: false,
                 free_bufs: Vec::new(),
+                params: Vec::new(),
             }),
             device_name,
             adapter_f16,
@@ -454,11 +542,15 @@ impl Device {
         })
     }
 
-    fn get_pipeline(&self, name: &str) -> Result<(wgpu::ComputePipeline, u32)> {
+    #[allow(clippy::type_complexity)]
+    fn get_pipeline(
+        &self,
+        name: &str,
+    ) -> Result<(wgpu::ComputePipeline, u32, wgpu::BindGroupLayout)> {
         {
             let pipelines = self.pipelines.lock().unwrap();
             if let Some(p) = pipelines.get(name) {
-                return Ok((p.pipeline.clone(), p.bindings));
+                return Ok((p.pipeline.clone(), p.bindings, p.bgl.clone()));
             }
         }
         // Dispatch names are `<base>_<dtype>`, or `cast_<src>_<dst>`.
@@ -481,16 +573,24 @@ impl Device {
                     .to_string(),
             ),
         };
-        let (body, bindings) = kernel_src(base)
+        let def = kernel_src(base)
             .ok_or_else(|| crate::Error::msg(format!("webgpu: unknown kernel {name}")))?;
-        let src = format!("{preamble}{body}");
+        let bindings = def.bindings;
+        let ops = if def.needs_ops { OPS_SRC } else { "" };
+        let src = format!("{preamble}{ops}{}", def.src);
+        let bgl = self.bind_group_layout(name, bindings, def.writable);
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(name),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(src)),
         });
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(name),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
         let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(name),
-            layout: Some(&self.pipeline_layouts[bindings as usize]),
+            layout: Some(&pipeline_layout),
             module: &module,
             entry_point: Some("main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -498,8 +598,54 @@ impl Device {
         });
         let mut pipelines = self.pipelines.lock().unwrap();
         let entry =
-            pipelines.entry(name.to_string()).or_insert(CachedPipeline { pipeline, bindings });
-        Ok((entry.pipeline.clone(), entry.bindings))
+            pipelines.entry(name.to_string()).or_insert(CachedPipeline { pipeline, bindings, bgl });
+        Ok((entry.pipeline.clone(), entry.bindings, entry.bgl.clone()))
+    }
+
+    /// Bind group layout for a kernel: `bindings` storage buffers, of which only
+    /// those set in `writable` are read_write, plus the parameter uniform.
+    ///
+    /// Declaring the rest read-only is what makes the backend WebGPU-legal:
+    /// aliasing one buffer across several bindings is permitted only when none of
+    /// them is writable, and several kernels do exactly that (gemv binds its
+    /// weights as both scalars and vec4s).
+    fn bind_group_layout(
+        &self,
+        label: &str,
+        bindings: u32,
+        writable: u32,
+    ) -> wgpu::BindGroupLayout {
+        debug_assert!(
+            bindings <= MAX_BINDINGS,
+            "kernel {label} declares {bindings} storage bindings, over the {MAX_BINDINGS} \
+             this backend is documented to stay within"
+        );
+        let mut entries: Vec<wgpu::BindGroupLayoutEntry> = (0..bindings)
+            .map(|i| wgpu::BindGroupLayoutEntry {
+                binding: i,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: writable & (1u32 << i) == 0 },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            })
+            .collect();
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: PARAMS_BINDING,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: true,
+                min_binding_size: None,
+            },
+            count: None,
+        });
+        self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(label),
+            entries: &entries,
+        })
     }
 
     /// Record a single dispatch of `kernel` (1D workgroup count).
@@ -527,9 +673,9 @@ impl Device {
             return Ok(());
         }
         let t0 = self.profile.then(std::time::Instant::now);
-        let (pipeline, bindings) = self.get_pipeline(kernel)?;
+        let (pipeline, bindings, bgl) = self.get_pipeline(kernel)?;
         assert_eq!(bindings as usize, buffers.len(), "kernel {kernel} binding count mismatch");
-        let entries: Vec<wgpu::BindGroupEntry> = buffers
+        let mut entries: Vec<wgpu::BindGroupEntry> = buffers
             .iter()
             .enumerate()
             .map(|(i, b)| wgpu::BindGroupEntry {
@@ -537,12 +683,34 @@ impl Device {
                 resource: b.as_entire_binding(),
             })
             .collect();
+        entries.push(wgpu::BindGroupEntry {
+            binding: PARAMS_BINDING,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &self.params_ring,
+                offset: 0,
+                size: Some(std::num::NonZeroU64::new(PARAMS_SLOT_SIZE).unwrap()),
+            }),
+        });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(kernel),
-            layout: &self.bind_group_layouts[bindings as usize],
+            layout: &bgl,
             entries: &entries,
         });
         let mut ctx = self.ctx.lock().unwrap();
+        // The ring is written in one go at flush, so a full ring means flushing
+        // now rather than growing it.
+        if ctx.params.len() as u64 + PARAMS_SLOT_SIZE > PARAMS_SLOT_SIZE * PARAMS_RING_SLOTS {
+            self.flush_locked(&mut ctx)?;
+        }
+        let params_offset = ctx.params.len() as u32;
+        if push.bytes.len() as u64 > PARAMS_SLOT_SIZE {
+            crate::bail!(
+                "webgpu: kernel {kernel} has {} bytes of parameters, slot is {PARAMS_SLOT_SIZE}",
+                push.bytes.len()
+            );
+        }
+        ctx.params.extend_from_slice(&push.bytes);
+        ctx.params.resize(params_offset as usize + PARAMS_SLOT_SIZE as usize, 0);
         self.begin_if_needed(&mut ctx);
         let opened = ctx.pass.is_none();
         if opened {
@@ -561,8 +729,7 @@ impl Device {
         {
             let cpass = ctx.pass.as_mut().unwrap();
             cpass.set_pipeline(&pipeline);
-            cpass.set_bind_group(0, &bind_group, &[]);
-            cpass.set_push_constants(0, &push.bytes);
+            cpass.set_bind_group(0, &bind_group, &[params_offset]);
             cpass.dispatch_workgroups(gx, gy, gz);
         }
         drop(ctx);
@@ -621,6 +788,9 @@ impl Device {
         let t0 = (self.profile && had_work).then(std::time::Instant::now);
         let (mut pass_end_ns, mut submit_ns) = (0u128, 0u128);
         if ctx.open {
+            if !ctx.params.is_empty() {
+                self.queue.write_buffer(&self.params_ring, 0, &ctx.params);
+            }
             let t = self.profile.then(std::time::Instant::now);
             ctx.pass = None;
             if let Some(t) = t {
@@ -633,6 +803,7 @@ impl Device {
                 submit_ns = t.elapsed().as_nanos();
             }
             ctx.open = false;
+            ctx.params.clear();
         }
         // Drive the queue to completion so host reads and buffer recycling are
         // safe. `poll(Wait)` blocks until all submitted work has finished.

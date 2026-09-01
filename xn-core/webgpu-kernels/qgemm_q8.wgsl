@@ -9,15 +9,17 @@
 const MR: u32 = 4u;
 
 struct Params { m: u32, n: u32, k: u32, has_bias: u32, scale_off: u32 };
-var<push_constant> pc: Params;
+// WebGPU has no push constants; parameters arrive in a uniform windowed to
+// this dispatch's slot by a dynamic offset.
+@group(0) @binding(8) var<uniform> pc: Params;
 @group(0) @binding(0) var<storage, read_write> dst: array<S>;
-@group(0) @binding(1) var<storage, read_write> lhs4: array<S4>;
-@group(0) @binding(2) var<storage, read_write> q: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read> lhs4: array<S4>;
+@group(0) @binding(2) var<storage, read> q: array<vec4<u32>>;
 // Same buffer as `q`, viewed as f32: the scales follow the quants, starting at
 // word `pc.scale_off`. One buffer instead of two keeps the number of distinct
 // buffers a compute pass references down, which measurably dominates.
-@group(0) @binding(3) var<storage, read_write> scales: array<f32>;
-@group(0) @binding(4) var<storage, read_write> bias: array<S>;
+@group(0) @binding(3) var<storage, read> scales: array<f32>;
+@group(0) @binding(4) var<storage, read> bias: array<S>;
 
 /// One 32-value block against `lhs4[base ..]`. The weights arrive as parameters
 /// rather than an array so they stay in registers; this inlines.

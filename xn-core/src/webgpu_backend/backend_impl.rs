@@ -182,9 +182,11 @@ impl crate::Backend for Device {
         let dt = dst.device.dtype_suffix::<T>("inplace_unary")?;
         let (code, alpha) = unary_op_code(op);
         let push = Pc::new().usize(len).u32(code).f32(alpha);
+        // A single read_write binding rather than the same buffer bound twice:
+        // WebGPU forbids aliasing a buffer across bindings when one is writable.
         dst.device.dispatch(
-            &format!("unary_{dt}"),
-            &[&dst.buffer, &dst.buffer],
+            &format!("unary_inplace_{dt}"),
+            &[&dst.buffer],
             &push,
             div_ceil(len, WORKGROUP_SIZE),
         )
@@ -215,9 +217,10 @@ impl crate::Backend for Device {
     ) -> Result<()> {
         if let Some(dt) = dst.device.float_suffix::<T>() {
             let push = Pc::new().usize(len).u32(binary_op_code(op));
+            // dst is read and written through one binding; see `inplace_unary`.
             dst.device.dispatch(
-                &format!("binary_{dt}"),
-                &[&dst.buffer, &s.buffer, &dst.buffer],
+                &format!("binary_inplace_{dt}"),
+                &[&dst.buffer, &s.buffer],
                 &push,
                 div_ceil(len, WORKGROUP_SIZE),
             )
