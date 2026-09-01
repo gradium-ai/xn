@@ -402,6 +402,10 @@ struct OpCtx {
     /// Buffers (dropped tensors + scratch) to recycle into the pool on the next
     /// flush, once the batch referencing them has finished executing.
     free_bufs: Vec<PooledBuf>,
+    /// Whether anything has been submitted since the queue was last known to be
+    /// drained. `flush_async` awaits a completion callback, and with nothing ever
+    /// submitted that callback does not arrive, so it must not wait in that case.
+    submitted: bool,
     /// Kernel parameters for every dispatch in this batch, one `PARAMS_SLOT_SIZE`
     /// slot each, uploaded in a single write just before the batch is submitted.
     ///
@@ -574,6 +578,7 @@ impl Device {
                 pass: None,
                 open: false,
                 free_bufs: Vec::new(),
+                submitted: false,
                 params: Vec::new(),
             }),
             device_name,
@@ -884,6 +889,7 @@ impl Device {
                 submit_ns = t.elapsed().as_nanos();
             }
             ctx.open = false;
+            ctx.submitted = true;
             ctx.params.clear();
         }
         // Drive the queue to completion so host reads and buffer recycling are
@@ -896,7 +902,10 @@ impl Device {
         // block, so this sync flush leaves the buffers queued and `flush_async`
         // recycles them after awaiting.
         #[cfg(not(target_arch = "wasm32"))]
-        Self::recycle(&self.pool, ctx);
+        {
+            ctx.submitted = false;
+            Self::recycle(&self.pool, ctx);
+        }
         if let Some(t0) = t0 {
             let mut p = self.pstats.lock().unwrap();
             p.submits += 1;
@@ -940,6 +949,7 @@ impl Device {
     /// Submit any pending work and await its completion. The browser-safe
     /// counterpart to `flush`.
     pub async fn flush_async(&self) -> Result<()> {
+        let outstanding;
         {
             let mut ctx = self.ctx.lock().unwrap();
             if ctx.open {
@@ -950,8 +960,15 @@ impl Device {
                 let enc = ctx.encoder.take().expect("open batch has an encoder");
                 self.queue.submit(Some(enc.finish()));
                 ctx.open = false;
+                ctx.submitted = true;
                 ctx.params.clear();
             }
+            outstanding = ctx.submitted;
+        }
+        // With nothing outstanding there is nothing to wait for, and awaiting a
+        // completion callback that will never be delivered would hang.
+        if !outstanding {
+            return Ok(());
         }
         let (signal, fire) = Signal::new();
         self.queue.on_submitted_work_done(fire);
@@ -961,7 +978,9 @@ impl Device {
         self.device.poll(wgpu::PollType::Wait).map_err(wgpuerr("poll (flush_async)"))?;
         signal.await;
         // Completion is known now, so queued buffers can go back in the pool.
-        Self::recycle(&self.pool, &mut self.ctx.lock().unwrap());
+        let mut ctx = self.ctx.lock().unwrap();
+        ctx.submitted = false;
+        Self::recycle(&self.pool, &mut ctx);
         Ok(())
     }
 

@@ -292,3 +292,148 @@ pub async fn run_all() -> String {
         results.join(", ")
     )
 }
+
+// -----------------------------------------------------------------------------
+// Benchmark
+// -----------------------------------------------------------------------------
+
+/// Wall-clock milliseconds. `std::time::Instant` panics on wasm32-unknown-unknown,
+/// so timing comes from `performance.now()`. Chrome clamps its resolution to
+/// ~100 us unless the page is cross-origin isolated, which is why every
+/// measurement below aggregates over enough iterations that the total is orders
+/// of magnitude above that.
+fn now_ms() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0)
+}
+
+/// Mirrors the native `webgpu_dispatch_cost` example: record `iters` dispatches
+/// without reading back, so they batch into one pass and one submit, then pay for
+/// all of them with a single completion. Dividing by `iters` gives the marginal
+/// cost of one dispatch.
+async fn bench(dev: &Device, iters: usize, mut f: impl FnMut()) -> f64 {
+    for _ in 0..8 {
+        f();
+    }
+    dev.flush_async().await.unwrap();
+    let start = now_ms();
+    for _ in 0..iters {
+        f();
+    }
+    dev.flush_async().await.unwrap();
+    (now_ms() - start) * 1000.0 / iters as f64
+}
+
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub async fn bench_all(divisor: u32) -> String {
+    console_error_panic_hook::set_once();
+    let dev = match Device::new_async(0).await {
+        Ok(d) => d,
+        Err(e) => return format!("{{\"deviceError\": \"{}\"}}", json_escape(&format!("{e}"))),
+    };
+    // Iteration counts are divided by `divisor` so the page can dial the work
+    // down; every wgpu call crosses into JS in a browser, which is far more
+    // expensive per dispatch than the native path.
+    // divisor == 0 is a probe: stop after device creation and one timer read, to
+    // separate a hang in setup from one in the measurement loops.
+    if divisor == 0 {
+        let t0 = now_ms();
+        let ok = dev.flush_async().await.is_ok();
+        return format!(
+            "{{\"probe\": true, \"now\": {t0}, \"flush_async_ok\": {ok}, \"device\": \"{}\"}}",
+            json_escape(&<Device as xn::Backend>::name(&dev))
+        );
+    }
+    let div = divisor.max(1) as usize;
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = |label: String, us: f64, extra: String| {
+        rows.push(format!(
+            "{{\"name\": \"{}\", \"us\": {:.3}{}}}",
+            json_escape(&label),
+            us,
+            extra
+        ));
+    };
+
+    // Every measurement writes into a preallocated destination rather than
+    // letting the op allocate. That keeps this measuring dispatch and kernel
+    // cost, and keeps the buffer pool out of it -- which matters here because on
+    // wasm nothing can block, so buffers freed inside a batch are not recycled
+    // until the next await, and an allocating loop of thousands of ops would be
+    // measuring allocation instead.
+    let tiny: Tensor<f32, Device> = Tensor::from_vec(vec![1f32; 256], vec![256], &dev).unwrap();
+    let tiny_dst: Tensor<f32, Device> =
+        Tensor::from_vec(vec![0f32; 256], vec![256], &dev).unwrap();
+    let us = bench(&dev, 4000 / div, || {
+        tiny_dst.silu_(&tiny).unwrap();
+    })
+    .await;
+    row("unary, 256 elems (1 workgroup)".into(), us, String::new());
+
+    // The same op letting the result allocate, which is what model code does.
+    // Natively the pool recycles on every flush; on wasm nothing can block, so
+    // buffers freed inside a batch are not reusable until the next await and this
+    // pays a fresh allocation per op. Low iteration count for that reason.
+    let us = bench(&dev, (400 / div).max(1), || {
+        tiny.silu().unwrap();
+    })
+    .await;
+    row("unary, 256 elems, allocating".into(), us, String::new());
+
+    let med: Tensor<f32, Device> =
+        Tensor::from_vec(vec![1f32; 1 << 16], vec![1 << 16], &dev).unwrap();
+    let med_dst: Tensor<f32, Device> =
+        Tensor::from_vec(vec![0f32; 1 << 16], vec![1 << 16], &dev).unwrap();
+    let us = bench(&dev, (500 / div).max(1), || {
+        med_dst.silu_(&med).unwrap();
+    })
+    .await;
+    row("unary, 65536 elems (256 workgroups)".into(), us, String::new());
+
+    // The decode-shaped GEMVs, in both dtypes, through matmul_t as Linear does.
+    for &(k, n) in &[(768usize, 768usize), (768, 3072), (3072, 768)] {
+        let bytes32 = (k * n * 4) as f64;
+        let a: Tensor<f32, Device> = Tensor::from_vec(vec![0.01f32; k], vec![1, k], &dev).unwrap();
+        let w: Tensor<f32, Device> =
+            Tensor::from_vec(vec![0.01f32; k * n], vec![n, k], &dev).unwrap();
+        let out: Tensor<f32, Device> =
+            Tensor::from_vec(vec![0f32; n], vec![1, n], &dev).unwrap();
+        let us = bench(&dev, (1500 / div).max(1), || {
+            out.matmul_(&a, &w, true).unwrap();
+        })
+        .await;
+        row(
+            format!("gemv_t f32 1x{k} @ {n}x{k}"),
+            us,
+            format!(", \"gbps\": {:.1}", bytes32 / (us * 1e3)),
+        );
+
+        if dev.supports_f16() {
+            let bytes16 = (k * n * 2) as f64;
+            let a: Tensor<f16, Device> =
+                Tensor::from_vec(vec![f16::from_f32(0.01); k], vec![1, k], &dev).unwrap();
+            let w: Tensor<f16, Device> =
+                Tensor::from_vec(vec![f16::from_f32(0.01); k * n], vec![n, k], &dev).unwrap();
+            let out: Tensor<f16, Device> =
+                Tensor::from_vec(vec![f16::from_f32(0.0); n], vec![1, n], &dev).unwrap();
+            let us = bench(&dev, (1500 / div).max(1), || {
+                out.matmul_(&a, &w, true).unwrap();
+            })
+            .await;
+            row(
+                format!("gemv_t f16 1x{k} @ {n}x{k}"),
+                us,
+                format!(", \"gbps\": {:.1}", bytes16 / (us * 1e3)),
+            );
+        }
+    }
+
+    format!(
+        "{{\"device\": \"{}\", \"f16\": {}, \"rows\": [{}]}}",
+        json_escape(&<Device as xn::Backend>::name(&dev)),
+        dev.supports_f16(),
+        rows.join(", ")
+    )
+}
