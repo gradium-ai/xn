@@ -4,7 +4,7 @@
 //   op: 0 = argmin, 1 = argmax
 struct Params { num_outputs: u32, dim_size: u32, inner_size: u32, op: u32 };
 var<push_constant> pc: Params;
-@group(0) @binding(0) var<storage, read_write> src: array<f32>;
+@group(0) @binding(0) var<storage, read_write> src: array<S>;
 @group(0) @binding(1) var<storage, read_write> dst: array<u32>;
 
 var<workgroup> shv: array<f32, 256>;
@@ -26,7 +26,7 @@ fn main(
     var bidx = 0u;
     var have = false;
     for (var k = tid; k < pc.dim_size; k = k + 256u) {
-        let v = src[outer_base + k * pc.inner_size];
+        let v = f32(src[outer_base + k * pc.inner_size]);
         var better = v < best;
         if pc.op == 1u { better = v > best; }
         if !have || better {

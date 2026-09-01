@@ -2,8 +2,8 @@
 // `op` matches the `UnaryOp` order used by the CPU/CUDA backends.
 struct Params { n: u32, op: u32, alpha: f32 };
 var<push_constant> pc: Params;
-@group(0) @binding(0) var<storage, read_write> src: array<f32>;
-@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(0) var<storage, read_write> src: array<S>;
+@group(0) @binding(1) var<storage, read_write> dst: array<S>;
 
 // Abramowitz & Stegun 7.1.26 approximation of erf, max abs error ~1.5e-7.
 fn erf_approx(x0: f32) -> f32 {
@@ -19,7 +19,7 @@ fn erf_approx(x0: f32) -> f32 {
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if i >= pc.n { return; }
-    let x = src[i];
+    let x = f32(src[i]);
     var r: f32;
     switch pc.op {
         case 0u: { r = cos(x); }
@@ -39,5 +39,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         case 14u: { r = 1.0 / (1.0 + exp(-x)); }
         default: { r = x; }
     }
-    dst[i] = r;
+    dst[i] = S(r);
 }

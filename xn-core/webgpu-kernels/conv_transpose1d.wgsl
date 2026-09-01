@@ -7,9 +7,9 @@ struct Params {
     out_length: u32, kernel_size: u32, stride: u32, padding: u32, groups: u32,
 };
 var<push_constant> pc: Params;
-@group(0) @binding(0) var<storage, read_write> dst: array<f32>;
-@group(0) @binding(1) var<storage, read_write> src: array<f32>;
-@group(0) @binding(2) var<storage, read_write> kern: array<f32>;
+@group(0) @binding(0) var<storage, read_write> dst: array<S>;
+@group(0) @binding(1) var<storage, read_write> src: array<S>;
+@group(0) @binding(2) var<storage, read_write> kern: array<S>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -38,10 +38,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if il >= pc.in_len { continue; }
         for (var ic = 0u; ic < in_c_per_group; ic = ic + 1u) {
             let in_c = in_c_start + ic;
-            let sv = src[(b * pc.in_channels + in_c) * pc.in_len + il];
-            let kv = kern[(in_c * out_c_per_group + oc_in_group) * pc.kernel_size + ko];
+            let sv = f32(src[(b * pc.in_channels + in_c) * pc.in_len + il]);
+            let kv = f32(kern[(in_c * out_c_per_group + oc_in_group) * pc.kernel_size + ko]);
             acc = acc + sv * kv;
         }
     }
-    dst[(b * pc.out_channels + oc) * pc.out_length + out_pos] = acc;
+    dst[(b * pc.out_channels + oc) * pc.out_length + out_pos] = S(acc);
 }

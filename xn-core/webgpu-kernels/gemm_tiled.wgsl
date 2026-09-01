@@ -12,9 +12,9 @@ struct Params {
     dst_rs: u32, dst_cs: u32, lhs_o: u32, rhs_o: u32,
 };
 var<push_constant> pc: Params;
-@group(0) @binding(0) var<storage, read_write> dst: array<f32>;
-@group(0) @binding(1) var<storage, read_write> lhs: array<f32>;
-@group(0) @binding(2) var<storage, read_write> rhs: array<f32>;
+@group(0) @binding(0) var<storage, read_write> dst: array<S>;
+@group(0) @binding(1) var<storage, read_write> lhs: array<S>;
+@group(0) @binding(2) var<storage, read_write> rhs: array<S>;
 
 const TILE: u32 = 16u;
 var<workgroup> lt: array<array<f32, 16>, 16>;
@@ -41,12 +41,12 @@ fn main(
         let l_lhs = t * TILE + lx;
         let l_rhs = t * TILE + ly;
         if row < pc.m && l_lhs < pc.k {
-            lt[ly][lx] = lhs[lhs_base + row * pc.lhs_rs + l_lhs * pc.lhs_cs];
+            lt[ly][lx] = f32(lhs[lhs_base + row * pc.lhs_rs + l_lhs * pc.lhs_cs]);
         } else {
             lt[ly][lx] = 0.0;
         }
         if col < pc.n && l_rhs < pc.k {
-            rt[ly][lx] = rhs[rhs_base + l_rhs * pc.rhs_rs + col * pc.rhs_cs];
+            rt[ly][lx] = f32(rhs[rhs_base + l_rhs * pc.rhs_rs + col * pc.rhs_cs]);
         } else {
             rt[ly][lx] = 0.0;
         }
@@ -58,6 +58,6 @@ fn main(
     }
 
     if row < pc.m && col < pc.n {
-        dst[b * pc.m * pc.n + row * pc.dst_rs + col * pc.dst_cs] = acc;
+        dst[b * pc.m * pc.n + row * pc.dst_rs + col * pc.dst_cs] = S(acc);
     }
 }

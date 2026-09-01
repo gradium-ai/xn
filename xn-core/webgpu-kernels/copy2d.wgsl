@@ -2,8 +2,8 @@
 // for i in [0,d1), j in [0,d2).
 struct Params { d1: u32, d2: u32, src_s: u32, dst_s: u32, src_o: u32, dst_o: u32 };
 var<push_constant> pc: Params;
-@group(0) @binding(0) var<storage, read_write> src: array<f32>;
-@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(0) var<storage, read_write> src: array<S>;
+@group(0) @binding(1) var<storage, read_write> dst: array<S>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {

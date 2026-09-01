@@ -9,8 +9,8 @@ struct Params {
     kernel_size: u32, stride: u32,
 };
 var<push_constant> pc: Params;
-@group(0) @binding(0) var<storage, read_write> dst: array<f32>;
-@group(0) @binding(1) var<storage, read_write> src: array<f32>;
+@group(0) @binding(0) var<storage, read_write> dst: array<S>;
+@group(0) @binding(1) var<storage, read_write> src: array<S>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -36,10 +36,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if !(k < i32(pc.kernel_size) && l_in_idx >= 0) { break; }
         if l_in_idx < i32(pc.l_in) {
             let src_idx = src_batch_base + u32(l_in_idx) * src_s1 + c_idx * pc.kernel_size + u32(k);
-            sum = sum + src[src_idx];
+            sum = sum + f32(src[src_idx]);
         }
         k = k + i32(pc.stride);
         l_in_idx = l_in_idx - 1;
     }
-    dst[g] = sum;
+    dst[g] = S(sum);
 }

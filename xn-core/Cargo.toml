@@ -83,9 +83,45 @@ name = "basic_webgpu"
 required-features = ["webgpu"]
 
 [[example]]
+name = "webgpu_dispatch_cost"
+required-features = ["webgpu"]
+
+[[example]]
 name = "cuda_benchmarks"
 required-features = ["cuda"]
 
 [[example]]
 name = "cuda_thread_test"
 required-features = ["cuda"]
+
+[[example]]
+name = "webgpu_caps"
+required-features = ["webgpu"]
+
+[[example]]
+name = "webgpu_gemv_lab"
+required-features = ["webgpu"]
+
+[[example]]
+name = "webgpu_dtype_lab"
+required-features = ["webgpu"]
+
+[[example]]
+name = "webgpu_barrier_lab"
+required-features = ["webgpu"]
+
+[[example]]
+name = "webgpu_f16_probe"
+required-features = ["webgpu"]
+
+[[example]]
+name = "webgpu_q8_cost"
+required-features = ["webgpu"]
+
+[[example]]
+name = "webgpu_dp4a_probe"
+required-features = ["webgpu"]
+
+[[example]]
+name = "webgpu_q8_shootout"
+required-features = ["webgpu"]

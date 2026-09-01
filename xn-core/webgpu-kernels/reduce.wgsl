@@ -3,8 +3,8 @@
 //   op: 0 = sum, 1 = max, 2 = min
 struct Params { num_outputs: u32, dim_size: u32, inner_size: u32, op: u32 };
 var<push_constant> pc: Params;
-@group(0) @binding(0) var<storage, read_write> src: array<f32>;
-@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(0) var<storage, read_write> src: array<S>;
+@group(0) @binding(1) var<storage, read_write> dst: array<S>;
 
 var<workgroup> sh: array<f32, 256>;
 
@@ -22,7 +22,7 @@ fn main(
     var acc: f32;
     if pc.op == 0u { acc = 0.0; } else if pc.op == 1u { acc = -3.402823466e+38; } else { acc = 3.402823466e+38; }
     for (var k = tid; k < pc.dim_size; k = k + 256u) {
-        let v = src[outer_base + k * pc.inner_size];
+        let v = f32(src[outer_base + k * pc.inner_size]);
         if pc.op == 0u { acc = acc + v; } else if pc.op == 1u { acc = max(acc, v); } else { acc = min(acc, v); }
     }
     sh[tid] = acc;
@@ -35,5 +35,5 @@ fn main(
         }
         workgroupBarrier();
     }
-    if tid == 0u { dst[o] = sh[0]; }
+    if tid == 0u { dst[o] = S(sh[0]); }
 }

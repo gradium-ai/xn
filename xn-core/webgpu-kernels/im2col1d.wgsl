@@ -8,8 +8,8 @@ struct Params {
     kernel_size: u32, stride: u32, padding: u32, dilation: u32,
 };
 var<push_constant> pc: Params;
-@group(0) @binding(0) var<storage, read_write> dst: array<f32>;
-@group(0) @binding(1) var<storage, read_write> src: array<f32>;
+@group(0) @binding(0) var<storage, read_write> dst: array<S>;
+@group(0) @binding(1) var<storage, read_write> src: array<S>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -27,7 +27,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c_idx = ck_idx / pc.kernel_size;
 
     let src_l_raw = l * pc.stride + k_idx * pc.dilation;
-    var v = 0.0;
+    var v = S(0.0);
     if src_l_raw >= pc.padding && src_l_raw < pc.padding + pc.in_len {
         let src_l = src_l_raw - pc.padding;
         v = src[(b * pc.in_channels + c_idx) * pc.in_len + src_l];

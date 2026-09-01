@@ -3,8 +3,8 @@
 //   dst[(left*num_ids + id)*right + r] = src[(left*src_dim_size + ids[id])*right + r]
 struct Params { left_size: u32, num_ids: u32, right_size: u32, src_dim_size: u32 };
 var<push_constant> pc: Params;
-@group(0) @binding(0) var<storage, read_write> src: array<f32>;
-@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(0) var<storage, read_write> src: array<S>;
+@group(0) @binding(1) var<storage, read_write> dst: array<S>;
 @group(0) @binding(2) var<storage, read_write> ids: array<u32>;
 
 @compute @workgroup_size(256)
@@ -21,7 +21,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = bitcast<i32>(ids[2u * id_i]);
     let dst_off = (left * pc.num_ids + id_i) * pc.right_size + r;
     if idx == -1 {
-        dst[dst_off] = 0.0;
+        dst[dst_off] = S(0.0);
         return;
     }
     let src_off = (left * pc.src_dim_size + u32(idx)) * pc.right_size + r;

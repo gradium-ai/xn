@@ -37,12 +37,56 @@ fn wgpuerr<E: std::fmt::Debug>(context: &str) -> impl Fn(E) -> crate::Error + '_
     move |e| crate::Error::msg(format!("webgpu: {context}: {e:?}"))
 }
 
-/// WGSL source for a kernel and its storage-buffer binding count. The dispatch
-/// names carry a dtype suffix (always `_f32` on the GPU path) for parity with
-/// the other backends; it is stripped here since only the `f32` variant exists.
-/// `None` for an unknown kernel so a wrong dispatch fails loudly.
-fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
-    let base = name.strip_suffix("_f32").unwrap_or(name);
+/// WGSL preamble that binds the storage scalar type. WGSL has no preprocessor,
+/// so a kernel is specialised by prepending this to its source -- the same thing
+/// the Vulkan backend does by including `dtype.glsl`.
+///
+/// Kernels declare storage as `array<S>` / `array<S4>` and convert explicitly at
+/// the boundary: `f32(..)` on load, `S(..)` on store. Both are no-ops when `S`
+/// is `f32`, so one source serves every dtype, and all arithmetic runs in f32
+/// regardless of how the tensor is stored.
+fn dtype_preamble(suffix: &str) -> Option<&'static str> {
+    match suffix {
+        "f32" => Some(concat!(
+            "alias S = f32;\n",
+            "alias S4 = vec4<f32>;\n",
+            "const S_NEG_BIG: S = -3.4028235e38;\n",
+        )),
+        "f16" => Some(concat!(
+            "enable f16;\n",
+            "alias S = f16;\n",
+            "alias S4 = vec4<f16>;\n",
+            // f16 has no -inf literal. Its most negative finite value plays the
+            // same role in masking: exp(x - max) underflows to zero either way.
+            "const S_NEG_BIG: S = -65504.0h;\n",
+        )),
+        _ => None,
+    }
+}
+
+/// The WGSL scalar type for a dtype suffix, or `None` if WGSL has no such type.
+fn wgsl_scalar(suffix: &str) -> Option<&'static str> {
+    match suffix {
+        "f32" => Some("f32"),
+        "f16" => Some("f16"),
+        _ => None,
+    }
+}
+
+/// Preamble for `cast`, which is the one kernel reading and writing different
+/// storage types: `SRC` for the source, `S` for the destination. `enable f16`
+/// must appear once and before anything else, so it is emitted if either side
+/// is f16.
+fn cast_preamble(src: &str, dst: &str) -> Option<String> {
+    let (src_ty, dst_ty) = (wgsl_scalar(src)?, wgsl_scalar(dst)?);
+    let enable = if src_ty == "f16" || dst_ty == "f16" { "enable f16;\n" } else { "" };
+    Some(format!("{enable}alias SRC = {src_ty};\nalias S = {dst_ty};\n"))
+}
+
+/// WGSL source for a kernel and its storage-buffer binding count, by base name
+/// (no dtype suffix). `None` for an unknown kernel so a wrong dispatch fails
+/// loudly rather than silently doing nothing.
+fn kernel_src(base: &str) -> Option<(&'static str, u32)> {
     let def = match base {
         "fill" => (include_str!("../../webgpu-kernels/fill.wgsl"), 1),
         "unary" => (include_str!("../../webgpu-kernels/unary.wgsl"), 2),
@@ -65,20 +109,34 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
         "gemm_tiled" => (include_str!("../../webgpu-kernels/gemm_tiled.wgsl"), 3),
         // rhs is bound twice: scalar + a vec4 view for the aligned fast path.
         "gemv" => (include_str!("../../webgpu-kernels/gemv.wgsl"), 4),
+        "gemv_tpc" => (include_str!("../../webgpu-kernels/gemv_tpc.wgsl"), 4),
         "conv1d" => (include_str!("../../webgpu-kernels/conv1d.wgsl"), 3),
         "conv_transpose1d" => (include_str!("../../webgpu-kernels/conv_transpose1d.wgsl"), 3),
         "im2col1d" => (include_str!("../../webgpu-kernels/im2col1d.wgsl"), 2),
         "col2im1d" => (include_str!("../../webgpu-kernels/col2im1d.wgsl"), 2),
+        "cast" => (include_str!("../../webgpu-kernels/cast.wgsl"), 2),
+        // dst, lhs (vec4 view), packed quants, scales, bias.
+        "qgemv_q8" => (include_str!("../../webgpu-kernels/qgemv_q8.wgsl"), 5),
+        "qgemm_q8" => (include_str!("../../webgpu-kernels/qgemm_q8.wgsl"), 5),
         _ => return None,
     };
     Some(def)
 }
 
-const MAX_BINDINGS: usize = 4;
+/// Largest storage-binding count any kernel uses (`qgemv_q8`). The device
+/// allows far more; this only sizes the layout table.
+const MAX_BINDINGS: usize = 5;
 const PUSH_CONSTANT_SIZE: u32 = 128;
 const WORKGROUP_SIZE: u32 = 256;
 /// GEMM tile size; must match `TILE` / the `@workgroup_size` in gemm_tiled.wgsl.
 const TILE: u32 = 16;
+/// Columns per workgroup in gemv_tpc.wgsl; must match its `@workgroup_size`.
+const GEMV_TPC_COLS: u32 = 64;
+/// Reduction length at which the cooperative gemv overtakes the thread-per-column
+/// one. Below this a thread can walk a whole weight row without losing locality;
+/// above it, 64 threads walking 64 rows at once thrash. Measured crossover on
+/// Apple M5 sits between k = 768 and k = 1024.
+const GEMV_TPC_MAX_K: usize = 1024;
 
 /// Little-endian push-constant byte builder. The WGSL kernels declare their
 /// push constants as a struct of `u32`/`f32` fields, which have the same
@@ -146,6 +204,8 @@ fn size_class(bytes: usize) -> u64 {
 #[derive(Default)]
 struct ProfStats {
     dispatches: u64,
+    /// Compute passes opened. Ideally far below `dispatches`.
+    passes: u64,
     copies: u64,
     submits: u64,
     readbacks: u64,
@@ -153,16 +213,40 @@ struct ProfStats {
     record_ns: u128,
     /// CPU time in submit + `poll(Wait)` (blocked on GPU execution).
     submit_wait_ns: u128,
+    /// Of `submit_wait_ns`: ending the compute pass. wgpu buffers a pass's
+    /// commands and only replays them into the platform encoder when the pass
+    /// ends, so this is CPU encoding time, not GPU time.
+    pass_end_ns: u128,
+    /// Of `submit_wait_ns`: `finish()` + `queue.submit()`.
+    submit_ns: u128,
+    /// Of `submit_wait_ns`: `poll(Wait)` alone -- the only genuinely
+    /// GPU-blocked portion.
+    poll_ns: u128,
     /// CPU time in the readback staging copy + map (excludes the inner flush).
     readback_ns: u128,
     /// Per-kernel dispatch counts.
     per_kernel: HashMap<String, u64>,
+    /// Readbacks bucketed by element count. Each one forces a flush, so the
+    /// small buckets are the interesting ones: they drain the pipeline to move
+    /// a handful of bytes.
+    readback_elems: HashMap<usize, u64>,
+    /// Per-kernel total workgroups. Divided by the dispatch count this gives the
+    /// average launch size, which separates a kernel that is called constantly
+    /// on tiny data from one that moves real bytes.
+    per_kernel_groups: HashMap<String, u64>,
 }
 
 /// Command-recording state, guarded by a mutex. Dispatches/copies are recorded
 /// into `encoder` and only submitted on flush.
 struct OpCtx {
     encoder: Option<wgpu::CommandEncoder>,
+    /// Compute pass held open across consecutive dispatches. WebGPU orders the
+    /// dispatches within a pass and makes each one's writes visible to the
+    /// next, so a whole run of ops can share a single pass. Ending one per op
+    /// instead costs a full pipeline drain at every boundary -- on Metal each
+    /// pass is its own `MTLComputeCommandEncoder`. Must be dropped (which ends
+    /// the pass) before the encoder is used for a copy or finished.
+    pass: Option<wgpu::ComputePass<'static>>,
     /// Whether `encoder` holds recorded, unsubmitted commands.
     open: bool,
     /// Buffers (dropped tensors + scratch) to recycle into the pool on the next
@@ -172,6 +256,10 @@ struct OpCtx {
 
 pub struct DeviceInner {
     device: wgpu::Device,
+    /// Idle `MAP_READ` staging buffers by size class. Creating one per readback
+    /// dominated `readback_ns`; a readback only borrows it between `map_async`
+    /// and `unmap`, so they recycle cleanly.
+    staging: Mutex<HashMap<u64, Vec<wgpu::Buffer>>>,
     queue: wgpu::Queue,
     // bind_group_layouts[n] / pipeline_layouts[n] describe `n` storage bindings.
     bind_group_layouts: Vec<wgpu::BindGroupLayout>,
@@ -180,6 +268,8 @@ pub struct DeviceInner {
     pool: Mutex<BufferPool>,
     ctx: Mutex<OpCtx>,
     device_name: String,
+    /// Whether the adapter advertises WGSL `shader-f16`.
+    adapter_f16: bool,
     profile: bool,
     pstats: Mutex<ProfStats>,
 }
@@ -239,16 +329,26 @@ impl Device {
         let adapter = &adapters[idx];
         let info = adapter.get_info();
         let device_name = format!("{} ({:?})", info.name, info.backend);
+        // What the adapter offers, which is not yet what the backend uses: the
+        // kernels are f32-only, so this is currently reporting-only. It is the
+        // gate an f16 compute path would have to check.
+        let adapter_f16 = adapter.features().contains(wgpu::Features::SHADER_F16);
 
         // Push constants (native feature) carry kernel parameters; f32 storage
         // buffers hold tensor data. Request a limit that fits the largest push
         // block (gemm: 14 u32 = 56 B) with headroom.
         let limits =
             wgpu::Limits { max_push_constant_size: PUSH_CONSTANT_SIZE, ..adapter.limits() };
+        // f16 compute is opt-in per adapter. When it is missing the backend stays
+        // f32-only and 16-bit storage falls back to the host, as before.
+        let mut features = wgpu::Features::PUSH_CONSTANTS;
+        if adapter_f16 {
+            features |= wgpu::Features::SHADER_F16;
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("xn-webgpu"),
-                required_features: wgpu::Features::PUSH_CONSTANTS,
+                required_features: features,
                 required_limits: limits,
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
@@ -300,19 +400,33 @@ impl Device {
             pipeline_layouts,
             pipelines: Mutex::new(HashMap::new()),
             pool: Mutex::new(BufferPool::default()),
-            ctx: Mutex::new(OpCtx { encoder: None, open: false, free_bufs: Vec::new() }),
+            staging: Mutex::new(HashMap::new()),
+            ctx: Mutex::new(OpCtx {
+                encoder: None,
+                pass: None,
+                open: false,
+                free_bufs: Vec::new(),
+            }),
             device_name,
+            adapter_f16,
             profile,
             pstats: Mutex::new(ProfStats::default()),
         };
         Ok(Self(Arc::new(inner)))
     }
 
-    /// WebGPU compute is f32-only, so 16-bit storage is never taken on the GPU.
-    /// Kept for API parity with the Vulkan/Metal backends.
+    /// Whether f16 tensors compute on the GPU. True when the adapter advertises
+    /// WGSL `shader-f16`; otherwise 16-bit storage falls back to host loops.
     pub fn supports_f16(&self) -> bool {
-        false
+        self.adapter_f16
     }
+
+    /// Whether the underlying adapter advertises WGSL `shader-f16`.
+    pub fn adapter_supports_f16(&self) -> bool {
+        self.adapter_f16
+    }
+
+    /// WGSL has no `bf16` type, so bf16 storage always falls back to the host.
     pub fn supports_bf16(&self) -> bool {
         false
     }
@@ -347,11 +461,32 @@ impl Device {
                 return Ok((p.pipeline.clone(), p.bindings));
             }
         }
-        let (src, bindings) = kernel_src(name)
+        // Dispatch names are `<base>_<dtype>`, or `cast_<src>_<dst>`.
+        let (base, suffix) = name.rsplit_once('_').ok_or_else(|| {
+            crate::Error::msg(format!("webgpu: kernel {name} has no dtype suffix"))
+        })?;
+        let (base, preamble) = match base.rsplit_once('_') {
+            Some(("cast", src_suffix)) => (
+                "cast",
+                cast_preamble(src_suffix, suffix).ok_or_else(|| {
+                    crate::Error::msg(format!("webgpu: no WGSL cast {src_suffix} -> {suffix}"))
+                })?,
+            ),
+            _ => (
+                base,
+                dtype_preamble(suffix)
+                    .ok_or_else(|| {
+                        crate::Error::msg(format!("webgpu: no WGSL preamble for {suffix}"))
+                    })?
+                    .to_string(),
+            ),
+        };
+        let (body, bindings) = kernel_src(base)
             .ok_or_else(|| crate::Error::msg(format!("webgpu: unknown kernel {name}")))?;
+        let src = format!("{preamble}{body}");
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(name),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(src)),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(src)),
         });
         let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(name),
@@ -409,12 +544,22 @@ impl Device {
         });
         let mut ctx = self.ctx.lock().unwrap();
         self.begin_if_needed(&mut ctx);
-        let enc = ctx.encoder.as_mut().unwrap();
+        let opened = ctx.pass.is_none();
+        if opened {
+            let enc = ctx.encoder.as_mut().unwrap();
+            // `forget_lifetime` lets the pass outlive this call and sit in
+            // `ctx` next to the encoder that owns it; `end_pass` drops it
+            // before the encoder is touched again.
+            let cpass = enc
+                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("xn"),
+                    timestamp_writes: None,
+                })
+                .forget_lifetime();
+            ctx.pass = Some(cpass);
+        }
         {
-            let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some(kernel),
-                timestamp_writes: None,
-            });
+            let cpass = ctx.pass.as_mut().unwrap();
             cpass.set_pipeline(&pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
             cpass.set_push_constants(0, &push.bytes);
@@ -424,8 +569,11 @@ impl Device {
         if let Some(t0) = t0 {
             let mut p = self.pstats.lock().unwrap();
             p.dispatches += 1;
+            p.passes += u64::from(opened);
             p.record_ns += t0.elapsed().as_nanos();
             *p.per_kernel.entry(kernel.to_string()).or_insert(0) += 1;
+            *p.per_kernel_groups.entry(kernel.to_string()).or_insert(0) +=
+                u64::from(gx) * u64::from(gy) * u64::from(gz);
         }
         Ok(())
     }
@@ -441,6 +589,7 @@ impl Device {
         let bytes = round4(bytes) as u64;
         let mut ctx = self.ctx.lock().unwrap();
         self.begin_if_needed(&mut ctx);
+        ctx.pass = None;
         ctx.encoder.as_mut().unwrap().copy_buffer_to_buffer(src, 0, dst, 0, bytes);
         drop(ctx);
         if let Some(t0) = t0 {
@@ -470,18 +619,33 @@ impl Device {
     fn flush_locked(&self, ctx: &mut OpCtx) -> Result<()> {
         let had_work = ctx.open;
         let t0 = (self.profile && had_work).then(std::time::Instant::now);
+        let (mut pass_end_ns, mut submit_ns) = (0u128, 0u128);
         if ctx.open {
+            let t = self.profile.then(std::time::Instant::now);
+            ctx.pass = None;
+            if let Some(t) = t {
+                pass_end_ns = t.elapsed().as_nanos();
+            }
+            let t = self.profile.then(std::time::Instant::now);
             let enc = ctx.encoder.take().unwrap();
             self.queue.submit(Some(enc.finish()));
+            if let Some(t) = t {
+                submit_ns = t.elapsed().as_nanos();
+            }
             ctx.open = false;
         }
         // Drive the queue to completion so host reads and buffer recycling are
         // safe. `poll(Wait)` blocks until all submitted work has finished.
+        let t = (self.profile && had_work).then(std::time::Instant::now);
         self.device.poll(wgpu::PollType::Wait).map_err(wgpuerr("poll"))?;
+        let poll_ns = t.map_or(0, |t| t.elapsed().as_nanos());
         if let Some(t0) = t0 {
             let mut p = self.pstats.lock().unwrap();
             p.submits += 1;
             p.submit_wait_ns += t0.elapsed().as_nanos();
+            p.pass_end_ns += pass_end_ns;
+            p.submit_ns += submit_ns;
+            p.poll_ns += poll_ns;
         }
         if !ctx.free_bufs.is_empty() {
             let mut pool = self.pool.lock().unwrap();
@@ -500,31 +664,72 @@ impl Device {
     }
 
     /// Read `len` elements of `T` back from a GPU buffer into a host `Vec`.
-    /// Flushes pending work first so the readback observes it.
+    ///
+    /// The staging copy is recorded into the batch that is already pending and
+    /// flushed with it, so a readback costs one GPU round trip. Submitting the
+    /// copy separately -- flush, then a second encoder and a second
+    /// `poll(Wait)` -- measured ~1.3 ms per readback on Apple M5 even for a
+    /// handful of bytes, because the second wait is a fresh submission rather
+    /// than work already in flight.
     fn read_buffer<T: WithDType>(&self, buf: &wgpu::Buffer, len: usize) -> Result<Vec<T>> {
         if len == 0 {
             return Ok(Vec::new());
         }
-        self.flush()?;
+        // Timed in two segments around the flush, so the flush stays attributed
+        // to `submit_wait_ns` alone and the three reported phases stay disjoint.
+        // Debug aid: XN_WEBGPU_TRACE_READBACK=<len> prints one backtrace for the
+        // first readback of that element count, to locate an unexpected sync.
+        if std::env::var("XN_WEBGPU_TRACE_READBACK").is_ok_and(|v| v.parse::<usize>() == Ok(len)) {
+            {
+                static ONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let n = ONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 3 {
+                    eprintln!(
+                        "=== readback #{n} of {len} x {:?} ===\n{}",
+                        T::DTYPE,
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
+            }
+        }
         let t0 = self.profile.then(std::time::Instant::now);
         let bytes = len * T::BYTE_SIZE;
         let padded = round4(bytes) as u64;
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("xn-readback"),
-            size: padded,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        let class = size_class(padded as usize);
+        let staging = {
+            let mut pool = self.staging.lock().unwrap();
+            pool.get_mut(&class).and_then(|v| v.pop())
+        }
+        .unwrap_or_else(|| {
+            // Class-sized, like the storage pool, so any same-class readback
+            // can reuse it.
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("xn-readback"),
+                size: class,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
         });
-        let mut enc =
-            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        enc.copy_buffer_to_buffer(buf, 0, &staging, 0, padded);
-        self.queue.submit(Some(enc.finish()));
+        let mut own_ns = t0.map_or(0, |t| t.elapsed().as_nanos());
+        {
+            // Append the copy to the pending batch and submit once. Any open
+            // compute pass has to end first: the encoder cannot record a copy
+            // while a pass borrowed from it is still live.
+            let mut ctx = self.ctx.lock().unwrap();
+            self.begin_if_needed(&mut ctx);
+            ctx.pass = None;
+            ctx.encoder.as_mut().unwrap().copy_buffer_to_buffer(buf, 0, &staging, 0, padded);
+            self.flush_locked(&mut ctx)?;
+        }
+        let t1 = self.profile.then(std::time::Instant::now);
 
-        let slice = staging.slice(..);
+        let slice = staging.slice(..padded);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
+        // The copy has already completed above, so this only runs the map
+        // callback rather than waiting on a new submission.
         self.device.poll(wgpu::PollType::Wait).map_err(wgpuerr("poll (readback)"))?;
         rx.recv().map_err(wgpuerr("map recv"))?.map_err(wgpuerr("map_async"))?;
         let mapped = slice.get_mapped_range();
@@ -535,10 +740,15 @@ impl Device {
         }
         drop(mapped);
         staging.unmap();
-        if let Some(t0) = t0 {
+        self.staging.lock().unwrap().entry(class).or_default().push(staging);
+        if let Some(t1) = t1 {
+            own_ns += t1.elapsed().as_nanos();
+        }
+        if self.profile {
             let mut p = self.pstats.lock().unwrap();
             p.readbacks += 1;
-            p.readback_ns += t0.elapsed().as_nanos();
+            p.readback_ns += own_ns;
+            *p.readback_elems.entry(len).or_insert(0) += 1;
         }
         Ok(out)
     }
@@ -586,6 +796,11 @@ impl Drop for DeviceInner {
             "{:>10} dispatches, {:>6} copies, {:>5} submits, {:>5} readbacks",
             p.dispatches, p.copies, p.submits, p.readbacks
         );
+        eprintln!(
+            "{:>10} compute passes ({:.1} dispatches per pass)",
+            p.passes,
+            p.dispatches as f64 / (p.passes.max(1)) as f64
+        );
         if total > 0.0 {
             eprintln!("CPU wall-clock split across the three phases (serial):");
             eprintln!(
@@ -597,6 +812,12 @@ impl Drop for DeviceInner {
                 "  submit+wait (blocked on GPU)     : {:>9.1} ms  ({:>4.1}%)",
                 wait,
                 100.0 * wait / total
+            );
+            eprintln!(
+                "      of which: pass-end (cpu encode) {:>8.1} ms | submit {:>7.1} ms | poll (gpu) {:>8.1} ms",
+                ms(p.pass_end_ns),
+                ms(p.submit_ns),
+                ms(p.poll_ns)
             );
             eprintln!(
                 "  readback (staging copy + map)    : {:>9.1} ms  ({:>4.1}%)",
@@ -611,13 +832,42 @@ impl Drop for DeviceInner {
                 wait / p.submits as f64
             );
         }
+        let mut rb: Vec<_> = p.readback_elems.iter().collect();
+        rb.sort_by_key(|r| std::cmp::Reverse(*r.1));
+        if !rb.is_empty() {
+            let list: Vec<String> =
+                rb.iter().take(8).map(|(n, c)| format!("{n} elems x{c}")).collect();
+            eprintln!("readbacks by size (each forces a flush): {}", list.join(", "));
+        }
         let mut rows: Vec<_> = p.per_kernel.iter().collect();
         rows.sort_by_key(|r| std::cmp::Reverse(*r.1));
-        let kernels: Vec<String> = rows.iter().take(8).map(|(k, c)| format!("{k}:{c}")).collect();
-        if !kernels.is_empty() {
-            eprintln!("top kernels (count): {}", kernels.join(", "));
+        if !rows.is_empty() {
+            eprintln!(
+                "\n{:<22} {:>9} {:>12} {:>10}  share of dispatches",
+                "kernel", "dispatches", "workgroups", "wg/disp"
+            );
+            let total: u64 = p.per_kernel.values().sum();
+            for (k, c) in rows.iter() {
+                let g = p.per_kernel_groups.get(*k).copied().unwrap_or(0);
+                eprintln!(
+                    "{:<22} {:>9} {:>12} {:>10.1}  {:>5.1}%",
+                    k,
+                    c,
+                    g,
+                    g as f64 / **c as f64,
+                    100.0 * **c as f64 / total as f64
+                );
+            }
         }
         let pool = self.pool.lock().unwrap();
+        let retained: u64 = pool.free.iter().map(|(c, v)| c * v.len() as u64).sum();
+        let buffers: usize = pool.free.values().map(|v| v.len()).sum();
+        eprintln!(
+            "buffer pool retains {:.1} MB in {} idle buffers across {} size classes",
+            retained as f64 / (1 << 20) as f64,
+            buffers,
+            pool.free.len(),
+        );
         let allocs = pool.hits + pool.misses;
         if allocs > 0 {
             eprintln!(
@@ -667,13 +917,6 @@ fn round4(bytes: usize) -> usize {
     bytes.div_ceil(4) * 4
 }
 
-fn check_f32<T: WithDType>(op: &str) -> Result<()> {
-    if T::DTYPE != DType::F32 {
-        crate::bail!("webgpu: {op} only supports f32, got {:?}", T::DTYPE);
-    }
-    Ok(())
-}
-
 /// Convert a float-typed scalar to `f32`. Only called on the GPU path, where
 /// `T` has already been restricted to f32.
 fn scalar_to_f32<T: WithDType>(v: T) -> f32 {
@@ -685,20 +928,28 @@ fn scalar_to_f32<T: WithDType>(v: T) -> f32 {
     }
 }
 
-/// Shader dtype suffix for a float storage type. Only `f32` runs on the GPU;
-/// `f16`/`bf16` error (callers with a host fallback use `float_suffix`).
-fn dtype_suffix<T: WithDType>(op: &str) -> Result<&'static str> {
-    match T::DTYPE {
-        DType::F32 => Ok("f32"),
-        d => crate::bail!("webgpu: {op} only supports f32 on the GPU, got {d:?}"),
+impl DeviceInner {
+    /// Shader dtype suffix for `T`, or `None` when this device cannot compute on
+    /// it and the caller must fall back to the host. f16 depends on the adapter
+    /// advertising `shader-f16`; bf16 has no WGSL type at all.
+    fn float_suffix<T: WithDType>(&self) -> Option<&'static str> {
+        match T::DTYPE {
+            DType::F32 => Some("f32"),
+            DType::F16 if self.adapter_f16 => Some("f16"),
+            _ => None,
+        }
     }
-}
 
-/// `Some("f32")` for f32 storage (GPU path), `None` otherwise (host fallback).
-fn float_suffix<T: WithDType>() -> Option<&'static str> {
-    match T::DTYPE {
-        DType::F32 => Some("f32"),
-        _ => None,
+    /// Like [`Self::float_suffix`] but for ops with no host fallback, so an
+    /// unsupported dtype is an error rather than a slow path.
+    fn dtype_suffix<T: WithDType>(&self, op: &str) -> Result<&'static str> {
+        self.float_suffix::<T>().ok_or_else(|| {
+            crate::Error::msg(format!(
+                "webgpu: {op} cannot run on {:?} on this device (f16 compute: {})",
+                T::DTYPE,
+                self.adapter_f16
+            ))
+        })
     }
 }
 
@@ -761,3 +1012,5 @@ fn div_ceil(n: usize, d: u32) -> u32 {
 }
 
 include!("backend_impl.rs");
+
+pub mod quantization;
