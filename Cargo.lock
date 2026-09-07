@@ -82,7 +82,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -93,7 +93,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -577,7 +577,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -662,7 +662,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -801,9 +801,8 @@ dependencies = [
 
 [[package]]
 name = "gemm"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa0673db364b12263d103b68337a68fbecc541d6f6b61ba72fe438654709eacb"
+version = "0.20.0"
+source = "git+https://github.com/gradium-ai/gemm?tag=v0.20.0#b09c3d2d6fbf317ae6a8a1e4156aa6f5cee08138"
 dependencies = [
  "dyn-stack",
  "gemm-c32",
@@ -821,9 +820,8 @@ dependencies = [
 
 [[package]]
 name = "gemm-c32"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "086936dbdcb99e37aad81d320f98f670e53c1e55a98bee70573e83f95beb128c"
+version = "0.20.0"
+source = "git+https://github.com/gradium-ai/gemm?tag=v0.20.0#b09c3d2d6fbf317ae6a8a1e4156aa6f5cee08138"
 dependencies = [
  "dyn-stack",
  "gemm-common",
@@ -836,9 +834,8 @@ dependencies = [
 
 [[package]]
 name = "gemm-c64"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20c8aeeeec425959bda4d9827664029ba1501a90a0d1e6228e48bef741db3a3f"
+version = "0.20.0"
+source = "git+https://github.com/gradium-ai/gemm?tag=v0.20.0#b09c3d2d6fbf317ae6a8a1e4156aa6f5cee08138"
 dependencies = [
  "dyn-stack",
  "gemm-common",
@@ -851,9 +848,8 @@ dependencies = [
 
 [[package]]
 name = "gemm-common"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88027625910cc9b1085aaaa1c4bc46bb3a36aad323452b33c25b5e4e7c8e2a3e"
+version = "0.20.0"
+source = "git+https://github.com/gradium-ai/gemm?tag=v0.20.0#b09c3d2d6fbf317ae6a8a1e4156aa6f5cee08138"
 dependencies = [
  "bytemuck",
  "dyn-stack",
@@ -872,9 +868,8 @@ dependencies = [
 
 [[package]]
 name = "gemm-f16"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3df7a55202e6cd6739d82ae3399c8e0c7e1402859b30e4cb780e61525d9486e"
+version = "0.20.0"
+source = "git+https://github.com/gradium-ai/gemm?tag=v0.20.0#b09c3d2d6fbf317ae6a8a1e4156aa6f5cee08138"
 dependencies = [
  "dyn-stack",
  "gemm-common",
@@ -890,9 +885,8 @@ dependencies = [
 
 [[package]]
 name = "gemm-f32"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02e0b8c9da1fbec6e3e3ab2ce6bc259ef18eb5f6f0d3e4edf54b75f9fd41a81c"
+version = "0.20.0"
+source = "git+https://github.com/gradium-ai/gemm?tag=v0.20.0#b09c3d2d6fbf317ae6a8a1e4156aa6f5cee08138"
 dependencies = [
  "dyn-stack",
  "gemm-common",
@@ -905,9 +899,8 @@ dependencies = [
 
 [[package]]
 name = "gemm-f64"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "056131e8f2a521bfab322f804ccd652520c79700d81209e9d9275bbdecaadc6a"
+version = "0.20.0"
+source = "git+https://github.com/gradium-ai/gemm?tag=v0.20.0#b09c3d2d6fbf317ae6a8a1e4156aa6f5cee08138"
 dependencies = [
  "dyn-stack",
  "gemm-common",
@@ -1613,7 +1606,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3341,7 +3334,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
