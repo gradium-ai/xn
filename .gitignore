@@ -32,3 +32,4 @@ xn-core/webgpu-browser-check/cd/
 xn-core/webgpu-browser-check/harness/target/
 xn-core/webgpu-browser-check/harness/pkg/
 xn-core/webgpu-browser-check/harness/Cargo.lock
+xn-core/webgpu-browser-check/.tls/

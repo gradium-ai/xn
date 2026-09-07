@@ -1,35 +1,14 @@
-<!doctype html><meta charset=utf-8><title>wgsl validation</title><body><script>
-(async () => {
-  const report = { results: [] };
-  try {
-    const adapter = await navigator.gpu.requestAdapter();
-    const hasF16 = adapter.features.has('shader-f16');
-    const dev = await adapter.requestDevice({ requiredFeatures: hasF16 ? ['shader-f16'] : [] });
-    report.shaderF16 = hasF16;
-    // Surface device-level errors too, not just compilation messages.
-    dev.addEventListener('uncapturederror', e => report.results.push({ name: '<device>', errors: [String(e.error.message)] }));
-    const names = await (await fetch('/index.json')).json();
-    for (const name of names) {
-      const code = await (await fetch('/' + name + '.wgsl')).text();
-      dev.pushErrorScope('validation');
-      const mod = dev.createShaderModule({ code });
-      const info = await mod.getCompilationInfo();
-      const msgs = info.messages.filter(m => m.type === 'error' || m.type === 'warning')
-        .map(m => `${m.type} L${m.lineNum}: ${m.message.trim()}`);
-      // Creating the pipeline with an auto layout is what actually forces full
-      // validation of the entry point and its bindings.
-      let pipeErr = null;
-      try {
-        dev.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: 'main' } });
-      } catch (e) { pipeErr = String(e); }
-      const scoped = await dev.popErrorScope();
-      if (msgs.length || pipeErr || scoped) {
-        report.results.push({ name, errors: msgs, pipeline: pipeErr, scoped: scoped ? scoped.message : null });
-      }
-    }
-    report.total = names.length;
-    report.failed = report.results.length;
-  } catch (e) { report.error = String(e); }
-  await fetch('/', { method: 'POST', body: JSON.stringify(report, null, 1) });
-})();
-</script>
+<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>xn WebGPU checks</title><link rel=stylesheet href=style.css>
+<body>
+<h1>xn WebGPU checks</h1>
+<p class=sub>Run these on whatever device you are holding.</p>
+<a class=card href="caps.html"><b>1. Capability check</b>
+<span>Does this device meet what the backend needs? No download — pure JavaScript.</span></a>
+<a class=card href="harness.html"><b>2. Backend harness</b>
+<span>Runs the real xn WebGPU backend compiled to wasm: correctness across the op set, and a benchmark.</span></a>
+<h2>If WebGPU appears to be missing</h2>
+<p>It needs a secure context. Over plain <code>http://</code> from a LAN address
+<code>navigator.gpu</code> is absent no matter how capable the device is. This server
+also speaks HTTPS with a self-signed certificate — use that URL and accept the
+warning (Advanced, then Proceed).</p>

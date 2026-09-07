@@ -1,0 +1,23 @@
+:root { color-scheme: light dark; --line: #8884; }
+* { box-sizing: border-box }
+body { font: 15px/1.55 system-ui, -apple-system, sans-serif; margin: 0 auto;
+       padding: 1rem; max-width: 46rem }
+h1 { font-size: 1.2rem; margin: 0 0 .25rem }
+h2 { font-size: 1rem; margin: 1.4rem 0 .4rem }
+p.sub { margin: 0 0 1rem; opacity: .7 }
+a.card { display: block; padding: .8rem .9rem; margin: .5rem 0; border: 1px solid var(--line);
+         border-radius: .55rem; text-decoration: none; color: inherit }
+a.card b { display: block; font-size: 1rem }
+a.card span { opacity: .7; font-size: 14px }
+button { font: inherit; padding: .65rem 1rem; margin: 0 .4rem .5rem 0;
+         border: 1px solid var(--line); border-radius: .5rem; background: #8881; color: inherit }
+button:disabled { opacity: .5 }
+.verdict { padding: .7rem .9rem; border-radius: .5rem; font-weight: 600; margin: .75rem 0 }
+.ok { background: #0a7f3f22; color: #0a7f3f } .bad { background: #b0202022; color: #c02020 }
+.warn { background: #9a6b0022; color: #9a6b00 } .run { background: #8881 }
+table { border-collapse: collapse; width: 100%; margin: .5rem 0; font-size: 14px }
+td, th { text-align: left; padding: .3rem .45rem; border-bottom: 1px solid var(--line) }
+td.n, th.n { text-align: right; font-variant-numeric: tabular-nums }
+.fail { color: #c02020; font-weight: 600 } .pass { color: #0a7f3f }
+pre { white-space: pre-wrap; word-break: break-word; font-size: 12px;
+      background: #8881; padding: .6rem; border-radius: .4rem }

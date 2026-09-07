@@ -1,0 +1,94 @@
+<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>xn WebGPU backend harness</title><link rel=stylesheet href=style.css>
+<body>
+<h1>xn WebGPU backend harness</h1>
+<p class=sub>The real backend, compiled to wasm. Ops run through the ordinary
+synchronous <code>Backend</code> trait; only readbacks are awaited.</p>
+<div id=verdict class="verdict run">loading wasm…</div>
+<div>
+  <button id=run disabled>Run correctness</button>
+  <button id=bench disabled>Run benchmark</button>
+</div>
+<div id=body></div>
+<script type="module">
+const el = (t, txt, cls) => { const n = document.createElement(t);
+  if (cls) n.className = cls; if (txt != null) n.textContent = txt; return n; };
+const verdict = document.getElementById('verdict');
+const body = document.getElementById('body');
+const set = (cls, txt) => { verdict.className = 'verdict ' + cls; verdict.textContent = txt; };
+const post = (t) => fetch('/', { method: 'POST', body: t }).catch(() => {});
+
+let mod;
+try {
+  mod = await import('./harness/pkg/xn_webgpu_browser_harness.js');
+  await mod.default();
+} catch (e) {
+  set('bad', 'Could not load the wasm module. Build it first — see the README.');
+  body.append(el('pre', String(e && (e.stack || e))));
+  throw e;
+}
+set('run', 'ready');
+const buttons = [document.getElementById('run'), document.getElementById('bench')];
+buttons.forEach(b => (b.disabled = false));
+
+function showCorrectness(d) {
+  body.replaceChildren();
+  if (d.deviceError) { set('bad', 'Device creation failed'); body.append(el('pre', d.deviceError)); return; }
+  set(d.failed === 0 ? 'ok' : 'bad',
+      d.failed === 0 ? `All ${d.total} checks passed` : `${d.failed} of ${d.total} checks failed`);
+  body.append(el('pre', `device: ${d.device}\nf16: ${d.f16}`));
+  if (d.failures && d.failures.length) {
+    const t = el('table');
+    const h = el('tr'); ['check', 'detail'].forEach(x => h.append(el('th', x))); t.append(h);
+    for (const f of d.failures) {
+      const tr = el('tr'); tr.append(el('td', f.name), el('td', f.detail)); t.append(tr);
+    }
+    body.append(t);
+  }
+}
+
+function showBench(d) {
+  body.replaceChildren();
+  if (d.deviceError) { set('bad', 'Device creation failed'); body.append(el('pre', d.deviceError)); return; }
+  set('ok', 'Benchmark complete');
+  body.append(el('pre', `device: ${d.device}\nf16: ${d.f16}`));
+  const t = el('table');
+  const h = el('tr');
+  h.append(el('th', 'measurement'), el('th', 'us/op', 'n'), el('th', 'GB/s', 'n'));
+  t.append(h);
+  for (const r of d.rows) {
+    const tr = el('tr');
+    tr.append(el('td', r.name), el('td', r.us.toFixed(2), 'n'),
+              el('td', r.gbps == null ? '' : r.gbps.toFixed(0), 'n'));
+    t.append(tr);
+  }
+  body.append(t);
+  body.append(el('p', 'Warm up by running it twice; the first pass pays shader compilation.'));
+}
+
+async function go(which) {
+  buttons.forEach(b => (b.disabled = true));
+  set('run', which === 'bench' ? 'benchmarking…' : 'running checks…');
+  await new Promise(r => setTimeout(r, 0));
+  let raw;
+  try {
+    raw = which === 'bench' ? await mod.bench_all(1) : await mod.run_all();
+  } catch (e) {
+    set('bad', 'The harness threw');
+    body.replaceChildren(el('pre', String(e && (e.stack || e))));
+    buttons.forEach(b => (b.disabled = false));
+    return;
+  }
+  post(raw);
+  const d = JSON.parse(raw);
+  which === 'bench' ? showBench(d) : showCorrectness(d);
+  buttons.forEach(b => (b.disabled = false));
+}
+document.getElementById('run').onclick = () => go('run');
+document.getElementById('bench').onclick = () => go('bench');
+
+// `?auto=run` / `?auto=bench` starts immediately, so the same page can be driven
+// headlessly as well as tapped on a phone.
+const auto = new URLSearchParams(location.search).get('auto');
+if (auto === 'run' || auto === 'bench') await go(auto);
+</script>
