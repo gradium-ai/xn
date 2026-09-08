@@ -52,6 +52,8 @@ bindgen_cuda = { workspace = true, optional = true }
 [features]
 default = []
 accelerate = ["dep:libc"]
+# Links a prebuilt XNNPACK; point XNNPACK_DIR at its build tree. See src/xnnpack.rs.
+xnnpack = []
 audio = ["dep:kaudio"]
 cuda = ["dep:cudarc", "dep:bindgen_cuda"]
 metal = ["dep:metal"]

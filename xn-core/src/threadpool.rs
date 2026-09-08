@@ -16,6 +16,10 @@
 //!
 //! [`dispatch`] is deliberately shaped like the `ith`/`nth` split the kernels already use, so
 //! call sites change by one line.
+//!
+//! There is one pool per process by default, which is right for one stream of work. A
+//! pipeline of stages that scale differently wants one each instead, so that they fan out
+//! over disjoint cores rather than taking turns at a single job slot: see [`bind`].
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -94,30 +98,87 @@ thread_local! {
     /// Set while this thread is running a pool job. Nested dispatches run serially rather than
     /// deadlocking against a pool that is already fully occupied.
     static IN_JOB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// The pool [`dispatch`] fans out over on this thread; the process-wide one when unset.
+    /// See [`bind`].
+    static BOUND: std::cell::Cell<Option<&'static Pool>> = const { std::cell::Cell::new(None) };
 }
 
-static POOL: OnceLock<Pool> = OnceLock::new();
+/// Pools created by [`bind`], keyed by name so a stage whose thread is recreated per request
+/// reuses one set of workers instead of leaking a pool every time.
+static NAMED: OnceLock<Mutex<Vec<(String, &'static Pool)>>> = OnceLock::new();
 
-fn pool() -> &'static Pool {
-    POOL.get_or_init(|| {
-        let size = crate::get_num_threads().max(1);
-        let shared: &'static Shared = Box::leak(Box::new(Shared {
-            seq: AtomicU64::new(0),
-            job: std::cell::UnsafeCell::new(None),
-            done: AtomicUsize::new(0),
-            panicked: AtomicBool::new(false),
-            quit: AtomicBool::new(false),
-            lock: Mutex::new(()),
-            wake: Condvar::new(),
-        }));
-        for ith in 1..size {
-            std::thread::Builder::new()
-                .name(format!("xn-worker-{ith}"))
-                .spawn(move || worker(shared, ith, size))
-                .expect("spawning an xn worker thread");
+static POOL: OnceLock<&'static Pool> = OnceLock::new();
+
+/// Spawns `size - 1` resident workers and leaks the pool that owns them.
+///
+/// Leaked because a published job hands its workers a `&'static Shared`, and because pools
+/// outlive any one stream anyway: they park when their stream goes quiet.
+fn spawn_pool(size: usize) -> &'static Pool {
+    let size = size.max(1);
+    let shared: &'static Shared = Box::leak(Box::new(Shared {
+        seq: AtomicU64::new(0),
+        job: std::cell::UnsafeCell::new(None),
+        done: AtomicUsize::new(0),
+        panicked: AtomicBool::new(false),
+        quit: AtomicBool::new(false),
+        lock: Mutex::new(()),
+        wake: Condvar::new(),
+    }));
+    for ith in 1..size {
+        std::thread::Builder::new()
+            .name(format!("xn-worker-{ith}"))
+            .spawn(move || worker(shared, ith, size))
+            .expect("spawning an xn worker thread");
+    }
+    Box::leak(Box::new(Pool { shared, size, publish: AtomicBool::new(false) }))
+}
+
+fn global() -> &'static Pool {
+    *POOL.get_or_init(|| spawn_pool(crate::get_num_threads().max(1)))
+}
+
+fn current() -> &'static Pool {
+    BOUND.with(|b| b.get()).unwrap_or_else(global)
+}
+
+/// Give this thread its own pool, so [`dispatch`] here does not contend with other threads.
+///
+/// One process-wide pool is right for one stream of work and wrong for a pipeline whose
+/// stages scale differently. Pocket TTS is exactly that: the flow LM is a batch-1
+/// autoregressive stream that barely speeds up past one core, while the Mimi decoder is a
+/// dense convnet that scales well. Overlapping them on a shared pool buys almost nothing,
+/// because only one of them can hold the single job slot -- whichever publishes first fans
+/// out and the other falls back to running serially on its own thread, alternating between
+/// them frame by frame. A pool per stage lets both fan out at once over disjoint cores.
+///
+/// Pools are keyed by `name` and built once: every thread binding the same name shares one
+/// set of workers, and the first caller's `size` is the one that sticks. Two threads on the
+/// same name contend for it exactly as they would for the process-wide pool. Sizes are not
+/// reservations and nothing here pins anything, so they should be chosen to fit the machine
+/// between them.
+///
+/// Has no effect under `XN_THREADPOOL=0`, which fans out through rayon's global pool instead.
+pub fn bind(name: &str, size: usize) {
+    let pool = {
+        let named = NAMED.get_or_init(|| Mutex::new(Vec::new()));
+        let mut named = named.lock().unwrap_or_else(|e| e.into_inner());
+        match named.iter().find(|(n, _)| n == name) {
+            Some((_, pool)) => *pool,
+            None => {
+                let pool = spawn_pool(size);
+                named.push((name.to_string(), pool));
+                pool
+            }
         }
-        Pool { shared, size, publish: AtomicBool::new(false) }
-    })
+    };
+    BOUND.with(|b| b.set(Some(pool)));
+}
+
+/// Return this thread to the process-wide pool. Whatever pool [`bind`] created stays alive
+/// for other threads that named it.
+pub fn unbind() {
+    BOUND.with(|b| b.set(None));
 }
 
 /// `nth` is fixed for the lifetime of the pool, so a worker never has to read it.
@@ -198,12 +259,13 @@ impl Drop for PublishGuard {
     }
 }
 
-/// Threads this pool can put on one operator, including the calling thread.
+/// Threads this thread's pool can put on one operator, including the calling thread.
 ///
-/// Fixed at first use, like rayon's global pool: [`crate::set_num_threads`] after that point
-/// changes how work is chunked but cannot grow the pool.
+/// That is the pool [`bind`] gave this thread, or the process-wide one. Either is fixed at
+/// first use, like rayon's global pool: [`crate::set_num_threads`] after that point changes
+/// how work is chunked but cannot grow the pool.
 pub fn size() -> usize {
-    pool().size
+    current().size
 }
 
 /// Run `f(ith, nth)` on every participant and return once all of them have finished.
@@ -228,7 +290,7 @@ pub fn dispatch<F: Fn(usize, usize) + Sync>(f: F) {
         f(0, 1);
         return;
     }
-    let pool = pool();
+    let pool = current();
     let nth = pool.size;
     if nth <= 1 {
         f(0, 1);

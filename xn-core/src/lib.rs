@@ -18,6 +18,8 @@ pub mod streaming;
 pub mod tensor;
 pub mod tensor_view;
 pub mod threadpool;
+#[cfg(feature = "xnnpack")]
+pub mod xnnpack;
 pub mod utils;
 
 pub use backend::Backend;

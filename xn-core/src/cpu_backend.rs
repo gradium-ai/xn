@@ -79,6 +79,35 @@ fn gemm_<T: WithDType>(
     let lhs = &lhs[lhs_o..];
     let rhs = &rhs[rhs_o..];
 
+    // XNNPACK's `fully_connected` keeps its weights packed across calls, which is worth a lot
+    // at the row counts batch-1 decode produces. It only implements one operand layout and
+    // declines the rest, and it handles a single batch at a time.
+    #[cfg(feature = "xnnpack")]
+    if lhs_b == 1 && T::DTYPE == crate::DType::F32 {
+        // SAFETY: `T::DTYPE == F32` establishes `T == f32`, so these reinterpret a slice as
+        // its own element type.
+        let (d, l, r) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut f32, dst.len()),
+                std::slice::from_raw_parts(lhs.as_ptr() as *const f32, lhs.len()),
+                std::slice::from_raw_parts(rhs.as_ptr() as *const f32, rhs.len()),
+            )
+        };
+        if crate::xnnpack::try_gemm_f32(
+            d,
+            l,
+            r,
+            m,
+            n,
+            k,
+            (dst_cs, dst_rs),
+            (lhs_cs, lhs_rs),
+            (rhs_cs, rhs_rs),
+        ) {
+            return Ok(());
+        }
+    }
+
     // Column stripes, run on xn's own pool rather than letting `gemm` reach for rayon.
     //
     // Two pools would otherwise both be live inside a decode step -- this one for the f32
@@ -1647,7 +1676,9 @@ fn unary_chunk(op: UnaryOp, len: usize) -> usize {
     if !transcendental {
         return ELEMWISE_CHUNK;
     }
-    let threads = rayon::current_num_threads().max(1);
+    // The pool that will actually run it, which is not rayon's -- and, once a per-thread pool
+    // is bound, is not the same size on every thread either.
+    let threads = crate::threadpool::size().max(1);
     len.div_ceil(threads * ELEMWISE_CHUNKS_PER_THREAD).max(ELEMWISE_MIN_CHUNK)
 }
 

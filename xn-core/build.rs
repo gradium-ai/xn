@@ -4,6 +4,8 @@ fn main() {
     {
         println!("cargo:rustc-link-lib=framework=Accelerate");
     }
+    #[cfg(feature = "xnnpack")]
+    link_xnnpack();
     #[cfg(feature = "cuda")]
     {
         println!("cargo:rerun-if-changed=src/compatibility.cuh");
@@ -123,4 +125,65 @@ fn build_vulkan_shaders() {
     let dest = Path::new(&out_dir).join("vulkan_shaders.rs");
     let mut f = std::fs::File::create(&dest).expect("failed to create vulkan_shaders.rs");
     f.write_all(generated.as_bytes()).expect("failed to write vulkan_shaders.rs");
+}
+
+/// Link a prebuilt XNNPACK.
+///
+/// The tree is located from `XNNPACK_DIR` if set, else a `XNNPACK` sibling of the workspace
+/// this crate sits in, which is where the checkout normally lands. Either way it must be a
+/// source tree that has already been built:
+///
+/// ```text
+/// git clone --depth 1 https://github.com/google/XNNPACK.git
+/// cd XNNPACK
+/// cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+///   -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DXNNPACK_LIBRARY_TYPE=static \
+///   -DXNNPACK_BUILD_TESTS=OFF -DXNNPACK_BUILD_BENCHMARKS=OFF \
+///   -DXNNPACK_BUILD_ALL_MICROKERNELS=OFF -DXNNPACK_ENABLE_KLEIDIAI=OFF
+/// ninja -C build XNNPACK
+/// ```
+///
+/// Prebuilt rather than built from here on purpose: XNNPACK is a cmake project of its own and
+/// compiling it inside a build script would put minutes onto every clean build of this crate.
+#[cfg(feature = "xnnpack")]
+fn link_xnnpack() {
+    println!("cargo:rerun-if-env-changed=XNNPACK_DIR");
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let manifest = std::path::Path::new(&manifest);
+    // xn-core/../.. is the directory holding the sibling checkouts.
+    let sibling = manifest.parent().and_then(|p| p.parent()).map(|p| p.join("XNNPACK"));
+    let candidates: Vec<std::path::PathBuf> = std::env::var("XNNPACK_DIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .into_iter()
+        .chain(sibling.clone())
+        .collect();
+
+    let dir = candidates
+        .iter()
+        .find(|d| d.join("build").join("libXNNPACK.a").is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "the `xnnpack` feature needs a built XNNPACK. Looked for build/libXNNPACK.a \
+                 under: {}. Set XNNPACK_DIR, or clone and build XNNPACK next to this \
+                 workspace -- see link_xnnpack in build.rs for the cmake invocation.",
+                candidates
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        });
+    println!("cargo:rerun-if-changed={}", dir.join("build/libXNNPACK.a").display());
+
+    let build = dir.join("build");
+    for sub in ["", "pthreadpool", "cpuinfo"] {
+        println!("cargo:rustc-link-search=native={}", build.join(sub).display());
+    }
+    // Order matters for static archives: XNNPACK pulls symbols from the microkernel archive.
+    for lib in ["XNNPACK", "xnnpack-microkernels-prod", "pthreadpool", "cpuinfo"] {
+        println!("cargo:rustc-link-lib=static={lib}");
+    }
+    // XNNPACK has C++ translation units (guard variables, std::once).
+    println!("cargo:rustc-link-lib=dylib=stdc++");
 }
