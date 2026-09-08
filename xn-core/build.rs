@@ -184,6 +184,9 @@ fn link_xnnpack() {
     for lib in ["XNNPACK", "xnnpack-microkernels-prod", "pthreadpool", "cpuinfo"] {
         println!("cargo:rustc-link-lib=static={lib}");
     }
-    // XNNPACK has C++ translation units (guard variables, std::once).
-    println!("cargo:rustc-link-lib=dylib=stdc++");
+    // XNNPACK has C++ translation units (guard variables, std::once). Apple's SDK ships
+    // libc++ only -- libstdc++ went away in Xcode 10 -- so name the toolchain's own runtime.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let cxx = if matches!(target_os.as_str(), "macos" | "ios") { "c++" } else { "stdc++" };
+    println!("cargo:rustc-link-lib=dylib={cxx}");
 }
