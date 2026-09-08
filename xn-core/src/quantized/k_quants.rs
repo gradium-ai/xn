@@ -699,8 +699,8 @@ impl GgmlType for BlockQ8_0 {
 }
 
 // Q8_0 matmul backed by the cache-tiling AVX/NEON/simd128 sgemm kernels.
-// The per-thread sgemm dispatch already partitions tiles via `ith`/`nth`,
-// so we just fan out across rayon workers with disjoint tile assignments.
+// The kernel partitions tiles via `ith`/`nth`, so the fan-out just claims
+// bands of that partition and each one writes disjoint output tiles.
 //
 // `dst` is row-major (`dst[i * n + j]`) while sgemm produces column-major
 // output (`c[ldc * j + i]`). To match layouts without a transpose, we
@@ -742,11 +742,23 @@ fn matmul_q8_0_sgemm(
     // join here and needs no special case. Gating the fan-out on a work threshold was measured
     // and rejected: it helps only when the pool is shared with another busy thread, and costs
     // ~3.4% otherwise.
-    crate::threadpool::dispatch(|ith, nth| {
-        // SAFETY: tile assignments are disjoint across `ith` values, so
-        // writes through `c_addr` do not alias. Bounds were checked
-        // above against the slice lengths.
-        unsafe { sgemm_q8_0_tile(a_addr, b_addr, c_addr, n, m, k_blocks, ith, nth) };
+    // Four claimed bands per participant rather than one static share each.
+    //
+    // The kernel derives its tile band from `ith`/`nth` (`duty = tiles.div_ceil(nth)`), so a
+    // larger synthetic `nth` is simply a finer partition, and every band is still covered
+    // exactly once. Claiming them from a shared counter then lets a fast participant take
+    // several while a slow one takes its single band -- and, because `div_ceil` rounds the duty
+    // up, a coarse partition can leave whole participants with nothing to do at all.
+    //
+    // One band per participant measures the same as the static split, which is what rules out
+    // the claiming itself as the cost: the win is the granularity. 4x is the flat part of the
+    // curve at every thread count tried.
+    let units = crate::threadpool::size() * 4;
+    crate::threadpool::par_units(units, |u| {
+        // SAFETY: each unit is handed to exactly one participant and maps to a disjoint band
+        // of output tiles, so writes through `c_addr` do not alias. Bounds were checked above
+        // against the slice lengths.
+        unsafe { sgemm_q8_0_tile(a_addr, b_addr, c_addr, n, m, k_blocks, u, units) };
     });
     Ok(())
 }
