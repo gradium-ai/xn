@@ -36,6 +36,12 @@ macro_rules! test_all_backends {
             fn [<$test_name _webgpu>]() -> Result<()> {
                 $test_fn(&webgpu_device())
             }
+
+            #[cfg(feature = "xla")]
+            #[test]
+            fn [<$test_name _xla>]() -> Result<()> {
+                $test_fn(&xla_device())
+            }
         }
     };
 }
@@ -50,6 +56,16 @@ fn webgpu_device() -> xn::webgpu_backend::Device {
     use std::sync::OnceLock;
     static DEVICE: OnceLock<xn::webgpu_backend::Device> = OnceLock::new();
     DEVICE.get_or_init(|| xn::webgpu_backend::Device::new(0).expect("init webgpu device")).clone()
+}
+
+/// A single XLA device (PJRT client) shared across the whole test binary:
+/// creating a client is expensive and sharing it lets all tests reuse the
+/// executable cache.
+#[cfg(feature = "xla")]
+fn xla_device() -> xn::xla_backend::Device {
+    use std::sync::OnceLock;
+    static DEVICE: OnceLock<xn::xla_backend::Device> = OnceLock::new();
+    DEVICE.get_or_init(|| xn::xla_backend::Device::new(0).expect("init xla device")).clone()
 }
 
 // =============================================================================
