@@ -468,17 +468,20 @@ impl crate::Backend for Device {
                 let groups = (div_ceil(n, GEMV_TPC_COLS), lhs_b as u32, 1);
                 dst.device.dispatch_nd(&format!("gemv_tpc_{dt}"), &buffers, &push, groups)
             } else {
+                // Cooperative kernel: one 64-thread workgroup per GEMV_TN
+                // columns, not per column. Amortizing the barrier tree across
+                // four columns is what dlight's GEMV schedule does.
                 dst.device.dispatch_nd(
                     &format!("gemv_{dt}"),
                     &buffers,
                     &push,
-                    (n as u32, lhs_b as u32, 1),
+                    (div_ceil(n, GEMV_TN), lhs_b as u32, 1),
                 )
             }
         } else {
             // Tiled kernel: grid (ceil(n/TILE), ceil(m/TILE), batch).
             let buffers = [&dst.buffer, &lhs.0.buffer, &rhs.0.buffer];
-            let groups = (div_ceil(n, TILE), div_ceil(m, TILE), lhs_b as u32);
+            let groups = (div_ceil(n, TILE_N), div_ceil(m, TILE), lhs_b as u32);
             dst.device.dispatch_nd(&format!("gemm_tiled_{dt}"), &buffers, &push, groups)
         }
     }

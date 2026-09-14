@@ -328,6 +328,60 @@ impl<B: Backend> VB<B> {
         }
     }
 
+    /// A tensor's values on the host, without ever putting it on the device.
+    ///
+    /// Some weights are only ever needed host-side -- the flow LM's `bos_emb` is
+    /// compared against every frame on the CPU -- and loading them as a tensor
+    /// only to read them straight back is a pointless round trip. On a GPU
+    /// backend it is worse than pointless: in a browser a blocking readback is
+    /// impossible, so that round trip cannot happen at all.
+    pub fn tensor_host<T: WithDTypeF>(
+        &self,
+        name: &str,
+        shape: impl Into<Shape>,
+    ) -> Result<Vec<T>> {
+        let shape = shape.into();
+        let from_td = |td: Option<&TensorData<'_>>| -> Result<Vec<T>> {
+            let td = match td {
+                Some(t) => t,
+                None => crate::bail!("tensor '{name}' not found"),
+            };
+            if td.shape != shape {
+                crate::bail!(
+                    "shape mismatch for tensor '{name}': expected {shape:?}, found {:?}",
+                    td.shape
+                );
+            }
+            Ok(crate::dtype::convert_bytes_to_vec::<T>(td.data, td.dtype))
+        };
+        match &self.data {
+            VBData::Mmap(yoke) => {
+                let out = from_td(yoke.get().tensor_data.get(name))?;
+                self.used.lock().unwrap().insert(name.to_string());
+                Ok(out)
+            }
+            VBData::Bytes(yoke) => {
+                let out = from_td(yoke.get().tensor_data.get(name))?;
+                self.used.lock().unwrap().insert(name.to_string());
+                Ok(out)
+            }
+            VBData::Gguf(content, reader) => {
+                let tensor = {
+                    let mut reader = reader.lock().unwrap();
+                    content.tensor(&mut *reader, name)?
+                };
+                self.used.lock().unwrap().insert(name.to_string());
+                if tensor.shape() != &shape {
+                    crate::bail!(
+                        "shape mismatch for tensor '{name}': expected {shape:?}, found {:?}",
+                        tensor.shape()
+                    );
+                }
+                Ok(tensor.dequantize()?.into_iter().map(T::from_f32).collect())
+            }
+        }
+    }
+
     pub fn tensor_names(&self) -> Vec<&str> {
         self.data.tensor_names()
     }
@@ -387,6 +441,16 @@ impl<B: Backend> Path<B> {
     ) -> Result<Tensor<T, B>> {
         let name = self.path(name);
         self.vb.tensor(&name, shape)
+    }
+
+    /// See [`VB::tensor_host`]: the values on the host, never on the device.
+    pub fn tensor_host<T: WithDTypeF>(
+        &self,
+        name: &str,
+        shape: impl Into<Shape>,
+    ) -> Result<Vec<T>> {
+        let name = self.path(name);
+        self.vb.tensor_host(&name, shape)
     }
 
     /// Return a new `VarBuilder` adding `s` to the current prefix. This can be think of as `cd`

@@ -230,8 +230,14 @@ const PARAMS_SLOT_SIZE: u64 = 256;
 /// records a few hundred, so this only bounds pathological batches.
 const PARAMS_RING_SLOTS: u64 = 4096;
 const WORKGROUP_SIZE: u32 = 256;
-/// GEMM tile size; must match `TILE` / the `@workgroup_size` in gemm_tiled.wgsl.
+/// GEMM output-tile rows; must match `TM` in gemm_tiled.wgsl. The tile is
+/// 16 rows x `TILE_N` columns over 64 threads (8x8), each holding a 2x4
+/// register tile, so the grid divides by the tile, not the workgroup size.
 const TILE: u32 = 16;
+/// GEMM output-tile columns; must match `TN` in gemm_tiled.wgsl.
+const TILE_N: u32 = 32;
+/// Output columns one workgroup of gemv.wgsl produces; must match its `TN`.
+const GEMV_TN: u32 = 4;
 /// Columns per workgroup in gemv_tpc.wgsl; must match its `@workgroup_size`.
 const GEMV_TPC_COLS: u32 = 64;
 /// Reduction length at which the cooperative gemv overtakes the thread-per-column
@@ -432,7 +438,44 @@ pub struct DeviceInner {
     adapter_f16: bool,
     profile: bool,
     pstats: Mutex<ProfStats>,
+    /// GPU timestamp instrumentation, `Some` when `XN_WEBGPU_TIMING=1` and the
+    /// adapter advertises `TIMESTAMP_QUERY`.
+    ///
+    /// Attribution from dispatch and workgroup counts has been wrong every time
+    /// it was tried on this model; this reads the GPU clock either side of each
+    /// dispatch instead. It forces one compute pass per dispatch, so absolute
+    /// times run high -- a pass is its own `MTLComputeCommandEncoder` -- but the
+    /// split between kernels is what it is for.
+    timing: Option<Timing>,
 }
+
+/// Timestamp-query state. Capacity is in timestamps, two per dispatch.
+struct Timing {
+    query_set: wgpu::QuerySet,
+    /// `QUERY_RESOLVE | COPY_SRC`: where `resolve_query_set` writes ticks.
+    resolve: wgpu::Buffer,
+    /// `MAP_READ | COPY_DST`: host-visible copy of the above.
+    staging: wgpu::Buffer,
+    /// Nanoseconds per tick.
+    period: f32,
+    state: Mutex<TimingState>,
+}
+
+#[derive(Default)]
+struct TimingState {
+    /// Kernel name per dispatch recorded in the current batch, in query order.
+    labels: Vec<String>,
+    /// Next free timestamp index; always even.
+    next: u32,
+    /// Accumulated GPU nanoseconds and dispatch count per kernel.
+    per_kernel: HashMap<String, (f64, u64)>,
+    /// Dispatches dropped because the query set filled before a flush.
+    dropped: u64,
+}
+
+/// Timestamps in the query set: 2048 dispatches per batch, against ~280 that a
+/// Phonon frame records.
+const TIMING_CAPACITY: u32 = 4096;
 
 #[derive(Clone)]
 pub struct Device(Arc<DeviceInner>);
@@ -547,6 +590,19 @@ impl Device {
         if adapter_f16 {
             features |= wgpu::Features::SHADER_F16;
         }
+        // Per-dispatch GPU timing, opt-in and standards-clean: `TIMESTAMP_QUERY`
+        // is a WebGPU feature, not a native extension, so this also works in a
+        // browser that exposes it.
+        let want_timing =
+            std::env::var("XN_WEBGPU_TIMING").is_ok_and(|v| !v.is_empty() && v != "0");
+        let can_time = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        if want_timing {
+            if can_time {
+                features |= wgpu::Features::TIMESTAMP_QUERY;
+            } else {
+                eprintln!("xn webgpu: XN_WEBGPU_TIMING set but the adapter has no TIMESTAMP_QUERY");
+            }
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("xn-webgpu"),
@@ -566,9 +622,34 @@ impl Device {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let timing = (want_timing && can_time).then(|| {
+            let bytes = u64::from(TIMING_CAPACITY) * 8;
+            Timing {
+                query_set: device.create_query_set(&wgpu::QuerySetDescriptor {
+                    label: Some("xn-timestamps"),
+                    ty: wgpu::QueryType::Timestamp,
+                    count: TIMING_CAPACITY,
+                }),
+                resolve: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("xn-query-resolve"),
+                    size: bytes,
+                    usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                }),
+                staging: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("xn-query-staging"),
+                    size: bytes,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                period: queue.get_timestamp_period(),
+                state: Mutex::new(TimingState::default()),
+            }
+        });
         let inner = DeviceInner {
             device,
             params_ring,
+            timing,
             queue,
             pipelines: Mutex::new(HashMap::new()),
             pool: Mutex::new(BufferPool::default()),
@@ -797,9 +878,45 @@ impl Device {
         }
         ctx.params.extend_from_slice(&push.bytes);
         ctx.params.resize(params_offset as usize + PARAMS_SLOT_SIZE as usize, 0);
+        // Timing mode gives every dispatch its own stamped pass. A timestamp
+        // can only be written at a pass boundary, so sharing a pass across
+        // dispatches -- which is what makes this backend fast -- would only
+        // ever time the batch as a whole.
+        let timed = match &self.timing {
+            Some(t) => {
+                let mut st = t.state.lock().unwrap();
+                if st.next + 2 > TIMING_CAPACITY {
+                    // Out of slots: flush so the batch resolves, which resets
+                    // the index, then take the first pair.
+                    drop(st);
+                    self.flush_locked(&mut ctx)?;
+                    st = t.state.lock().unwrap();
+                }
+                if st.next + 2 > TIMING_CAPACITY {
+                    st.dropped += 1;
+                    None
+                } else {
+                    let at = st.next;
+                    st.next += 2;
+                    st.labels.push(kernel.to_string());
+                    Some(at)
+                }
+            }
+            None => None,
+        };
+        if timed.is_some() {
+            // Dropping the pass ends it, so the next one can carry its own
+            // timestamp pair.
+            ctx.pass = None;
+        }
         self.begin_if_needed(&mut ctx);
         let opened = ctx.pass.is_none();
         if opened {
+            let ts = timed.map(|at| wgpu::ComputePassTimestampWrites {
+                query_set: &self.timing.as_ref().unwrap().query_set,
+                beginning_of_pass_write_index: Some(at),
+                end_of_pass_write_index: Some(at + 1),
+            });
             let enc = ctx.encoder.as_mut().unwrap();
             // `forget_lifetime` lets the pass outlive this call and sit in
             // `ctx` next to the encoder that owns it; `end_pass` drops it
@@ -807,7 +924,7 @@ impl Device {
             let cpass = enc
                 .begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("xn"),
-                    timestamp_writes: None,
+                    timestamp_writes: ts,
                 })
                 .forget_lifetime();
             ctx.pass = Some(cpass);
@@ -852,6 +969,40 @@ impl Device {
         }
     }
 
+    /// Read back this batch's timestamp pairs and fold them into the per-kernel
+    /// totals. Called after the poll, so the values are known to be written.
+    fn collect_timestamps(&self, n: u32) {
+        let Some(tm) = &self.timing else { return };
+        let bytes = u64::from(n) * 8;
+        let slice = tm.staging.slice(0..bytes);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        if self.device.poll(wgpu::PollType::Wait).is_err() {
+            return;
+        }
+        {
+            let view = slice.get_mapped_range();
+            let ticks: &[u8] = &view;
+            let mut st = tm.state.lock().unwrap();
+            let labels = std::mem::take(&mut st.labels);
+            for (i, label) in labels.into_iter().enumerate() {
+                let at = i * 16;
+                if at + 16 > ticks.len() {
+                    break;
+                }
+                let beg = u64::from_le_bytes(ticks[at..at + 8].try_into().unwrap());
+                let end = u64::from_le_bytes(ticks[at + 8..at + 16].try_into().unwrap());
+                // Timestamps are unordered across passes on some backends; a
+                // wrapped or equal pair contributes nothing rather than garbage.
+                let ns = end.saturating_sub(beg) as f64 * f64::from(tm.period);
+                let e = st.per_kernel.entry(label).or_insert((0.0, 0));
+                e.0 += ns;
+                e.1 += 1;
+            }
+            st.next = 0;
+        }
+        tm.staging.unmap();
+    }
+
     fn begin_if_needed(&self, ctx: &mut OpCtx) {
         if ctx.encoder.is_none() {
             ctx.encoder = Some(
@@ -873,6 +1024,7 @@ impl Device {
         let had_work = ctx.open;
         let t0 = (self.profile && had_work).then(std::time::Instant::now);
         let (mut pass_end_ns, mut submit_ns) = (0u128, 0u128);
+        let mut resolved = 0u32;
         if ctx.open {
             if !ctx.params.is_empty() {
                 self.queue.write_buffer(&self.params_ring, 0, &ctx.params);
@@ -883,7 +1035,20 @@ impl Device {
                 pass_end_ns = t.elapsed().as_nanos();
             }
             let t = self.profile.then(std::time::Instant::now);
-            let enc = ctx.encoder.take().unwrap();
+            let mut enc = ctx.encoder.take().unwrap();
+            // Resolve this batch's timestamps into a readable buffer before the
+            // encoder is finished; the values are read after the poll below.
+            resolved = match &self.timing {
+                Some(tm) => {
+                    let n = tm.state.lock().unwrap().next;
+                    if n > 0 {
+                        enc.resolve_query_set(&tm.query_set, 0..n, &tm.resolve, 0);
+                        enc.copy_buffer_to_buffer(&tm.resolve, 0, &tm.staging, 0, u64::from(n) * 8);
+                    }
+                    n
+                }
+                None => 0,
+            };
             self.queue.submit(Some(enc.finish()));
             if let Some(t) = t {
                 submit_ns = t.elapsed().as_nanos();
@@ -897,6 +1062,9 @@ impl Device {
         let t = (self.profile && had_work).then(std::time::Instant::now);
         self.poll_blocking()?;
         let poll_ns = t.map_or(0, |t| t.elapsed().as_nanos());
+        if resolved > 0 {
+            self.collect_timestamps(resolved);
+        }
         // Recycling a buffer the GPU has not finished with would corrupt it, so
         // it happens only where completion is actually known. On wasm nothing can
         // block, so this sync flush leaves the buffers queued and `flush_async`
@@ -1184,8 +1352,44 @@ impl Device {
     }
 }
 
+impl DeviceInner {
+    /// Per-kernel GPU time, printed at teardown when timing is on.
+    fn dump_timing(&self) {
+        let Some(tm) = &self.timing else { return };
+        let st = tm.state.lock().unwrap();
+        if st.per_kernel.is_empty() {
+            return;
+        }
+        let mut rows: Vec<(&String, &(f64, u64))> = st.per_kernel.iter().collect();
+        rows.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap_or(std::cmp::Ordering::Equal));
+        let total: f64 = rows.iter().map(|r| r.1.0).sum();
+        eprintln!("\n=== xn webgpu per-kernel GPU time: {} ===", self.device_name);
+        eprintln!("(one compute pass per dispatch, so totals run high; the split is the point)");
+        eprintln!(
+            "{:<24} {:>10} {:>12} {:>10} {:>8}",
+            "kernel", "dispatches", "total ms", "us each", "share"
+        );
+        for (k, (ns, count)) in rows {
+            let ms = ns / 1e6;
+            eprintln!(
+                "{:<24} {:>10} {:>12.2} {:>10.2} {:>7.1}%",
+                k,
+                count,
+                ms,
+                ns / 1e3 / *count as f64,
+                100.0 * ns / total
+            );
+        }
+        eprintln!("{:<24} {:>10} {:>12.2}", "TOTAL", "", total / 1e6);
+        if st.dropped > 0 {
+            eprintln!("{} dispatches went untimed (query set full)", st.dropped);
+        }
+    }
+}
+
 impl Drop for DeviceInner {
     fn drop(&mut self) {
+        self.dump_timing();
         if !self.profile {
             return;
         }

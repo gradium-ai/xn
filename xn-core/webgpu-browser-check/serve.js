@@ -12,6 +12,7 @@
 // Binding is on all interfaces, which is the point, but do note that anything on
 // the network can reach it while it runs.
 const http = require('http');
+const net = require('net');
 const https = require('https');
 const fs = require('fs');
 const os = require('os');
@@ -77,25 +78,53 @@ function handler(req, res) {
   const rel = decodeURIComponent(req.url.split('?')[0]);
   const f = path.join(root, rel === '/' ? 'index.html' : rel);
   if (!f.startsWith(root) || !fs.existsSync(f) || fs.statSync(f).isDirectory()) {
+    console.error(`  404 ${rel}`);
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('not found: ' + rel);
     return;
   }
+  const body = fs.readFileSync(f);
+  console.error(`  200 ${rel} (${body.length} bytes)`);
   res.writeHead(200, { 'Content-Type': TYPES[path.extname(f)] || 'text/plain' });
-  res.end(fs.readFileSync(f));
+  res.end(body);
 }
 
 const { key, cert } = ensureCert();
-https.createServer({ key, cert }, handler).listen(port, '0.0.0.0', () => {
-  console.error(`\nhttps on 0.0.0.0:${port} — serving ${root}\n`);
+
+// One port that accepts both schemes.
+//
+// Phones get this wrong in both directions -- Chrome on Android rewrites typed
+// addresses to https, and a pasted http:// link stays http -- and speaking the
+// wrong protocol at a single-scheme port produces ERR_EMPTY_RESPONSE with no clue
+// as to why. So the first byte is sniffed instead: a TLS handshake record starts
+// with 0x16, anything else is plaintext HTTP and gets redirected to https on the
+// same port, because WebGPU needs the secure context.
+const tls = https.createServer({ key, cert }, handler);
+const plain = http.createServer((req, res) => {
+  const host = (req.headers.host || '').split(':')[0] || localAddresses()[0] || 'localhost';
+  const to = `https://${host}:${port}${req.url}`;
+  console.error(`  http -> redirecting to ${to}`);
+  res.writeHead(301, { Location: to, 'Content-Type': 'text/plain' });
+  res.end(`WebGPU needs https. Go to ${to}\n`);
+});
+
+net.createServer(socket => {
+  const from = socket.remoteAddress;
+  socket.once('error', () => {});
+  socket.once('data', buf => {
+    const isTls = buf[0] === 0x16;
+    console.error(`connection from ${from}: ${isTls ? 'https' : 'http'}`);
+    socket.pause();
+    socket.unshift(buf);
+    (isTls ? tls : plain).emit('connection', socket);
+    process.nextTick(() => socket.resume());
+  });
+}).listen(port, '0.0.0.0', () => {
+  console.error(`\nserving ${root} on 0.0.0.0:${port} (http and https both work)\n`);
   for (const a of ['localhost', ...localAddresses()]) {
     console.error(`  https://${a}:${port}/`);
   }
   console.error('\nOn the phone Chrome will warn about the certificate: tap');
-  console.error('Advanced then Proceed. HTTPS is what makes WebGPU available at all.\n');
-});
-// Plain http alongside, purely so a phone that lands on it gets told why the
-// page reports no WebGPU rather than silently failing.
-http.createServer(handler).listen(port + 1, '0.0.0.0', () => {
-  console.error(`http on 0.0.0.0:${port + 1} (insecure; WebGPU will be absent)`);
+  console.error('Advanced then Proceed. HTTPS is what makes WebGPU available at all.');
+  console.error('Connections are logged below, so you can see the phone arrive.\n');
 });

@@ -7,7 +7,7 @@ exclude = ["xn-flash-attn"]
 resolver = "3"
 
 [workspace.package]
-version = "0.2.3"
+version = "0.2.4"
 description = "Another minimalist deep-learning framework optimized for inference."
 repository = "https://github.com/LaurentMazare/xn"
 keywords = ["pytorch", "deep-learning", "machine-learning"]
