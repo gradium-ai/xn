@@ -74,6 +74,9 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
     Some(def)
 }
 
+/// What `map_async` reports back through the readback channel.
+type MapResult = std::result::Result<(), wgpu::BufferAsyncError>;
+
 const MAX_BINDINGS: usize = 4;
 const PUSH_CONSTANT_SIZE: u32 = 128;
 const WORKGROUP_SIZE: u32 = 256;
@@ -476,8 +479,8 @@ impl Device {
             ctx.open = false;
         }
         // Drive the queue to completion so host reads and buffer recycling are
-        // safe. `poll(Wait)` blocks until all submitted work has finished.
-        self.device.poll(wgpu::PollType::Wait).map_err(wgpuerr("poll"))?;
+        // safe. See `wait_for_queue` for why this spins rather than blocking.
+        self.wait_for_queue()?;
         if let Some(t0) = t0 {
             let mut p = self.pstats.lock().unwrap();
             p.submits += 1;
@@ -497,6 +500,51 @@ impl Device {
     /// the buffer, so recycling waits until the next flush completes.
     fn defer_free(&self, buf: PooledBuf) {
         self.ctx.lock().unwrap().free_bufs.push(buf);
+    }
+
+    /// Whether to spin rather than block while waiting on the GPU.
+    ///
+    /// `poll(Wait)` parks the thread until the queue drains, and waking it back
+    /// up measured ~1 ms on macOS -- more than the work being waited on. A
+    /// decode step waits several times, so the frame ends up dominated by
+    /// scheduler latency rather than by the GPU. Spinning on `poll(Poll)`
+    /// trades a busy core for that latency, which is the right trade for one
+    /// stream and the wrong one for a server running several: set
+    /// `XN_WEBGPU_SPIN=0` to get the blocking wait back.
+    fn spin_wait(&self) -> bool {
+        static SPIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *SPIN.get_or_init(|| !std::env::var("XN_WEBGPU_SPIN").is_ok_and(|v| v == "0"))
+    }
+
+    /// Block until every submitted command has finished.
+    fn wait_for_queue(&self) -> Result<()> {
+        if !self.spin_wait() {
+            self.device.poll(wgpu::PollType::Wait).map_err(wgpuerr("poll"))?;
+            return Ok(());
+        }
+        loop {
+            let status = self.device.poll(wgpu::PollType::Poll).map_err(wgpuerr("poll"))?;
+            if status.is_queue_empty() {
+                return Ok(());
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Block until a pending `map_async` has reported back.
+    fn wait_for_map(&self, rx: &std::sync::mpsc::Receiver<MapResult>) -> Result<()> {
+        if !self.spin_wait() {
+            self.device.poll(wgpu::PollType::Wait).map_err(wgpuerr("poll (readback)"))?;
+            return rx.recv().map_err(wgpuerr("map recv"))?.map_err(wgpuerr("map_async"));
+        }
+        loop {
+            self.device.poll(wgpu::PollType::Poll).map_err(wgpuerr("poll (readback)"))?;
+            match rx.try_recv() {
+                Ok(r) => return r.map_err(wgpuerr("map_async")),
+                Err(std::sync::mpsc::TryRecvError::Empty) => std::hint::spin_loop(),
+                Err(e) => return Err(wgpuerr("map recv")(e)),
+            }
+        }
     }
 
     /// Read `len` elements of `T` back from a GPU buffer into a host `Vec`.
@@ -525,8 +573,7 @@ impl Device {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        self.device.poll(wgpu::PollType::Wait).map_err(wgpuerr("poll (readback)"))?;
-        rx.recv().map_err(wgpuerr("map recv"))?.map_err(wgpuerr("map_async"))?;
+        self.wait_for_map(&rx)?;
         let mapped = slice.get_mapped_range();
         let mut out = Vec::<T>::with_capacity(len);
         unsafe {
