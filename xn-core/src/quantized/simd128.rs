@@ -5,6 +5,27 @@ use half::f16;
 
 use core::arch::wasm32::*;
 
+/// `a * b + c`, fused where the build says the engine can take it.
+///
+/// `f32x4_relaxed_madd` is free to contract into a single FMA or to round
+/// twice, so no caller may depend on which it picks -- which is exactly what
+/// lets the unfused form stand in for it. Safari on iOS implements no relaxed
+/// SIMD at all and rejects an entire module that contains one of those
+/// instructions, even in a function nothing ever calls, so a build meant to
+/// load there must emit none. Pass `-C target-feature=+relaxed-simd` to get
+/// the fused instruction back on engines known to support it.
+#[inline(always)]
+fn f32x4_madd(a: v128, b: v128, c: v128) -> v128 {
+    #[cfg(target_feature = "relaxed-simd")]
+    {
+        f32x4_relaxed_madd(a, b, c)
+    }
+    #[cfg(not(target_feature = "relaxed-simd"))]
+    {
+        f32x4_add(f32x4_mul(a, b), c)
+    }
+}
+
 #[inline(always)]
 pub(crate) fn vec_dot_q4_0_q8_0(n: usize, xs: &[BlockQ4_0], ys: &[BlockQ8_0]) -> Result<f32> {
     let qk = QK8_0;
@@ -39,7 +60,7 @@ pub(crate) fn vec_dot_q4_0_q8_0(n: usize, xs: &[BlockQ4_0], ys: &[BlockQ8_0]) ->
             let sum_xy = f32x4_convert_i32x4(sum_xy);
 
             let d = f32x4_splat(f16::to_f32(x.d) * f16::to_f32(y.d));
-            acc = f32x4_relaxed_madd(sum_xy, d, acc);
+            acc = f32x4_madd(sum_xy, d, acc);
         }
         let res = f32x4_extract_lane::<0>(acc)
             + f32x4_extract_lane::<1>(acc)
@@ -77,7 +98,7 @@ pub(crate) fn vec_dot_q8_0_q8_0(n: usize, xs: &[BlockQ8_0], ys: &[BlockQ8_0]) ->
             let sum_xy = f32x4_convert_i32x4(sum_xy);
 
             let d = f32x4_splat(f16::to_f32(x.d) * f16::to_f32(y.d));
-            acc = f32x4_relaxed_madd(sum_xy, d, acc);
+            acc = f32x4_madd(sum_xy, d, acc);
         }
         let res = f32x4_extract_lane::<0>(acc)
             + f32x4_extract_lane::<1>(acc)
@@ -329,7 +350,7 @@ impl TinyBlasQ0Simd128 {
                         s = i32x4_add(s, i32x4_dot_i16x8(av[2], bv[2]));
                         s = i32x4_add(s, i32x4_dot_i16x8(av[3], bv[3]));
                         let scale = f32x4_splat(a_ds[i] * b_d);
-                        cv[j][i] = f32x4_relaxed_madd(f32x4_convert_i32x4(s), scale, cv[j][i]);
+                        cv[j][i] = f32x4_madd(f32x4_convert_i32x4(s), scale, cv[j][i]);
                     }
                 }
             }
