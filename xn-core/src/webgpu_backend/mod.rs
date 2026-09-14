@@ -64,6 +64,8 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
         "causality_mask" => (include_str!("../../webgpu-kernels/causality_mask.wgsl"), 1),
         "scatter_set" => (include_str!("../../webgpu-kernels/scatter_set.wgsl"), 3),
         "gemm_tiled" => (include_str!("../../webgpu-kernels/gemm_tiled.wgsl"), 3),
+        // rhs is bound twice, as gemv does: scalar plus a vec4 view.
+        "gemm_skinny" => (include_str!("../../webgpu-kernels/gemm_skinny.wgsl"), 4),
         // rhs is bound twice: scalar + a vec4 view for the aligned fast path.
         "gemv" => (include_str!("../../webgpu-kernels/gemv.wgsl"), 4),
         "conv1d" => (include_str!("../../webgpu-kernels/conv1d.wgsl"), 3),
@@ -86,6 +88,18 @@ const WORKGROUP_SIZE: u32 = 256;
 const TILE: u32 = 32;
 /// Output columns one GEMV workgroup produces; must match `TN` in gemv.wgsl.
 const GEMV_TN: u32 = 4;
+/// Output rows and columns one skinny-GEMM workgroup produces; must match
+/// `MT`/`NT` in gemm_skinny.wgsl.
+const SKINNY_MT: u32 = 8;
+const SKINNY_NT: u32 = 2;
+/// Largest m the skinny kernel is considered for. Above this the tiled kernel
+/// has rows to fill its tile with.
+const SKINNY_MAX_M: usize = 16;
+/// Tiled-grid workgroup count at or below which the output does not supply
+/// enough parallelism, so k has to. Measured on an M5: at 16 workgroups the
+/// skinny kernel is 1.9-6.2x faster, at 48 it is 6% slower, so the gate sits
+/// between them.
+const SKINNY_MAX_GROUPS: u32 = 32;
 
 /// Little-endian push-constant byte builder. The WGSL kernels declare their
 /// push constants as a struct of `u32`/`f32` fields, which have the same
