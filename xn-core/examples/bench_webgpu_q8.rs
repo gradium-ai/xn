@@ -7,6 +7,12 @@
 //! (`m = 1`) streams the whole weight per call and nothing else of consequence,
 //! so GB/s is the number that says whether a kernel is finished: the ratio
 //! between the two dtypes should approach 4x, the ratio of their bytes.
+//!
+//! Both arms are warmed hard and timed as the best of several passes. The GPU
+//! clocks up over the first few hundred calls, and a single pass of 100 that
+//! starts cold reads the ramp rather than the kernel: the same q8 kernel on the
+//! same shape measures 90 us that way and 20 us warm, which is enough to draw
+//! the opposite conclusion about whether a kernel is finished.
 
 #[cfg(not(feature = "webgpu"))]
 fn main() {
@@ -52,28 +58,33 @@ fn main() -> xn::Result<()> {
             let xt: Tensor<f32, Device> = Tensor::from_vec(x, (m, k), &dev)?;
             let wq = Q8Tensor::from_f32(&dev, &w, &Shape::from((n, k)))?;
 
-            let iters = 100;
-            // Warm up pipelines, bind groups and the buffer pool first: the
-            // first call of each compiles a shader.
-            for _ in 0..5 {
+            // Compile the shaders, fill the buffer pool, and let the GPU reach
+            // its clock: five calls is enough for the first, nowhere near
+            // enough for the last.
+            let iters = 300;
+            for _ in 0..iters {
                 let _ = xt.matmul_t(&wt)?;
                 let _ = wq.matmul_t(&xt)?;
             }
             dev.synchronize()?;
 
-            let t0 = std::time::Instant::now();
-            for _ in 0..iters {
-                let _ = xt.matmul_t(&wt)?;
-            }
-            dev.synchronize()?;
-            let us_f32 = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            let mut us_f32 = f64::MAX;
+            let mut us_q8 = f64::MAX;
+            for _ in 0..3 {
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    let _ = xt.matmul_t(&wt)?;
+                }
+                dev.synchronize()?;
+                us_f32 = us_f32.min(t0.elapsed().as_secs_f64() * 1e6 / iters as f64);
 
-            let t0 = std::time::Instant::now();
-            for _ in 0..iters {
-                let _ = wq.matmul_t(&xt)?;
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    let _ = wq.matmul_t(&xt)?;
+                }
+                dev.synchronize()?;
+                us_q8 = us_q8.min(t0.elapsed().as_secs_f64() * 1e6 / iters as f64);
             }
-            dev.synchronize()?;
-            let us_q8 = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
 
             // Weight bytes only: q8_0 is 32 quants plus an f16 scale per block.
             let bytes_f32 = (n * k * 4) as f64;

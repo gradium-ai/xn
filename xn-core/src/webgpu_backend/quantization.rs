@@ -123,15 +123,21 @@ impl Q8Tensor {
             //                 tile is mostly empty; above it, the row-block
             //                 kernel's re-reads dominate.
             //
-            // Measured crossover (examples/bench_webgpu_q8.rs on an M5,
-            // summed over Phonon's linear shapes, against the f32 path):
-            // the row-block kernel runs 6.6x at m = 4, 4.0x at 8 and 2.25x
-            // at 16, then decays as its re-reads pile up -- 1.3x at 30,
-            // 0.70x at 64 -- while the tiled kernel holds a flat ~1.0-1.1x
-            // from 30 up. They cross around 32 on the total, but the
-            // row-block kernel is already losing on individual wide-n shapes
-            // by m = 30 (0.41x on 512->2048), so the gate sits at 16, where
-            // no shape regresses.
+            // Measured crossover on an M5, row-block against tiled, summed
+            // over Phonon's linear shapes: 4.9x at m = 4, 3.1x at 8, 1.7x at
+            // 16, 1.2x at 24, then 0.81x at 32 and 0.60x at 64 as the
+            // row-block kernel's weight re-reads pile up. They cross around
+            // 28 on the total, so a gate at 16 leaves a little on the table
+            // and keeps a margin.
+            //
+            // The total hides that the right kernel is really a question of
+            // shape, not of m. What starves the tiled kernel is its grid --
+            // ceil(n/32) * ceil(m/32) workgroups -- so 3072->768, which gives
+            // it 24 of them, prefers the row-block kernel at every m measured
+            // (118 vs 647 us at m = 16, 218 vs 578 at 32), while 512->2048
+            // gives it 64 and already prefers it at m = 16. A gate on the
+            // tiled grid size would serve both; this one is deliberately
+            // simpler.
             const ROW_BLOCK_MAX: usize = 16;
             if m == 1 {
                 self.device.dispatch_nd(
