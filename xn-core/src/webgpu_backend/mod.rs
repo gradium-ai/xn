@@ -34,6 +34,8 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
+pub mod quantization;
+
 fn wgpuerr<E: std::fmt::Debug>(context: &str) -> impl Fn(E) -> crate::Error + '_ {
     move |e| crate::Error::msg(format!("webgpu: {context}: {e:?}"))
 }
@@ -66,6 +68,11 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
         "gemm_tiled" => (include_str!("../../webgpu-kernels/gemm_tiled.wgsl"), 3),
         // rhs is bound twice: scalar + a vec4 view for the aligned fast path.
         "gemv" => (include_str!("../../webgpu-kernels/gemv.wgsl"), 4),
+        // q8_0 weights: dst, lhs, quants, scales. Named without a dtype
+        // suffix -- the activation is always f32 and the weight always q8_0.
+        "gemv_q8" => (include_str!("../../webgpu-kernels/gemv_q8.wgsl"), 4),
+        "gemm_q8" => (include_str!("../../webgpu-kernels/gemm_q8.wgsl"), 4),
+        "gemm_q8_tiled" => (include_str!("../../webgpu-kernels/gemm_q8_tiled.wgsl"), 4),
         "conv1d" => (include_str!("../../webgpu-kernels/conv1d.wgsl"), 3),
         "conv_transpose1d" => (include_str!("../../webgpu-kernels/conv_transpose1d.wgsl"), 3),
         "im2col1d" => (include_str!("../../webgpu-kernels/im2col1d.wgsl"), 2),
@@ -659,6 +666,22 @@ impl Device {
 
     /// Upload host data into a GPU buffer. The write is applied at the next
     /// queue submission, ahead of any command recorded after this call.
+    /// Upload raw bytes to a buffer. `write_buffer_data` is keyed off
+    /// `WithDType`, which the packed q8_0 streams are not -- they are `u32`
+    /// quants and `f32` scales with no tensor dtype between them.
+    fn write_buffer_bytes(&self, buf: &wgpu::Buffer, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if bytes.len().is_multiple_of(4) {
+            self.queue.write_buffer(buf, 0, bytes);
+        } else {
+            let mut padded = bytes.to_vec();
+            padded.resize(round4(bytes.len()), 0);
+            self.queue.write_buffer(buf, 0, &padded);
+        }
+    }
+
     fn write_buffer_data<T: WithDType>(&self, buf: &wgpu::Buffer, data: &[T]) {
         let bytes = std::mem::size_of_val(data);
         if bytes == 0 {
