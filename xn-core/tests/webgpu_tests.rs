@@ -500,3 +500,161 @@ fn conv_transpose1d_cmp() -> Result<()> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// q8_0 weights on the GPU.
+//
+// The oracle here cannot be the f32 matmul directly: quantizing to 8 bits is
+// lossy, so these compare against the *dequantized* weight rather than the
+// original. That isolates the kernel from the quantizer -- a wrong unpack,
+// scale index or reduction shows up immediately, while the ~0.4% the
+// quantizer itself costs does not.
+
+/// Round-trip a weight through q8_0 on the host, mirroring what the GPU
+/// upload does, so tests can multiply by exactly the weight the kernel sees.
+fn q8_roundtrip(w: &[f32]) -> Vec<f32> {
+    use xn::quantized::GgmlType;
+    use xn::quantized::k_quants::BlockQ8_0;
+    let mut blocks = vec![BlockQ8_0::zeros(); w.len() / 32];
+    BlockQ8_0::from_float(w, &mut blocks).unwrap();
+    let mut out = vec![0f32; w.len()];
+    BlockQ8_0::to_float(&blocks, &mut out).unwrap();
+    out
+}
+
+fn cmp_q8_matmul(m: usize, k: usize, n: usize) -> Result<()> {
+    use xn::Shape;
+    use xn::webgpu_backend::quantization::Q8Tensor;
+    let d = dev();
+
+    // Spread of magnitudes across blocks so per-block scales actually differ.
+    let w: Vec<f32> = (0..n * k)
+        .map(|i| ((i % 71) as f32 - 35.0) * 0.013 * (1.0 + (i / k) as f32 * 0.1))
+        .collect();
+    let x: Vec<f32> = (0..m * k).map(|i| ((i % 53) as f32 - 26.0) * 0.021).collect();
+
+    let wq = Q8Tensor::from_f32(&d, &w, &Shape::from((n, k)))?;
+    let xt: Tensor<f32, Wg> = Tensor::from_vec(x.clone(), (m, k), &d)?;
+    let got = wq.matmul_t(&xt)?.to_vec()?;
+
+    // Reference: the dequantized weight, multiplied on the CPU backend.
+    let wd = q8_roundtrip(&w);
+    let wt: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(wd, (n, k), &CPU)?;
+    let xc: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(x, (m, k), &CPU)?;
+    let want = xc.matmul_t(&wt)?.to_vec()?;
+
+    assert_eq!(got.len(), want.len(), "m={m} k={k} n={n}");
+    // f32 accumulation in a different order than the CPU reference.
+    assert_close(&want, &got, 1e-4);
+    Ok(())
+}
+
+#[test]
+fn q8_matmul_decode() -> Result<()> {
+    // m == 1 takes the gemv_q8 path.
+    for (k, n) in [(32, 4), (64, 1), (256, 7), (1024, 256), (1536, 512)] {
+        cmp_q8_matmul(1, k, n)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn q8_matmul_rows() -> Result<()> {
+    // m > 1 takes gemm_q8, including partial row and column tiles.
+    for (m, k, n) in [(2, 64, 8), (3, 256, 5), (4, 512, 64), (6, 1024, 130), (8, 128, 33)] {
+        cmp_q8_matmul(m, k, n)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn q8_matmul_tiled() -> Result<()> {
+    // m > 8 takes gemm_q8_tiled, including tiles that are partial in every
+    // direction at once (m, n and k all off the 32/8 boundaries).
+    for (m, k, n) in [(9, 64, 4), (30, 288, 96), (33, 128, 33), (64, 512, 128), (120, 96, 65)] {
+        cmp_q8_matmul(m, k, n)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn q8_matmul_batched_shape() -> Result<()> {
+    use xn::Shape;
+    use xn::webgpu_backend::quantization::Q8Tensor;
+    // Leading dims are flattened into m and restored on the output.
+    let (b, t, k, n) = (2usize, 3usize, 128usize, 16usize);
+    let d = dev();
+    let w: Vec<f32> = (0..n * k).map(|i| ((i % 29) as f32 - 14.0) * 0.02).collect();
+    let x: Vec<f32> = (0..b * t * k).map(|i| ((i % 37) as f32 - 18.0) * 0.011).collect();
+    let wq = Q8Tensor::from_f32(&d, &w, &Shape::from((n, k)))?;
+    let xt: Tensor<f32, Wg> = Tensor::from_vec(x.clone(), (b, t, k), &d)?;
+    let out = wq.matmul_t(&xt)?;
+    assert_eq!(out.dims(), &[b, t, n]);
+
+    let wd = q8_roundtrip(&w);
+    let wt: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(wd, (n, k), &CPU)?;
+    let xc: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(x, (b, t, k), &CPU)?;
+    assert_close(&xc.matmul_t(&wt)?.to_vec()?, &out.to_vec()?, 1e-4);
+    Ok(())
+}
+
+#[test]
+fn q8_linear_matches_dequantized() -> Result<()> {
+    // The BackendQ entry point, bias included: quantizing a Linear and running
+    // it must match running the dequantized weight through the f32 path.
+    use xn::BackendQ;
+    use xn::nn::Linear;
+    use xn::webgpu_backend::quantization::Q8F32;
+    let d = dev();
+    let (k, n, m) = (256usize, 64usize, 2usize);
+    let w: Vec<f32> = (0..n * k).map(|i| ((i % 61) as f32 - 30.0) * 0.017).collect();
+    let bias: Vec<f32> = (0..n).map(|i| i as f32 * 0.01).collect();
+
+    let wt: Tensor<f32, Wg> = Tensor::from_vec(w.clone(), (n, k), &d)?;
+    let bt: Tensor<f32, Wg> = Tensor::from_vec(bias.clone(), (n,), &d)?;
+    let lin = Linear::new(wt).with_bias(bt);
+    let q = Q8F32::from_linear(lin)?;
+
+    let x: Vec<f32> = (0..m * k).map(|i| ((i % 43) as f32 - 21.0) * 0.03).collect();
+    let xt: Tensor<f32, Wg> = Tensor::from_vec(x.clone(), (m, k), &d)?;
+    let got = q.forward(&xt)?.to_vec()?;
+
+    let wd = q8_roundtrip(&w);
+    let wc: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(wd, (n, k), &CPU)?;
+    let bc: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(bias, (n,), &CPU)?;
+    let xc: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(x, (m, k), &CPU)?;
+    let want = xc.matmul_t(&wc)?.broadcast_add(&bc)?.to_vec()?;
+    assert_close(&want, &got, 1e-4);
+    Ok(())
+}
+
+#[test]
+fn q8_quantization_error_is_small() -> Result<()> {
+    // End to end against the *unquantized* weight: confirms the whole path
+    // (quantize, split, unpack, scale) lands within q8_0's error budget rather
+    // than merely being self-consistent.
+    use xn::Shape;
+    use xn::webgpu_backend::quantization::Q8Tensor;
+    let d = dev();
+    let (k, n) = (1024usize, 128usize);
+    let w: Vec<f32> = (0..n * k).map(|i| (i * 7919 % 1000) as f32 / 500.0 - 1.0).collect();
+    let x: Vec<f32> = (0..k).map(|i| (i * 104729 % 1000) as f32 / 500.0 - 1.0).collect();
+
+    let wq = Q8Tensor::from_f32(&d, &w, &Shape::from((n, k)))?;
+    let xt: Tensor<f32, Wg> = Tensor::from_vec(x.clone(), (1, k), &d)?;
+    let got = wq.matmul_t(&xt)?.to_vec()?;
+
+    let wc: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(w, (n, k), &CPU)?;
+    let xc: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(x, (1, k), &CPU)?;
+    let want = xc.matmul_t(&wc)?.to_vec()?;
+
+    let mut num = 0f64;
+    let mut den = 0f64;
+    for (a, b) in want.iter().zip(got.iter()) {
+        num += ((a - b) as f64).powi(2);
+        den += (*a as f64).powi(2);
+    }
+    let rel = (num / den).sqrt();
+    assert!(rel < 0.01, "q8_0 relative error {rel} is above the 1% budget");
+    Ok(())
+}
