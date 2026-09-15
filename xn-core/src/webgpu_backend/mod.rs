@@ -22,9 +22,10 @@
 //!
 //! Synchronization model: dispatches and buffer copies are recorded into a
 //! single command encoder and only submitted when the batch is flushed (on host
-//! readback / `synchronize` / before a host fallback). Each op runs in its own
-//! compute pass, so WebGPU's automatic cross-pass hazard tracking orders reads
-//! after prior writes. The flush waits for GPU completion via `Device::poll`.
+//! readback / `synchronize` / before a host fallback). Consecutive dispatches
+//! share one compute pass; they execute in order and WebGPU requires each to
+//! observe its predecessors' writes. A buffer copy cannot sit inside a pass, so
+//! recording one closes it first. The flush waits via `Device::poll`.
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::needless_range_loop)]
 
@@ -75,10 +76,16 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
 }
 
 const MAX_BINDINGS: usize = 4;
+/// Entries kept in the bind-group cache before it is dropped wholesale. The
+/// working set is a few thousand tuples per decode step; 8192 thrashed.
+const BIND_GROUP_CACHE_CAP: usize = 1 << 17;
 const PUSH_CONSTANT_SIZE: u32 = 128;
 const WORKGROUP_SIZE: u32 = 256;
-/// GEMM tile size; must match `TILE` / the `@workgroup_size` in gemm_tiled.wgsl.
-const TILE: u32 = 16;
+/// GEMM output-tile edge; must match `TILE` in gemm_tiled.wgsl (the kernel's
+/// `@workgroup_size` is 8x8, with each thread producing a 4x4 patch of it).
+const TILE: u32 = 32;
+/// Output columns one GEMV workgroup produces; must match `TN` in gemv.wgsl.
+const GEMV_TN: u32 = 4;
 
 /// Little-endian push-constant byte builder. The WGSL kernels declare their
 /// push constants as a struct of `u32`/`f32` fields, which have the same
@@ -108,12 +115,35 @@ impl Pc {
 struct CachedPipeline {
     pipeline: wgpu::ComputePipeline,
     bindings: u32,
+    /// Stable index, used to skip a redundant `set_pipeline` when consecutive
+    /// dispatches in the same pass use the same kernel.
+    idx: usize,
 }
 
-/// A pooled buffer plus its size class.
-struct PooledBuf {
+/// A wgpu buffer plus its size class and a stable identity.
+///
+/// `wgpu::Buffer` is only `Clone + Debug` -- no equality, no hash -- so the
+/// bind-group cache needs an id of our own. Ids are handed out once per created
+/// buffer and travel with it through the recycling pool, so a cached bind group
+/// stays valid for as long as the buffers exist. Derefs to `wgpu::Buffer`.
+struct Buf {
     buffer: wgpu::Buffer,
     class: u64,
+    id: u64,
+}
+
+impl std::ops::Deref for Buf {
+    type Target = wgpu::Buffer;
+    fn deref(&self) -> &wgpu::Buffer {
+        &self.buffer
+    }
+}
+
+impl Buf {
+    /// Another handle to the same GPU buffer, carrying the same identity.
+    fn dup(&self) -> Buf {
+        Buf { buffer: self.buffer.clone(), class: self.class, id: self.id }
+    }
 }
 
 /// Recycling pool for buffer allocations, keyed by size class. Decoding
@@ -122,7 +152,9 @@ struct PooledBuf {
 /// and reused instead of being re-created.
 #[derive(Default)]
 struct BufferPool {
-    free: HashMap<u64, Vec<PooledBuf>>,
+    free: HashMap<u64, Vec<Buf>>,
+    /// Monotonic source of buffer identities.
+    next_id: u64,
     hits: u64,
     misses: u64,
 }
@@ -153,6 +185,9 @@ struct ProfStats {
     record_ns: u128,
     /// CPU time in submit + `poll(Wait)` (blocked on GPU execution).
     submit_wait_ns: u128,
+    /// Bind-group cache hits / misses.
+    bg_hits: u64,
+    bg_misses: u64,
     /// CPU time in the readback staging copy + map (excludes the inner flush).
     readback_ns: u128,
     /// Per-kernel dispatch counts.
@@ -163,11 +198,17 @@ struct ProfStats {
 /// into `encoder` and only submitted on flush.
 struct OpCtx {
     encoder: Option<wgpu::CommandEncoder>,
+    /// The compute pass dispatches record into, held open across consecutive
+    /// dispatches. Must be dropped (via `end_pass`) before the encoder is
+    /// touched again or finished.
+    pass: Option<wgpu::ComputePass<'static>>,
+    /// `CachedPipeline::idx` of the pipeline currently bound in `pass`.
+    last_pipeline: usize,
     /// Whether `encoder` holds recorded, unsubmitted commands.
     open: bool,
     /// Buffers (dropped tensors + scratch) to recycle into the pool on the next
     /// flush, once the batch referencing them has finished executing.
-    free_bufs: Vec<PooledBuf>,
+    free_bufs: Vec<Buf>,
 }
 
 pub struct DeviceInner {
@@ -177,6 +218,10 @@ pub struct DeviceInner {
     bind_group_layouts: Vec<wgpu::BindGroupLayout>,
     pipeline_layouts: Vec<wgpu::PipelineLayout>,
     pipelines: Mutex<HashMap<String, CachedPipeline>>,
+    /// Bind groups keyed by (pipeline index, buffer ids). Which pooled buffer
+    /// an intermediate lands in shifts between steps, so this is not a perfect
+    /// cache: ~74% hits on a decode step (`XN_WEBGPU_PROFILE=1` reports it).
+    bind_groups: Mutex<HashMap<(usize, [u64; MAX_BINDINGS]), wgpu::BindGroup>>,
     pool: Mutex<BufferPool>,
     ctx: Mutex<OpCtx>,
     device_name: String,
@@ -299,8 +344,15 @@ impl Device {
             bind_group_layouts,
             pipeline_layouts,
             pipelines: Mutex::new(HashMap::new()),
+            bind_groups: Mutex::new(HashMap::new()),
             pool: Mutex::new(BufferPool::default()),
-            ctx: Mutex::new(OpCtx { encoder: None, open: false, free_bufs: Vec::new() }),
+            ctx: Mutex::new(OpCtx {
+                encoder: None,
+                pass: None,
+                last_pipeline: usize::MAX,
+                open: false,
+                free_bufs: Vec::new(),
+            }),
             device_name,
             profile,
             pstats: Mutex::new(ProfStats::default()),
@@ -319,32 +371,36 @@ impl Device {
 
     /// Allocate a buffer of at least `size_bytes`, reusing a pooled buffer of
     /// the same size class when one is available.
-    fn alloc_buffer(&self, size_bytes: usize) -> wgpu::Buffer {
+    fn alloc_buffer(&self, size_bytes: usize) -> Buf {
         let class = size_class(size_bytes);
-        {
+        let id = {
             let mut pool = self.pool.lock().unwrap();
             if let Some(b) = pool.free.get_mut(&class).and_then(|v| v.pop()) {
                 pool.hits += 1;
-                return b.buffer;
+                return b;
             }
             pool.misses += 1;
-        }
-        // Created at full class size so any same-class request can reuse it.
-        self.device.create_buffer(&wgpu::BufferDescriptor {
+            pool.next_id += 1;
+            pool.next_id
+        };
+        // Created at full class size so any same-class request can reuse it,
+        // and so `as_entire_binding` is stable for the bind-group cache.
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("xn-storage"),
             size: class,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        })
+        });
+        Buf { buffer, class, id }
     }
 
-    fn get_pipeline(&self, name: &str) -> Result<(wgpu::ComputePipeline, u32)> {
+    fn get_pipeline(&self, name: &str) -> Result<(wgpu::ComputePipeline, u32, usize)> {
         {
             let pipelines = self.pipelines.lock().unwrap();
             if let Some(p) = pipelines.get(name) {
-                return Ok((p.pipeline.clone(), p.bindings));
+                return Ok((p.pipeline.clone(), p.bindings, p.idx));
             }
         }
         let (src, bindings) = kernel_src(name)
@@ -362,19 +418,14 @@ impl Device {
             cache: None,
         });
         let mut pipelines = self.pipelines.lock().unwrap();
+        let idx = pipelines.len();
         let entry =
-            pipelines.entry(name.to_string()).or_insert(CachedPipeline { pipeline, bindings });
-        Ok((entry.pipeline.clone(), entry.bindings))
+            pipelines.entry(name.to_string()).or_insert(CachedPipeline { pipeline, bindings, idx });
+        Ok((entry.pipeline.clone(), entry.bindings, entry.idx))
     }
 
     /// Record a single dispatch of `kernel` (1D workgroup count).
-    fn dispatch(
-        &self,
-        kernel: &str,
-        buffers: &[&wgpu::Buffer],
-        push: &Pc,
-        groups_x: u32,
-    ) -> Result<()> {
+    fn dispatch(&self, kernel: &str, buffers: &[&Buf], push: &Pc, groups_x: u32) -> Result<()> {
         self.dispatch_nd(kernel, buffers, push, (groups_x, 1, 1))
     }
 
@@ -383,7 +434,7 @@ impl Device {
     fn dispatch_nd(
         &self,
         kernel: &str,
-        buffers: &[&wgpu::Buffer],
+        buffers: &[&Buf],
         push: &Pc,
         groups: (u32, u32, u32),
     ) -> Result<()> {
@@ -392,34 +443,54 @@ impl Device {
             return Ok(());
         }
         let t0 = self.profile.then(std::time::Instant::now);
-        let (pipeline, bindings) = self.get_pipeline(kernel)?;
+        let (pipeline, bindings, pidx) = self.get_pipeline(kernel)?;
         assert_eq!(bindings as usize, buffers.len(), "kernel {kernel} binding count mismatch");
-        let entries: Vec<wgpu::BindGroupEntry> = buffers
-            .iter()
-            .enumerate()
-            .map(|(i, b)| wgpu::BindGroupEntry {
-                binding: i as u32,
-                resource: b.as_entire_binding(),
-            })
-            .collect();
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some(kernel),
-            layout: &self.bind_group_layouts[bindings as usize],
-            entries: &entries,
-        });
-        let mut ctx = self.ctx.lock().unwrap();
-        self.begin_if_needed(&mut ctx);
-        let enc = ctx.encoder.as_mut().unwrap();
-        {
-            let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some(kernel),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&pipeline);
-            cpass.set_bind_group(0, &bind_group, &[]);
-            cpass.set_push_constants(0, &push.bytes);
-            cpass.dispatch_workgroups(gx, gy, gz);
+        let mut key = [0u64; MAX_BINDINGS];
+        for (i, b) in buffers.iter().enumerate() {
+            key[i] = b.id;
         }
+        let mut bgs = self.bind_groups.lock().unwrap();
+        let cached = bgs.get(&(pidx, key)).cloned();
+        if self.profile {
+            let mut p = self.pstats.lock().unwrap();
+            if cached.is_some() { p.bg_hits += 1 } else { p.bg_misses += 1 }
+        }
+        let bind_group = match cached {
+            Some(bg) => bg,
+            None => {
+                let entries: Vec<wgpu::BindGroupEntry> = buffers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| wgpu::BindGroupEntry {
+                        binding: i as u32,
+                        resource: b.as_entire_binding(),
+                    })
+                    .collect();
+                let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.bind_group_layouts[bindings as usize],
+                    entries: &entries,
+                });
+                // Distinct tuples are not bounded a priori, so cap the cache.
+                if bgs.len() >= BIND_GROUP_CACHE_CAP {
+                    bgs.clear();
+                }
+                bgs.insert((pidx, key), bg.clone());
+                bg
+            }
+        };
+        drop(bgs);
+        let mut ctx = self.ctx.lock().unwrap();
+        self.ensure_pass(&mut ctx);
+        let switch_pipeline = ctx.last_pipeline != pidx;
+        ctx.last_pipeline = pidx;
+        let cpass = ctx.pass.as_mut().unwrap();
+        if switch_pipeline {
+            cpass.set_pipeline(&pipeline);
+        }
+        cpass.set_bind_group(0, &bind_group, &[]);
+        cpass.set_push_constants(0, &push.bytes);
+        cpass.dispatch_workgroups(gx, gy, gz);
         drop(ctx);
         if let Some(t0) = t0 {
             let mut p = self.pstats.lock().unwrap();
@@ -440,6 +511,8 @@ impl Device {
         // multiple of 256) so rounding up never overruns the allocation.
         let bytes = round4(bytes) as u64;
         let mut ctx = self.ctx.lock().unwrap();
+        // A copy cannot be recorded inside a compute pass.
+        Self::end_pass(&mut ctx);
         self.begin_if_needed(&mut ctx);
         ctx.encoder.as_mut().unwrap().copy_buffer_to_buffer(src, 0, dst, 0, bytes);
         drop(ctx);
@@ -448,6 +521,36 @@ impl Device {
             p.copies += 1;
             p.record_ns += t0.elapsed().as_nanos();
         }
+    }
+
+    /// Open the compute pass if there is not one already.
+    ///
+    /// One pass per operator cost 38% of wall-clock in command recording with
+    /// the GPU idle (on Metal a WebGPU pass is a fresh
+    /// `MTLComputeCommandEncoder`). The Metal backend keeps one serial encoder
+    /// open per batch and Vulkan records into one command buffer; this is the
+    /// WebGPU equivalent, and ordering still holds because dispatches within a
+    /// pass run in order and must observe their predecessors' writes.
+    fn ensure_pass(&self, ctx: &mut OpCtx) {
+        self.begin_if_needed(ctx);
+        if ctx.pass.is_none() {
+            let enc = ctx.encoder.as_mut().unwrap();
+            let pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("xn"),
+                timestamp_writes: None,
+            });
+            // `forget_lifetime` lets the pass outlive the borrow of `encoder`;
+            // `end_pass` runs before every copy and before `finish`.
+            ctx.pass = Some(pass.forget_lifetime());
+            ctx.last_pipeline = usize::MAX;
+        }
+    }
+
+    /// Close the open compute pass, if any. Required before recording anything
+    /// else into the encoder (buffer copies) or finishing it.
+    fn end_pass(ctx: &mut OpCtx) {
+        ctx.pass = None;
+        ctx.last_pipeline = usize::MAX;
     }
 
     fn begin_if_needed(&self, ctx: &mut OpCtx) {
@@ -470,6 +573,8 @@ impl Device {
     fn flush_locked(&self, ctx: &mut OpCtx) -> Result<()> {
         let had_work = ctx.open;
         let t0 = (self.profile && had_work).then(std::time::Instant::now);
+        // The pass borrows the encoder; it has to go before `finish`.
+        Self::end_pass(ctx);
         if ctx.open {
             let enc = ctx.encoder.take().unwrap();
             self.queue.submit(Some(enc.finish()));
@@ -495,7 +600,7 @@ impl Device {
     /// Schedule a buffer to be recycled into the pool on the next flush. Called
     /// from `Storage::drop`; the current (unsubmitted) batch may still reference
     /// the buffer, so recycling waits until the next flush completes.
-    fn defer_free(&self, buf: PooledBuf) {
+    fn defer_free(&self, buf: Buf) {
         self.ctx.lock().unwrap().free_bufs.push(buf);
     }
 
@@ -617,6 +722,15 @@ impl Drop for DeviceInner {
         if !kernels.is_empty() {
             eprintln!("top kernels (count): {}", kernels.join(", "));
         }
+        let bg_total = p.bg_hits + p.bg_misses;
+        if bg_total > 0 {
+            eprintln!(
+                "bind groups: {} hits / {} built ({:.1}% reuse)",
+                p.bg_hits,
+                p.bg_misses,
+                100.0 * p.bg_hits as f64 / bg_total as f64,
+            );
+        }
         let pool = self.pool.lock().unwrap();
         let allocs = pool.hits + pool.misses;
         if allocs > 0 {
@@ -633,10 +747,8 @@ impl Drop for DeviceInner {
 /// WebGPU tensor storage: an `f32`-capable storage buffer. Host access goes
 /// through readback/upload rather than a mapped pointer.
 pub struct Storage<T: WithDType> {
-    buffer: wgpu::Buffer,
+    buffer: Buf,
     len: usize,
-    /// Allocation size class; used to return the buffer to the pool on drop.
-    class: u64,
     device: Device,
     _t: PhantomData<T>,
 }
@@ -658,7 +770,7 @@ impl<T: WithDType> Drop for Storage<T> {
     fn drop(&mut self) {
         // The current (unsubmitted) batch may still reference this buffer, so
         // defer recycling it until the next flush completes on the GPU.
-        self.device.defer_free(PooledBuf { buffer: self.buffer.clone(), class: self.class });
+        self.device.defer_free(self.buffer.dup());
     }
 }
 
