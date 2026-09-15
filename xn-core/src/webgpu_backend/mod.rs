@@ -74,11 +74,17 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
     Some(def)
 }
 
+/// What `map_async` reports back through the readback channel.
+type MapResult = std::result::Result<(), wgpu::BufferAsyncError>;
+
 const MAX_BINDINGS: usize = 4;
 const PUSH_CONSTANT_SIZE: u32 = 128;
 const WORKGROUP_SIZE: u32 = 256;
 /// GEMM tile size; must match `TILE` / the `@workgroup_size` in gemm_tiled.wgsl.
 const TILE: u32 = 16;
+/// Busy-poll budget for `Device::wait_for_queue` (see there), overridable with
+/// `XN_WEBGPU_SPIN_US`; `0` blocks immediately.
+const DEFAULT_SPIN_BUDGET_US: u64 = 2_000;
 
 /// Little-endian push-constant byte builder. The WGSL kernels declare their
 /// push constants as a struct of `u32`/`f32` fields, which have the same
@@ -140,9 +146,9 @@ fn size_class(bytes: usize) -> u64 {
 /// Profiling counters (enabled via `XN_WEBGPU_PROFILE=1`). Because a whole
 /// forward pass records into one encoder and flushes exactly once (at the
 /// logits readback), the per-op timeline is: record ops (GPU idle) -> submit +
-/// poll-wait (GPU busy) -> readback. Timing those phases separately shows
-/// whether wall-clock is spent building commands on the CPU (`record_ns`),
-/// blocked waiting on the GPU (`submit_wait_ns`), or in host readback.
+/// wait for the queue to drain (GPU busy) -> readback. Timing those phases
+/// separately shows whether wall-clock is spent building commands on the CPU
+/// (`record_ns`), waiting on the GPU (`submit_wait_ns`), or in host readback.
 #[derive(Default)]
 struct ProfStats {
     dispatches: u64,
@@ -151,9 +157,11 @@ struct ProfStats {
     readbacks: u64,
     /// CPU time building dispatches/copies into the encoder (GPU idle).
     record_ns: u128,
-    /// CPU time in submit + `poll(Wait)` (blocked on GPU execution).
+    /// CPU time in submit + draining the queue. The GPU is busy here, but the
+    /// CPU is not idle: `wait_for_queue` spins for the first `spin_budget`.
     submit_wait_ns: u128,
-    /// CPU time in the readback staging copy + map (excludes the inner flush).
+    /// CPU time in the readback staging copy + map. Excludes the flush that
+    /// carries the copy, which is counted as a submit in `submit_wait_ns`.
     readback_ns: u128,
     /// Per-kernel dispatch counts.
     per_kernel: HashMap<String, u64>,
@@ -181,6 +189,8 @@ pub struct DeviceInner {
     ctx: Mutex<OpCtx>,
     device_name: String,
     profile: bool,
+    /// Busy-poll budget for `wait_for_queue`; zero means block immediately.
+    spin_budget: std::time::Duration,
     pstats: Mutex<ProfStats>,
 }
 
@@ -292,6 +302,11 @@ impl Device {
         }
 
         let profile = std::env::var("XN_WEBGPU_PROFILE").is_ok_and(|v| !v.is_empty() && v != "0");
+        let spin_us = std::env::var("XN_WEBGPU_SPIN_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_SPIN_BUDGET_US);
+        let spin_budget = std::time::Duration::from_micros(spin_us);
 
         let inner = DeviceInner {
             device,
@@ -303,6 +318,7 @@ impl Device {
             ctx: Mutex::new(OpCtx { encoder: None, open: false, free_bufs: Vec::new() }),
             device_name,
             profile,
+            spin_budget,
             pstats: Mutex::new(ProfStats::default()),
         };
         Ok(Self(Arc::new(inner)))
@@ -476,8 +492,8 @@ impl Device {
             ctx.open = false;
         }
         // Drive the queue to completion so host reads and buffer recycling are
-        // safe. `poll(Wait)` blocks until all submitted work has finished.
-        self.device.poll(wgpu::PollType::Wait).map_err(wgpuerr("poll"))?;
+        // safe. See `wait_for_queue` for how the wait is split.
+        self.wait_for_queue()?;
         if let Some(t0) = t0 {
             let mut p = self.pstats.lock().unwrap();
             p.submits += 1;
@@ -499,13 +515,61 @@ impl Device {
         self.ctx.lock().unwrap().free_bufs.push(buf);
     }
 
+    /// Block until every submitted command has finished: busy-poll for
+    /// `spin_budget`, then hand the core back and block.
+    ///
+    /// `poll(Wait)` is a real kernel wait on Vulkan (`vkWaitSemaphores`) and
+    /// DX12 (`SetEventOnCompletion`), but not on Metal, where wgpu-hal polls
+    /// `MTLCommandBuffer::status()` with a `thread::sleep(1ms)` between checks
+    /// (`wgpu-hal/src/metal/device.rs`). There every wait costs a sleep quantum
+    /// however briefly the GPU was busy -- which is why a 1 f32 and a 24,000
+    /// f32 readback both measured ~1.3 ms, and why a decode frame ended up made
+    /// of sleep quanta rather than of GPU work.
+    ///
+    /// Spinning is not free either: each `poll(Poll)` re-enters wgpu-core's
+    /// whole `maintain` path (several locks plus a driver `get_fence_value`),
+    /// with `ctx` held when the caller is `flush_locked`. So the budget is
+    /// short -- enough for the sub-millisecond decode waits the win comes from,
+    /// while prefill and software adapters, whose "GPU" work runs on the very
+    /// cores being spun on, fall through to the blocking wait. Same trade as
+    /// `crate::threadpool`'s spin-then-park.
+    ///
+    /// The two phases differ slightly: `is_queue_empty()` is stricter than
+    /// `poll(Wait)`, which targets the last submission index as of the call, so
+    /// a spinning thread also waits out other threads' concurrent submissions.
+    /// Both cover the caller's own work; the budget bounds the difference.
+    fn wait_for_queue(&self) -> Result<()> {
+        let deadline = std::time::Instant::now() + self.spin_budget;
+        while std::time::Instant::now() < deadline {
+            let status = self.device.poll(wgpu::PollType::Poll).map_err(wgpuerr("poll"))?;
+            if status.is_queue_empty() {
+                return Ok(());
+            }
+            std::hint::spin_loop();
+        }
+        self.device.poll(wgpu::PollType::Wait).map_err(wgpuerr("poll"))?;
+        Ok(())
+    }
+
+    /// Block until a pending `map_async` has reported back. A poll that reports
+    /// the queue empty has already fired the map callback (wgpu-core collects
+    /// the mapping closures before computing `queue_empty`), so draining the
+    /// queue is sufficient; the blocking wait relies on the same ordering.
+    fn wait_for_map(&self, rx: &std::sync::mpsc::Receiver<MapResult>) -> Result<()> {
+        self.wait_for_queue()?;
+        rx.recv().map_err(wgpuerr("map recv"))?.map_err(wgpuerr("map_async"))
+    }
+
     /// Read `len` elements of `T` back from a GPU buffer into a host `Vec`.
-    /// Flushes pending work first so the readback observes it.
+    ///
+    /// The staging copy goes into the pending batch rather than a submit of its
+    /// own, so a readback costs one GPU wait rather than two: the dispatches
+    /// producing `buf` are in the same encoder, and `write_buffer` uploads
+    /// apply at the head of the submission, so both are ordered before it.
     fn read_buffer<T: WithDType>(&self, buf: &wgpu::Buffer, len: usize) -> Result<Vec<T>> {
         if len == 0 {
             return Ok(Vec::new());
         }
-        self.flush()?;
         let t0 = self.profile.then(std::time::Instant::now);
         let bytes = len * T::BYTE_SIZE;
         let padded = round4(bytes) as u64;
@@ -515,18 +579,24 @@ impl Device {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let mut enc =
-            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        enc.copy_buffer_to_buffer(buf, 0, &staging, 0, padded);
-        self.queue.submit(Some(enc.finish()));
-
+        let mut readback_ns = 0u128;
+        {
+            let mut ctx = self.ctx.lock().unwrap();
+            self.begin_if_needed(&mut ctx);
+            ctx.encoder.as_mut().unwrap().copy_buffer_to_buffer(buf, 0, &staging, 0, padded);
+            if let Some(t0) = t0 {
+                readback_ns += t0.elapsed().as_nanos();
+            }
+            // Counts as a submit, not as readback time.
+            self.flush_locked(&mut ctx)?;
+        }
+        let t1 = self.profile.then(std::time::Instant::now);
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        self.device.poll(wgpu::PollType::Wait).map_err(wgpuerr("poll (readback)"))?;
-        rx.recv().map_err(wgpuerr("map recv"))?.map_err(wgpuerr("map_async"))?;
+        self.wait_for_map(&rx)?;
         let mapped = slice.get_mapped_range();
         let mut out = Vec::<T>::with_capacity(len);
         unsafe {
@@ -535,10 +605,11 @@ impl Device {
         }
         drop(mapped);
         staging.unmap();
-        if let Some(t0) = t0 {
+        if let Some(t1) = t1 {
+            readback_ns += t1.elapsed().as_nanos();
             let mut p = self.pstats.lock().unwrap();
             p.readbacks += 1;
-            p.readback_ns += t0.elapsed().as_nanos();
+            p.readback_ns += readback_ns;
         }
         Ok(out)
     }
@@ -594,7 +665,7 @@ impl Drop for DeviceInner {
                 100.0 * record / total
             );
             eprintln!(
-                "  submit+wait (blocked on GPU)     : {:>9.1} ms  ({:>4.1}%)",
+                "  submit+wait (GPU busy)           : {:>9.1} ms  ({:>4.1}%)",
                 wait,
                 100.0 * wait / total
             );
