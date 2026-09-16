@@ -22,9 +22,10 @@
 //!
 //! Synchronization model: dispatches and buffer copies are recorded into a
 //! single command encoder and only submitted when the batch is flushed (on host
-//! readback / `synchronize` / before a host fallback). Each op runs in its own
-//! compute pass, so WebGPU's automatic cross-pass hazard tracking orders reads
-//! after prior writes. The flush waits for GPU completion via `Device::poll`.
+//! readback / `synchronize` / before a host fallback). Consecutive dispatches
+//! share one compute pass; they execute in order and WebGPU requires each to
+//! observe its predecessors' writes. A buffer copy cannot sit inside a pass, so
+//! recording one closes it first. The flush waits via `Device::poll`.
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::needless_range_loop)]
 
@@ -114,6 +115,9 @@ impl Pc {
 struct CachedPipeline {
     pipeline: wgpu::ComputePipeline,
     bindings: u32,
+    /// Stable index, used to skip a redundant `set_pipeline` when consecutive
+    /// dispatches in the same pass use the same kernel.
+    idx: usize,
 }
 
 /// A wgpu buffer plus its size class and a stable identity.
@@ -193,6 +197,12 @@ struct ProfStats {
 /// into `encoder` and only submitted on flush.
 struct OpCtx {
     encoder: Option<wgpu::CommandEncoder>,
+    /// The compute pass dispatches record into, held open across consecutive
+    /// dispatches. Must be dropped (via `end_pass`) before the encoder is
+    /// touched again or finished.
+    pass: Option<wgpu::ComputePass<'static>>,
+    /// `CachedPipeline::idx` of the pipeline currently bound in `pass`.
+    last_pipeline: usize,
     /// Whether `encoder` holds recorded, unsubmitted commands.
     open: bool,
     /// Buffers (dropped tensors + scratch) to recycle into the pool on the next
@@ -337,7 +347,13 @@ impl Device {
             pipeline_layouts,
             pipelines: Mutex::new(HashMap::new()),
             pool: Mutex::new(BufferPool::default()),
-            ctx: Mutex::new(OpCtx { encoder: None, open: false, free_bufs: Vec::new() }),
+            ctx: Mutex::new(OpCtx {
+                encoder: None,
+                pass: None,
+                last_pipeline: usize::MAX,
+                open: false,
+                free_bufs: Vec::new(),
+            }),
             device_name,
             profile,
             spin_budget,
@@ -381,11 +397,11 @@ impl Device {
         Buf { buffer, class, id }
     }
 
-    fn get_pipeline(&self, name: &str) -> Result<(wgpu::ComputePipeline, u32)> {
+    fn get_pipeline(&self, name: &str) -> Result<(wgpu::ComputePipeline, u32, usize)> {
         {
             let pipelines = self.pipelines.lock().unwrap();
             if let Some(p) = pipelines.get(name) {
-                return Ok((p.pipeline.clone(), p.bindings));
+                return Ok((p.pipeline.clone(), p.bindings, p.idx));
             }
         }
         let (src, bindings) = kernel_src(name)
@@ -403,9 +419,10 @@ impl Device {
             cache: None,
         });
         let mut pipelines = self.pipelines.lock().unwrap();
+        let idx = pipelines.len();
         let entry =
-            pipelines.entry(name.to_string()).or_insert(CachedPipeline { pipeline, bindings });
-        Ok((entry.pipeline.clone(), entry.bindings))
+            pipelines.entry(name.to_string()).or_insert(CachedPipeline { pipeline, bindings, idx });
+        Ok((entry.pipeline.clone(), entry.bindings, entry.idx))
     }
 
     /// Record a single dispatch of `kernel` (1D workgroup count).
@@ -427,7 +444,7 @@ impl Device {
             return Ok(());
         }
         let t0 = self.profile.then(std::time::Instant::now);
-        let (pipeline, bindings) = self.get_pipeline(kernel)?;
+        let (pipeline, bindings, pidx) = self.get_pipeline(kernel)?;
         assert_eq!(bindings as usize, buffers.len(), "kernel {kernel} binding count mismatch");
         let entries: Vec<wgpu::BindGroupEntry> = buffers
             .iter()
@@ -443,18 +460,16 @@ impl Device {
             entries: &entries,
         });
         let mut ctx = self.ctx.lock().unwrap();
-        self.begin_if_needed(&mut ctx);
-        let enc = ctx.encoder.as_mut().unwrap();
-        {
-            let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some(kernel),
-                timestamp_writes: None,
-            });
+        self.ensure_pass(&mut ctx);
+        let switch_pipeline = ctx.last_pipeline != pidx;
+        ctx.last_pipeline = pidx;
+        let cpass = ctx.pass.as_mut().unwrap();
+        if switch_pipeline {
             cpass.set_pipeline(&pipeline);
-            cpass.set_bind_group(0, &bind_group, &[]);
-            cpass.set_push_constants(0, &push.bytes);
-            cpass.dispatch_workgroups(gx, gy, gz);
         }
+        cpass.set_bind_group(0, &bind_group, &[]);
+        cpass.set_push_constants(0, &push.bytes);
+        cpass.dispatch_workgroups(gx, gy, gz);
         drop(ctx);
         if let Some(t0) = t0 {
             let mut p = self.pstats.lock().unwrap();
@@ -475,6 +490,8 @@ impl Device {
         // multiple of 256) so rounding up never overruns the allocation.
         let bytes = round4(bytes) as u64;
         let mut ctx = self.ctx.lock().unwrap();
+        // A copy cannot be recorded inside a compute pass.
+        Self::end_pass(&mut ctx);
         self.begin_if_needed(&mut ctx);
         ctx.encoder.as_mut().unwrap().copy_buffer_to_buffer(src, 0, dst, 0, bytes);
         drop(ctx);
@@ -483,6 +500,36 @@ impl Device {
             p.copies += 1;
             p.record_ns += t0.elapsed().as_nanos();
         }
+    }
+
+    /// Open the compute pass if there is not one already.
+    ///
+    /// One pass per operator cost 38% of wall-clock in command recording with
+    /// the GPU idle (on Metal a WebGPU pass is a fresh
+    /// `MTLComputeCommandEncoder`). The Metal backend keeps one serial encoder
+    /// open per batch and Vulkan records into one command buffer; this is the
+    /// WebGPU equivalent, and ordering still holds because dispatches within a
+    /// pass run in order and must observe their predecessors' writes.
+    fn ensure_pass(&self, ctx: &mut OpCtx) {
+        self.begin_if_needed(ctx);
+        if ctx.pass.is_none() {
+            let enc = ctx.encoder.as_mut().unwrap();
+            let pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("xn"),
+                timestamp_writes: None,
+            });
+            // `forget_lifetime` lets the pass outlive the borrow of `encoder`;
+            // `end_pass` runs before every copy and before `finish`.
+            ctx.pass = Some(pass.forget_lifetime());
+            ctx.last_pipeline = usize::MAX;
+        }
+    }
+
+    /// Close the open compute pass, if any. Required before recording anything
+    /// else into the encoder (buffer copies) or finishing it.
+    fn end_pass(ctx: &mut OpCtx) {
+        ctx.pass = None;
+        ctx.last_pipeline = usize::MAX;
     }
 
     fn begin_if_needed(&self, ctx: &mut OpCtx) {
@@ -505,6 +552,8 @@ impl Device {
     fn flush_locked(&self, ctx: &mut OpCtx) -> Result<()> {
         let had_work = ctx.open;
         let t0 = (self.profile && had_work).then(std::time::Instant::now);
+        // The pass borrows the encoder; it has to go before `finish`.
+        Self::end_pass(ctx);
         if ctx.open {
             let enc = ctx.encoder.take().unwrap();
             self.queue.submit(Some(enc.finish()));
@@ -601,6 +650,8 @@ impl Device {
         let mut readback_ns = 0u128;
         {
             let mut ctx = self.ctx.lock().unwrap();
+            // A copy cannot be recorded inside a compute pass.
+            Self::end_pass(&mut ctx);
             self.begin_if_needed(&mut ctx);
             ctx.encoder.as_mut().unwrap().copy_buffer_to_buffer(buf, 0, &staging, 0, padded);
             if let Some(t0) = t0 {
