@@ -79,9 +79,18 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
 type MapResult = std::result::Result<(), wgpu::BufferAsyncError>;
 
 const MAX_BINDINGS: usize = 4;
-/// Entries kept in the bind-group cache before it is dropped wholesale. The
-/// working set is a few thousand tuples per decode step; 8192 thrashed.
-const BIND_GROUP_CACHE_CAP: usize = 1 << 17;
+/// Entries kept in the bind-group cache before it is dropped wholesale.
+///
+/// The per-step working set is small, but the set of reachable tuples is not
+/// bounded -- a decode loop with a growing KV cache accumulates about one new
+/// tuple per step indefinitely -- so the cap exists to stop a long session
+/// retaining all of them, not to protect the hit rate. It only has to sit far
+/// enough above the working set that clears stay rare: measured over 1000
+/// decode steps, dropping the cap to 1/64th of this (a clear every few hundred
+/// steps) moved reuse 94.0% -> 93.8%. 2^14 keeps that margin without holding
+/// 131k live bind groups, each pinning up to `MAX_BINDINGS` buffers -- on the
+/// wasm target, that many JS-side objects of retained GPU state.
+const BIND_GROUP_CACHE_CAP: usize = 1 << 14;
 const PUSH_CONSTANT_SIZE: u32 = 128;
 const WORKGROUP_SIZE: u32 = 256;
 /// The two matmul kernels, kept as named constants because the dispatch
@@ -89,13 +98,46 @@ const WORKGROUP_SIZE: u32 = 256;
 const GEMM_SRC: &str = include_str!("../../webgpu-kernels/gemm_tiled.wgsl");
 const GEMV_SRC: &str = include_str!("../../webgpu-kernels/gemv.wgsl");
 
-/// Finds `pat` in `src` and parses the decimal number written right after it.
+/// How many times `pat` occurs in `src`. Const context only.
+const fn count(src: &str, pat: &str) -> u32 {
+    let (s, p) = (src.as_bytes(), pat.as_bytes());
+    let (mut i, mut n) = (0, 0);
+    while i + p.len() <= s.len() {
+        let mut j = 0;
+        while j < p.len() && s[i + j] == p[j] {
+            j += 1;
+        }
+        if j == p.len() {
+            n += 1;
+        }
+        i += 1;
+    }
+    n
+}
+
+/// Whether `pat` occurs in `src`. Const context only.
+const fn contains(src: &str, pat: &str) -> bool {
+    count(src, pat) > 0
+}
+
+/// Parses the decimal number written right after the sole occurrence of `pat`.
 ///
 /// Used in const context only, to pin the constants below to the WGSL that
-/// actually defines them. A missing pattern or a non-numeric tail is a
-/// compile-time panic rather than a fallback: silently guessing a tile size is
-/// the exact failure this is here to prevent.
+/// actually defines them. Absence, a non-numeric tail, and a *second*
+/// occurrence are all compile-time panics rather than fallbacks. The last of
+/// those matters as much as the first: taking the first match would let a
+/// commented-out or stale earlier declaration -- `// const TILE: u32 = 16u`
+/// above the real one -- quietly decide the dispatch geometry, which is the
+/// silent failure this whole mechanism exists to prevent.
 const fn u32_after(src: &str, pat: &str) -> u32 {
+    assert!(
+        count(src, pat) != 0,
+        "WGSL: pattern not found -- the shader no longer declares what Rust reads from it"
+    );
+    assert!(
+        count(src, pat) == 1,
+        "WGSL: pattern occurs more than once -- which one sets the constant is ambiguous"
+    );
     let (s, p) = (src.as_bytes(), pat.as_bytes());
     let mut i = 0;
     while i + p.len() <= s.len() {
@@ -116,24 +158,7 @@ const fn u32_after(src: &str, pat: &str) -> u32 {
         }
         i += 1;
     }
-    panic!("WGSL: pattern not found -- the shader no longer declares what Rust reads from it");
-}
-
-/// Whether `pat` occurs in `src`. Const context only, same purpose.
-const fn contains(src: &str, pat: &str) -> bool {
-    let (s, p) = (src.as_bytes(), pat.as_bytes());
-    let mut i = 0;
-    while i + p.len() <= s.len() {
-        let mut j = 0;
-        while j < p.len() && s[i + j] == p[j] {
-            j += 1;
-        }
-        if j == p.len() {
-            return true;
-        }
-        i += 1;
-    }
-    false
+    unreachable!()
 }
 
 /// GEMM output-tile edge: the grid is `ceil(n/TILE) x ceil(m/TILE) x batch`.
@@ -158,9 +183,11 @@ const _: () = {
     let kstep = u32_after(GEMM_SRC, "const KSTEP: u32 = ");
     let tpb = u32_after(GEMM_SRC, "const TPB: u32 = ");
     let rt = u32_after(GEMM_SRC, "const RT: u32 = ");
+    assert!(tpb == 64, "gemm_tiled.wgsl: TPB must be the thread count of the 8x8 @workgroup_size");
+    // Matched literally, so a reformat trips this rather than going unnoticed.
     assert!(
-        tpb == 64 && contains(GEMM_SRC, "@workgroup_size(8, 8, 1)"),
-        "gemm_tiled.wgsl: TPB must be the 8x8 @workgroup_size"
+        contains(GEMM_SRC, "@workgroup_size(8, 8, 1)"),
+        "gemm_tiled.wgsl: @workgroup_size must be spelled exactly `@workgroup_size(8, 8, 1)`"
     );
     assert!(rt == 4, "gemm_tiled.wgsl: the c00..c33 accumulators are unrolled for RT == 4");
     assert!(
@@ -186,13 +213,18 @@ const _: () = {
     // gemv.wgsl: TPB threads each accumulating TN columns, reduced through one
     // shared array in log2(TPB) halving steps.
     let gtpb = u32_after(GEMV_SRC, "const TPB: u32 = ");
-    assert!(
-        gtpb == 64 && contains(GEMV_SRC, "@workgroup_size(64)"),
-        "gemv.wgsl: TPB must be the @workgroup_size"
-    );
+    // Checked before the `== 64` below, which would otherwise make it dead: this
+    // is the constraint that survives a change of workgroup size, that one is
+    // only today's value.
     assert!(
         gtpb.is_power_of_two(),
         "gemv.wgsl: the reduction halves the active thread count each step"
+    );
+    assert!(gtpb == 64, "gemv.wgsl: TPB must be the thread count of the @workgroup_size");
+    // Matched literally, so a reformat trips this rather than going unnoticed.
+    assert!(
+        contains(GEMV_SRC, "@workgroup_size(64)"),
+        "gemv.wgsl: @workgroup_size must be spelled exactly `@workgroup_size(64)`"
     );
     assert!(
         GEMV_TN == 4,
@@ -321,10 +353,10 @@ struct ProfStats {
 struct OpCtx {
     /// The compute pass dispatches record into, held open across consecutive
     /// dispatches. Must be dropped (via `end_pass`) before the encoder is
-    /// touched again or finished -- including on an implicit drop of the whole
-    /// struct, which is why this is declared before `encoder`: fields drop in
-    /// declaration order, and `forget_lifetime` has erased the borrow that
-    /// would otherwise make the compiler enforce it.
+    /// touched again or finished; `forget_lifetime` has erased the borrow that
+    /// would otherwise make the compiler enforce that. The `Drop` impl below
+    /// holds the invariant on the implicit path, so this does not depend on
+    /// staying declared ahead of `encoder`.
     pass: Option<wgpu::ComputePass<'static>>,
     encoder: Option<wgpu::CommandEncoder>,
     /// `CachedPipeline::idx` of the pipeline currently bound in `pass`.
@@ -334,6 +366,24 @@ struct OpCtx {
     /// Buffers (dropped tensors + scratch) to recycle into the pool on the next
     /// flush, once the batch referencing them has finished executing.
     free_bufs: Vec<Buf>,
+}
+
+impl Drop for OpCtx {
+    /// End the pass while the encoder is still alive.
+    ///
+    /// Every explicit path already calls `end_pass`, but a device dropped with
+    /// a batch still pending (tensors built and discarded with no readback)
+    /// reaches neither. Field declaration order alone would cover it, and
+    /// nothing but a comment would hold that order in place -- reordering the
+    /// two fields, or matching them to the struct literal in `Device::new`,
+    /// compiles and passes every test. `Drop::drop` runs before any field is
+    /// dropped, so this makes the ordering irrelevant.
+    ///
+    /// Sound here because no field is ever moved out of `OpCtx`: `flush_locked`
+    /// uses `Option::take` and `Vec::drain`, which a `Drop` impl permits.
+    fn drop(&mut self) {
+        self.pass = None;
+    }
 }
 
 pub struct DeviceInner {
@@ -479,8 +529,8 @@ impl Device {
             bind_groups: Mutex::new(HashMap::new()),
             pool: Mutex::new(BufferPool::default()),
             ctx: Mutex::new(OpCtx {
-                encoder: None,
                 pass: None,
+                encoder: None,
                 last_pipeline: usize::MAX,
                 open: false,
                 free_bufs: Vec::new(),
