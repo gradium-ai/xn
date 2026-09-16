@@ -205,11 +205,14 @@ struct ProfStats {
 /// Command-recording state, guarded by a mutex. Dispatches/copies are recorded
 /// into `encoder` and only submitted on flush.
 struct OpCtx {
-    encoder: Option<wgpu::CommandEncoder>,
     /// The compute pass dispatches record into, held open across consecutive
     /// dispatches. Must be dropped (via `end_pass`) before the encoder is
-    /// touched again or finished.
+    /// touched again or finished -- including on an implicit drop of the whole
+    /// struct, which is why this is declared before `encoder`: fields drop in
+    /// declaration order, and `forget_lifetime` has erased the borrow that
+    /// would otherwise make the compiler enforce it.
     pass: Option<wgpu::ComputePass<'static>>,
+    encoder: Option<wgpu::CommandEncoder>,
     /// `CachedPipeline::idx` of the pipeline currently bound in `pass`.
     last_pipeline: usize,
     /// Whether `encoder` holds recorded, unsubmitted commands.
