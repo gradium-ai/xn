@@ -63,9 +63,9 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
         "index_select" => (include_str!("../../webgpu-kernels/index_select.wgsl"), 3),
         "causality_mask" => (include_str!("../../webgpu-kernels/causality_mask.wgsl"), 1),
         "scatter_set" => (include_str!("../../webgpu-kernels/scatter_set.wgsl"), 3),
-        "gemm_tiled" => (include_str!("../../webgpu-kernels/gemm_tiled.wgsl"), 3),
+        "gemm_tiled" => (GEMM_SRC, 3),
         // rhs is bound twice: scalar + a vec4 view for the aligned fast path.
-        "gemv" => (include_str!("../../webgpu-kernels/gemv.wgsl"), 4),
+        "gemv" => (GEMV_SRC, 4),
         "conv1d" => (include_str!("../../webgpu-kernels/conv1d.wgsl"), 3),
         "conv_transpose1d" => (include_str!("../../webgpu-kernels/conv_transpose1d.wgsl"), 3),
         "im2col1d" => (include_str!("../../webgpu-kernels/im2col1d.wgsl"), 2),
@@ -81,11 +81,125 @@ type MapResult = std::result::Result<(), wgpu::BufferAsyncError>;
 const MAX_BINDINGS: usize = 4;
 const PUSH_CONSTANT_SIZE: u32 = 128;
 const WORKGROUP_SIZE: u32 = 256;
-/// GEMM output-tile edge; must match `TILE` in gemm_tiled.wgsl (the kernel's
-/// `@workgroup_size` is 8x8, with each thread producing a 4x4 patch of it).
-const TILE: u32 = 32;
-/// Output columns one GEMV workgroup produces; must match `TN` in gemv.wgsl.
-const GEMV_TN: u32 = 4;
+/// The two matmul kernels, kept as named constants because the dispatch
+/// geometry below is parsed back out of them.
+const GEMM_SRC: &str = include_str!("../../webgpu-kernels/gemm_tiled.wgsl");
+const GEMV_SRC: &str = include_str!("../../webgpu-kernels/gemv.wgsl");
+
+/// Finds `pat` in `src` and parses the decimal number written right after it.
+///
+/// Used in const context only, to pin the constants below to the WGSL that
+/// actually defines them. A missing pattern or a non-numeric tail is a
+/// compile-time panic rather than a fallback: silently guessing a tile size is
+/// the exact failure this is here to prevent.
+const fn u32_after(src: &str, pat: &str) -> u32 {
+    let (s, p) = (src.as_bytes(), pat.as_bytes());
+    let mut i = 0;
+    while i + p.len() <= s.len() {
+        let mut j = 0;
+        while j < p.len() && s[i + j] == p[j] {
+            j += 1;
+        }
+        if j == p.len() {
+            let mut k = i + p.len();
+            let (mut v, mut digits) = (0u32, 0u32);
+            while k < s.len() && s[k].is_ascii_digit() {
+                v = v * 10 + (s[k] - b'0') as u32;
+                k += 1;
+                digits += 1;
+            }
+            assert!(digits > 0, "WGSL: pattern is not followed by a number");
+            return v;
+        }
+        i += 1;
+    }
+    panic!("WGSL: pattern not found -- the shader no longer declares what Rust reads from it");
+}
+
+/// Whether `pat` occurs in `src`. Const context only, same purpose.
+const fn contains(src: &str, pat: &str) -> bool {
+    let (s, p) = (src.as_bytes(), pat.as_bytes());
+    let mut i = 0;
+    while i + p.len() <= s.len() {
+        let mut j = 0;
+        while j < p.len() && s[i + j] == p[j] {
+            j += 1;
+        }
+        if j == p.len() {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// GEMM output-tile edge: the grid is `ceil(n/TILE) x ceil(m/TILE) x batch`.
+/// Read out of the shader rather than restated, because the two drifting apart
+/// has no loud failure mode -- a `TILE` larger here than there under-dispatches
+/// and leaves the tail of `dst` holding whatever the buffer pool last wrote
+/// into it, with no error from wgpu or anywhere else.
+const TILE: u32 = u32_after(GEMM_SRC, "const TILE: u32 = ");
+/// Output columns one GEMV workgroup produces: grid is `ceil(n/GEMV_TN)`. Same
+/// reasoning as `TILE`.
+const GEMV_TN: u32 = u32_after(GEMV_SRC, "const TN: u32 = ");
+
+/// The sizes each kernel hardcodes, checked against the constants they were
+/// derived from. Both kernels fully unroll their inner tile into named scalars
+/// (`c00..c33`, `acc0..acc3`) and stage through fixed-size workgroup arrays, so
+/// a change to one constant has to be carried by hand into several literals.
+/// This turns "carried it everywhere" into a compile error rather than wrong
+/// numbers at runtime.
+const _: () = {
+    // gemm_tiled.wgsl: a TILE x TILE output tile over a 64-thread (8x8)
+    // workgroup, each thread owning an RT x RT patch of it.
+    let kstep = u32_after(GEMM_SRC, "const KSTEP: u32 = ");
+    let tpb = u32_after(GEMM_SRC, "const TPB: u32 = ");
+    let rt = u32_after(GEMM_SRC, "const RT: u32 = ");
+    assert!(
+        tpb == 64 && contains(GEMM_SRC, "@workgroup_size(8, 8, 1)"),
+        "gemm_tiled.wgsl: TPB must be the 8x8 @workgroup_size"
+    );
+    assert!(rt == 4, "gemm_tiled.wgsl: the c00..c33 accumulators are unrolled for RT == 4");
+    assert!(
+        TILE == 8 * rt,
+        "gemm_tiled.wgsl: TILE must be 8 threads x the RT-wide patch each one owns"
+    );
+    // Both operand tiles are staged `stage / TPB` elements per thread, and both
+    // staging loops are written `for (var s = 0u; s < 4u; ...)`.
+    let stage = TILE * kstep;
+    assert!(
+        stage == u32_after(GEMM_SRC, "var<workgroup> at: array<f32, "),
+        "gemm_tiled.wgsl: `at` must hold TILE*KSTEP elements"
+    );
+    assert!(
+        stage == u32_after(GEMM_SRC, "var<workgroup> bt: array<f32, "),
+        "gemm_tiled.wgsl: `bt` must hold KSTEP*TILE elements"
+    );
+    assert!(
+        stage == 4 * tpb,
+        "gemm_tiled.wgsl: the staging loops are hardcoded to 4 elements per thread"
+    );
+
+    // gemv.wgsl: TPB threads each accumulating TN columns, reduced through one
+    // shared array in log2(TPB) halving steps.
+    let gtpb = u32_after(GEMV_SRC, "const TPB: u32 = ");
+    assert!(
+        gtpb == 64 && contains(GEMV_SRC, "@workgroup_size(64)"),
+        "gemv.wgsl: TPB must be the @workgroup_size"
+    );
+    assert!(
+        gtpb.is_power_of_two(),
+        "gemv.wgsl: the reduction halves the active thread count each step"
+    );
+    assert!(
+        GEMV_TN == 4,
+        "gemv.wgsl: the acc0..acc3 accumulators and the vec4 rhs view are unrolled for TN == 4"
+    );
+    assert!(
+        gtpb * GEMV_TN == u32_after(GEMV_SRC, "var<workgroup> sh: array<f32, "),
+        "gemv.wgsl: `sh` must hold one slot per (thread, column)"
+    );
+};
 /// Busy-poll budget for `Device::wait_for_queue` (see there), overridable with
 /// `XN_WEBGPU_SPIN_US`; `0` blocks immediately.
 const DEFAULT_SPIN_BUDGET_US: u64 = 2_000;
