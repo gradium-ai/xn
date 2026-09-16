@@ -207,14 +207,68 @@ fn matmul_shapes() -> Result<()> {
     cmp_matmul(3, 4, 5, 2)?;
     cmp_matmul(8, 8, 8, 3)?;
     cmp_matmul(33, 17, 19, 1)?; // non-tile-aligned gemm
-    // The register-tiled gemm and the multi-column gemv both have an interior
-    // fast path plus a tail path; these pin both down.
+    // Interior and tail tiles of the register-tiled gemm and the multi-column
+    // gemv. `cmp_matmul` leaves rhs as [k, n], so rhs_rs = n and both kernels
+    // take their strided branch; `matmul_t_shapes` covers rhs_rs == 1, which is
+    // the layout the model actually uses.
     cmp_matmul(32, 64, 32, 1)?; // exactly one 32x32 tile, k a multiple of KSTEP
     cmp_matmul(64, 8, 64, 2)?; // several whole tiles, batched
     cmp_matmul(31, 9, 33, 1)?; // one short of a tile in every dimension
-    cmp_matmul(1, 576, 1152, 1)?; // decode-shaped gemv, n a multiple of GEMV_TN
+    cmp_matmul(1, 576, 1152, 1)?; // gemv, n a multiple of GEMV_TN
     cmp_matmul(1, 576, 1151, 1)?; // ...and with a gemv column tail
-    cmp_matmul(128, 576, 1152, 1)?; // prefill-shaped gemm
+    cmp_matmul(128, 576, 1152, 1)?; // gemm, prefill-shaped
+    Ok(())
+}
+
+/// As `cmp_matmul`, but with rhs stored [n, k] and multiplied with `matmul_t`,
+/// giving rhs_rs = 1 and rhs_cs = k.
+fn cmp_matmul_t(m: usize, k: usize, n: usize, batch: usize) -> Result<()> {
+    let a = iota(batch * m * k);
+    let b = iota(batch * n * k);
+    let (as_, bs): (Vec<usize>, Vec<usize>) =
+        if batch == 1 { (vec![m, k], vec![n, k]) } else { (vec![batch, m, k], vec![batch, n, k]) };
+    let av: Tensor<f32, Wg> = Tensor::from_vec(a.clone(), as_.clone(), &dev())?;
+    let bv: Tensor<f32, Wg> = Tensor::from_vec(b.clone(), bs.clone(), &dev())?;
+    let ac: Tensor<f32, _> = Tensor::from_vec(a, as_, &CPU)?;
+    let bc: Tensor<f32, _> = Tensor::from_vec(b, bs, &CPU)?;
+    assert_close(&ac.matmul_t(&bc)?.to_vec()?, &av.matmul_t(&bv)?.to_vec()?, 1e-4);
+    Ok(())
+}
+
+/// The rhs_rs == 1 half of both kernels: the GEMV `vec4` path and the GEMM
+/// contiguous staging branch. This is the layout of every linear layer in the
+/// model, and the one `matmul_shapes` cannot reach.
+#[test]
+fn matmul_t_shapes() -> Result<()> {
+    cmp_matmul_t(1, 576, 1152, 1)?; // decode gemv, vectorized, n a multiple of GEMV_TN
+    cmp_matmul_t(1, 576, 1151, 1)?; // ...and with a gemv column tail
+    cmp_matmul_t(1, 577, 64, 1)?; // rhs_cs not 4-aligned: gemv scalar fallback
+    cmp_matmul_t(128, 576, 1152, 1)?; // prefill gemm, contiguous rhs staging
+    cmp_matmul_t(32, 64, 32, 1)?; // exactly one 32x32 tile
+    cmp_matmul_t(31, 9, 33, 1)?; // one short of a tile in every dimension
+    cmp_matmul_t(3, 4, 5, 2)?; // batched
+    Ok(())
+}
+
+/// The scalar mop-up at the end of the vectorized GEMV loop.
+///
+/// A contiguous [n, k] rhs has rhs_cs == k, so that remainder is unreachable
+/// through `cmp_matmul_t`: the same k that is not a multiple of 4 also fails
+/// the `rhs_cs & 3` alignment check and drops the kernel to the fully scalar
+/// path instead. Narrowing k away from the row stride is what separates the
+/// two, leaving rhs_cs 4-aligned while k is not.
+#[test]
+fn matmul_t_gemv_vec4_remainder() -> Result<()> {
+    let (n, k_full, k) = (256usize, 576usize, 573usize);
+    let a = iota(k_full);
+    let b = iota(n * k_full);
+    let av: Tensor<f32, Wg> = Tensor::from_vec(a.clone(), vec![1, k_full], &dev())?;
+    let bv: Tensor<f32, Wg> = Tensor::from_vec(b.clone(), vec![n, k_full], &dev())?;
+    let ac: Tensor<f32, _> = Tensor::from_vec(a, vec![1, k_full], &CPU)?;
+    let bc: Tensor<f32, _> = Tensor::from_vec(b, vec![n, k_full], &CPU)?;
+    let (avn, bvn) = (av.narrow(1, 0..k)?, bv.narrow(1, 0..k)?);
+    let (acn, bcn) = (ac.narrow(1, 0..k)?, bc.narrow(1, 0..k)?);
+    assert_close(&acn.matmul_t(&bcn)?.to_vec()?, &avn.matmul_t(&bvn)?.to_vec()?, 1e-4);
     Ok(())
 }
 
