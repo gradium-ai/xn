@@ -276,7 +276,7 @@ struct GEMVTKernel {
       device T* out_vec,
       const constant int& in_vec_size,
       const constant int& out_vec_size,
-      const constant int& marix_ld,
+      const constant int& matrix_ld,
       threadgroup float* tgp_memory,
       uint3 tid [[threadgroup_position_in_grid]],
       uint3 lid [[thread_position_in_threadgroup]],
@@ -331,7 +331,7 @@ struct GEMVTKernel {
         MLX_MTL_PRAGMA_UNROLL
         for (int tm = 0; tm < TM; tm++) {
           for (int tn = 0; tn < TN; tn++) {
-            inter[tn] = mat[(bm + tm) * marix_ld + out_col + tn];
+            inter[tn] = mat[(bm + tm) * matrix_ld + out_col + tn];
           }
           for (int tn = 0; tn < TN; tn++) {
             result[tn] += float(v_coeff[tm]) * float(inter[tn]);
@@ -347,7 +347,7 @@ struct GEMVTKernel {
 
           MLX_MTL_PRAGMA_UNROLL
           for (int tn = 0; tn < TN; tn++) {
-            inter[tn] = mat[(bm + tm) * marix_ld + out_col + tn];
+            inter[tn] = mat[(bm + tm) * matrix_ld + out_col + tn];
           }
 
           MLX_MTL_PRAGMA_UNROLL
