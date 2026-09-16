@@ -21,7 +21,7 @@ impl crate::Backend for Device {
     unsafe fn alloc_uninit<T: WithDType>(len: usize, dev: &Self) -> Result<Self::Storage<T>> {
         let bytes = len * T::BYTE_SIZE;
         let buffer = dev.alloc_buffer(bytes);
-        Ok(Storage { buffer, len, class: size_class(bytes), device: dev.clone(), _t: PhantomData })
+        Ok(Storage { buffer, len, device: dev.clone(), _t: PhantomData })
     }
 
     fn from_vec<T: WithDType>(v: Vec<T>, dev: &Self) -> Result<Self::Storage<T>> {
@@ -623,7 +623,7 @@ impl crate::Backend for Device {
                 &push,
                 div_ceil(numel, WORKGROUP_SIZE),
             );
-            dst.device.defer_free(PooledBuf { buffer: scratch, class: size_class(info.len() * 4) });
+            dst.device.defer_free(scratch);
             res
         } else {
             let n = dims.len();
@@ -712,7 +712,7 @@ impl crate::Backend for Device {
                 &push,
                 div_ceil(numel, WORKGROUP_SIZE),
             );
-            dst.device.defer_free(PooledBuf { buffer: scratch, class: size_class(info.len() * 4) });
+            dst.device.defer_free(scratch);
             res
         } else {
             let n = dst_shape.len();
