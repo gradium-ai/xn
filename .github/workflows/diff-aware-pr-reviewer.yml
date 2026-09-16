@@ -2,7 +2,8 @@ name: Claude - Diff-Aware PR Reviewer
 
 # ABOUT THIS WORKFLOW
 # - Purpose: Generate a thorough, diff-aware review for a specific PR and write a markdown report under reports/.
-# - Trigger: Manual only (workflow_dispatch). Nothing here runs automatically.
+# - Trigger: Automatically when a PR is opened or reopened, plus manual
+#   workflow_dispatch to re-review any PR on demand.
 # - Outputs: reports/pr-<PR>-review.md and optional PR comment linking to it.
 # - Copy/Paste Ready: You can drop this file into other repos and adjust:
 #   - inputs, prompt, claude_args, and permissions for your stack.
@@ -24,9 +25,12 @@ name: Claude - Diff-Aware PR Reviewer
 #
 # SAFETY
 # - This workflow does not change code. It only writes a report file and can optionally post a comment.
-# - All actions require manual invocation via the GitHub UI or API.
+# - Automatic runs are limited to PRs from branches in this repo; fork PRs
+#   are skipped (no secrets there) and need a manual dispatch.
 
 on:
+  pull_request:
+    types: [opened, reopened]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -44,9 +48,23 @@ permissions:
   id-token: write
   actions: read
 
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
 jobs:
   review:
     runs-on: ubuntu-latest
+    # A pull_request run from a fork gets a read-only token and no access to
+    # ANTHROPIC_API_KEY, so it could only fail. Review branches in this repo
+    # automatically; a fork PR can still be reviewed via workflow_dispatch.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    env:
+      # workflow_dispatch supplies inputs; pull_request supplies the event payload.
+      PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+      POST_COMMENT: ${{ inputs.post_comment || 'true' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -65,16 +83,16 @@ jobs:
           allowed_bots: "github-actions"
           prompt: |
             REPO: ${{ github.repository }}
-            PR NUMBER: ${{ inputs.pr_number }}
-            POST COMMENT: ${{ inputs.post_comment }}
+            PR NUMBER: ${{ env.PR_NUMBER }}
+            POST COMMENT: ${{ env.POST_COMMENT }}
 
             You are a careful PR reviewer.
 
             Goal:
-            - Review pull request #${{ inputs.pr_number }}.
+            - Review pull request #${{ env.PR_NUMBER }}.
             - First, post a short execution plan inline in the report (checks to run, files to touch).
             - Analyze the diff and run lightweight checks (no builds): lint-like reasoning, potential bugs, risky changes.
-            - Produce a concise markdown report at reports/pr-${{ inputs.pr_number }}-review.md with:
+            - Produce a concise markdown report at reports/pr-${{ env.PR_NUMBER }}-review.md with:
               - Summary
               - Strengths
               - Risks / Potential bugs
@@ -83,8 +101,8 @@ jobs:
 
             Rules:
             - Do NOT modify repository files beyond writing the single report file in reports/.
-            - If ${{ inputs.post_comment }} is "true", post the *full* report markdown as a PR comment using `--body-file` so the review is visible inline (not a pointer to an artifact):
-              `gh pr comment ${{ inputs.pr_number }} --body-file reports/pr-${{ inputs.pr_number }}-review.md`
+            - If ${{ env.POST_COMMENT }} is "true", post the *full* report markdown as a PR comment using `--body-file` so the review is visible inline (not a pointer to an artifact):
+              `gh pr comment ${{ env.PR_NUMBER }} --body-file reports/pr-${{ env.PR_NUMBER }}-review.md`
               The artifact upload still happens automatically as a backup.
             - Keep suggestions minimal and safe; do not assume project-specific build steps.
           claude_args: |
