@@ -1,0 +1,98 @@
+name: Claude - Diff-Aware PR Reviewer
+
+# ABOUT THIS WORKFLOW
+# - Purpose: Generate a thorough, diff-aware review for a specific PR and write a markdown report under reports/.
+# - Trigger: Manual only (workflow_dispatch). Nothing here runs automatically.
+# - Outputs: reports/pr-<PR>-review.md and optional PR comment linking to it.
+# - Copy/Paste Ready: You can drop this file into other repos and adjust:
+#   - inputs, prompt, claude_args, and permissions for your stack.
+#
+# REQUIRED SECRETS
+# - ANTHROPIC_API_KEY: Anthropic API key for Claude.  (Alternatively
+#   CLAUDE_CODE_OAUTH_TOKEN can be passed via `claude_code_oauth_token`.)
+#
+# PERMISSIONS EXPLAINED
+# - contents: read, pull-requests: write, issues: read enable reading repo/PR metadata and posting PR comments when enabled.
+# - id-token: write is required by the action runtime.
+# - actions: read lets Claude read CI results on PRs if you include that in additional_permissions.
+#
+# CUSTOMIZATION TIPS
+# - Adjust --allowedTools to restrict/enable commands. Keep the scope tight. Remove gh comment tool if you don't want comments.
+# - Update the prompt sections (checks, formatting, tone) to match your review style.
+# - If you want sticky comments, change logic to maintain a single comment (see docs).
+# - If you prefer different output paths, change reports/ to your desired directory.
+#
+# SAFETY
+# - This workflow does not change code. It only writes a report file and can optionally post a comment.
+# - All actions require manual invocation via the GitHub UI or API.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to review
+        required: true
+      post_comment:
+        description: Also post a PR comment (true/false)
+        required: false
+        default: "true"
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: read
+  id-token: write
+  actions: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Diff-aware PR Review with Plan
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Allow a bot actor through, so that another workflow can
+          # dispatch this one via `gh workflow run` (the actor is then
+          # github-actions[bot]). Harmless for manual dispatch.
+          allowed_bots: "github-actions"
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ inputs.pr_number }}
+            POST COMMENT: ${{ inputs.post_comment }}
+
+            You are a careful PR reviewer.
+
+            Goal:
+            - Review pull request #${{ inputs.pr_number }}.
+            - First, post a short execution plan inline in the report (checks to run, files to touch).
+            - Analyze the diff and run lightweight checks (no builds): lint-like reasoning, potential bugs, risky changes.
+            - Produce a concise markdown report at reports/pr-${{ inputs.pr_number }}-review.md with:
+              - Summary
+              - Strengths
+              - Risks / Potential bugs
+              - Suggested minimal patch as a unified diff inside a fenced code block
+              - Next actions for the author
+
+            Rules:
+            - Do NOT modify repository files beyond writing the single report file in reports/.
+            - If ${{ inputs.post_comment }} is "true", post the *full* report markdown as a PR comment using `--body-file` so the review is visible inline (not a pointer to an artifact):
+              `gh pr comment ${{ inputs.pr_number }} --body-file reports/pr-${{ inputs.pr_number }}-review.md`
+              The artifact upload still happens automatically as a backup.
+            - Keep suggestions minimal and safe; do not assume project-specific build steps.
+          claude_args: |
+            --allowedTools "Write,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(mkdir -p reports)"
+
+      - name: Upload reports artifact
+        if: ${{ hashFiles('reports/**') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-reports
+          path: reports/**
