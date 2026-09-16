@@ -25,13 +25,16 @@ use std::sync::{Condvar, Mutex, OnceLock};
 /// The budget has to bridge the gap between two consecutive parallel operators -- a few
 /// microseconds for a decode step -- because catching the next job while still spinning is what
 /// keeps a dispatch sub-microsecond. Overshooting is not free: anything else runnable on the
-/// machine competes with the spinners, and on this codebase that is still the f32 matmul, which
-/// lives in the `gemm` crate and drives rayon itself.
+/// machine competes with the spinners.
 ///
 /// While the f32 matmul still drove rayon this had to stay near 1000 to avoid the two pools
-/// fighting. With everything on one pool the tradeoff is gone and a longer bridge is uniformly
+/// fighting. Now that every per-token operator dispatches here -- both q8 matmuls, the f32
+/// matmul by column stripe, the elementwise ops and rope -- a longer bridge is uniformly
 /// better: measured across 3-8 threads and both vocoder windows, 5000 is at or above every
 /// other value tried, and roughly 20% better than 1000 at 8 threads.
+///
+/// The rayon call sites that remain -- row and block copies, fills, the reductions, conv -- are
+/// off the decode path. Any one of them that turns out not to be re-opens that tradeoff.
 const DEFAULT_SPIN_BUDGET: u32 = 5_000;
 
 fn spin_budget() -> u32 {
@@ -63,7 +66,6 @@ struct Shared {
     done: AtomicUsize,
     /// Set if any worker panicked; the publisher re-raises so a panic is not silently swallowed.
     panicked: AtomicBool,
-    quit: AtomicBool,
     /// Park slot for workers whose spin budget ran out.
     lock: Mutex<()>,
     wake: Condvar,
@@ -98,6 +100,9 @@ thread_local! {
 
 static POOL: OnceLock<Pool> = OnceLock::new();
 
+/// The workers live as long as the process, like rayon's global pool: there is no shutdown or
+/// resize, and `Shared` is leaked deliberately so a worker's `&'static` reference stays valid
+/// without reference counting on the dispatch path.
 fn pool() -> &'static Pool {
     POOL.get_or_init(|| {
         let size = crate::get_num_threads().max(1);
@@ -106,7 +111,6 @@ fn pool() -> &'static Pool {
             job: std::cell::UnsafeCell::new(None),
             done: AtomicUsize::new(0),
             panicked: AtomicBool::new(false),
-            quit: AtomicBool::new(false),
             lock: Mutex::new(()),
             wake: Condvar::new(),
         }));
@@ -122,30 +126,28 @@ fn pool() -> &'static Pool {
 
 /// `nth` is fixed for the lifetime of the pool, so a worker never has to read it.
 fn worker(shared: &'static Shared, ith: usize, nth: usize) {
+    // Read once: this is the innermost loop in the module, and the budget cannot change after
+    // the pool is up.
+    let budget = spin_budget();
     let mut last = 0u64;
     loop {
         // Spin first: between two operators of the same layer the next job usually lands within
         // a few microseconds, and catching it here is what keeps dispatch cheap.
         let mut seq = shared.seq.load(Ordering::Acquire);
         let mut spins = 0u32;
-        while seq == last && !shared.quit.load(Ordering::Relaxed) {
-            if spins < spin_budget() {
+        while seq == last {
+            if spins < budget {
                 spins += 1;
                 std::hint::spin_loop();
             } else {
                 // The stream has gone quiet; give the core back.
                 let guard = shared.lock.lock().unwrap_or_else(|e| e.into_inner());
-                if shared.seq.load(Ordering::Acquire) == last
-                    && !shared.quit.load(Ordering::Relaxed)
-                {
+                if shared.seq.load(Ordering::Acquire) == last {
                     let _unused = shared.wake.wait(guard).unwrap_or_else(|e| e.into_inner());
                 }
                 spins = 0;
             }
             seq = shared.seq.load(Ordering::Acquire);
-        }
-        if shared.quit.load(Ordering::Relaxed) {
-            return;
         }
         last = seq;
 
@@ -264,9 +266,10 @@ pub fn dispatch<F: Fn(usize, usize) + Sync>(f: F) {
     let own = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(0, nth)));
 
     let want = nth - 1;
+    let budget = spin_budget();
     let mut spins = 0u32;
     while shared.done.load(Ordering::Acquire) < want {
-        if spins < spin_budget() {
+        if spins < budget {
             spins += 1;
             std::hint::spin_loop();
         } else {
