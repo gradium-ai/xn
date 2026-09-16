@@ -207,6 +207,12 @@ fn matmul_shapes() -> Result<()> {
     cmp_matmul(3, 4, 5, 2)?;
     cmp_matmul(8, 8, 8, 3)?;
     cmp_matmul(33, 17, 19, 1)?; // non-tile-aligned gemm
+    // The register-tiled gemm has an interior fast path plus a tail path;
+    // these pin both down.
+    cmp_matmul(32, 64, 32, 1)?; // exactly one 32x32 tile, k a multiple of KSTEP
+    cmp_matmul(64, 8, 64, 2)?; // several whole tiles, batched
+    cmp_matmul(31, 9, 33, 1)?; // one short of a tile in every dimension
+    cmp_matmul(128, 576, 1152, 1)?; // prefill-shaped gemm
     Ok(())
 }
 
