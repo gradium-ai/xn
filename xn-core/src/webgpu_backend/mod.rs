@@ -84,8 +84,9 @@ const MAX_BINDINGS: usize = 4;
 const BIND_GROUP_CACHE_CAP: usize = 1 << 17;
 const PUSH_CONSTANT_SIZE: u32 = 128;
 const WORKGROUP_SIZE: u32 = 256;
-/// GEMM tile size; must match `TILE` / the `@workgroup_size` in gemm_tiled.wgsl.
-const TILE: u32 = 16;
+/// GEMM output-tile edge; must match `TILE` in gemm_tiled.wgsl (the kernel's
+/// `@workgroup_size` is 8x8, with each thread producing a 4x4 patch of it).
+const TILE: u32 = 32;
 /// Busy-poll budget for `Device::wait_for_queue` (see there), overridable with
 /// `XN_WEBGPU_SPIN_US`; `0` blocks immediately.
 const DEFAULT_SPIN_BUDGET_US: u64 = 2_000;
