@@ -223,7 +223,7 @@ impl<T: WithDTypeF, B: Backend> RotatingCache<T, B> {
         Tensor::from_vec(mask, (size1, size2), device)
     }
 
-    /// Returns the positions corresponding to all the elements that will be retured
+    /// Returns the positions corresponding to all the elements that will be returned
     /// *after* adding `seq_len` to the cache.
     pub fn positions(&self, seq_len: usize) -> Vec<usize> {
         if seq_len <= self.max_seq_len {
@@ -317,7 +317,7 @@ impl<T: WithDTypeF, B: Backend> RotatingKvCache<T, B> {
         self.k.attn_mask(seq_len, device)
     }
 
-    /// Returns the positions corresponding to all the elements that will be retured
+    /// Returns the positions corresponding to all the elements that will be returned
     /// *after* adding `seq_len` to the cache.
     pub fn positions(&self, seq_len: usize) -> Vec<usize> {
         self.k.positions(seq_len)

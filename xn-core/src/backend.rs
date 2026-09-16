@@ -14,7 +14,7 @@ pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
     }
 
     /// # Safety
-    /// This function allocates an unitialized block of memory. It is the responsibility of the
+    /// This function allocates an uninitialized block of memory. It is the responsibility of the
     /// caller to set the memory before using or returning the block.
     unsafe fn alloc_uninit<T: crate::WithDType>(len: usize, dev: &Self)
     -> Result<Self::Storage<T>>;
