@@ -64,6 +64,8 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
         "causality_mask" => (include_str!("../../webgpu-kernels/causality_mask.wgsl"), 1),
         "scatter_set" => (include_str!("../../webgpu-kernels/scatter_set.wgsl"), 3),
         "gemm_tiled" => (GEMM_SRC, 3),
+        // rhs is bound twice, as gemv does: scalar plus a vec4 view.
+        "gemm_skinny" => (GEMM_SKINNY_SRC, 4),
         // rhs is bound twice: scalar + a vec4 view for the aligned fast path.
         "gemv" => (GEMV_SRC, 4),
         "conv1d" => (include_str!("../../webgpu-kernels/conv1d.wgsl"), 3),
@@ -93,9 +95,10 @@ const MAX_BINDINGS: usize = 4;
 const BIND_GROUP_CACHE_CAP: usize = 1 << 14;
 const PUSH_CONSTANT_SIZE: u32 = 128;
 const WORKGROUP_SIZE: u32 = 256;
-/// The two matmul kernels, kept as named constants because the dispatch
-/// geometry below is parsed back out of them.
+/// The matmul kernels, kept as named constants because the dispatch geometry
+/// below is parsed back out of them.
 const GEMM_SRC: &str = include_str!("../../webgpu-kernels/gemm_tiled.wgsl");
+const GEMM_SKINNY_SRC: &str = include_str!("../../webgpu-kernels/gemm_skinny.wgsl");
 const GEMV_SRC: &str = include_str!("../../webgpu-kernels/gemv.wgsl");
 
 /// How many times `pat` occurs in `src`. Const context only.
@@ -170,10 +173,15 @@ const TILE: u32 = u32_after(GEMM_SRC, "const TILE: u32 = ");
 /// Output columns one GEMV workgroup produces: grid is `ceil(n/GEMV_TN)`. Same
 /// reasoning as `TILE`.
 const GEMV_TN: u32 = u32_after(GEMV_SRC, "const TN: u32 = ");
+/// Output rows and columns one skinny-GEMM workgroup produces: the grid is
+/// `ceil(n/SKINNY_NT) x ceil(m/SKINNY_MT) x batch`. Same reasoning as `TILE`.
+const SKINNY_MT: u32 = u32_after(GEMM_SKINNY_SRC, "const MT: u32 = ");
+const SKINNY_NT: u32 = u32_after(GEMM_SKINNY_SRC, "const NT: u32 = ");
 
 /// The sizes each kernel hardcodes, checked against the constants they were
-/// derived from. Both kernels fully unroll their inner tile into named scalars
-/// (`c00..c33`, `acc0..acc3`) and stage through fixed-size workgroup arrays, so
+/// derived from. The kernels fully unroll their inner tile into named scalars
+/// (`c00..c33`, `acc0..acc3`, `c0_0..c7_1`) and stage through fixed-size
+/// workgroup arrays, so
 /// a change to one constant has to be carried by hand into several literals.
 /// This turns "carried it everywhere" into a compile error rather than wrong
 /// numbers at runtime.
@@ -233,6 +241,31 @@ const _: () = {
     assert!(
         gtpb * GEMV_TN == u32_after(GEMV_SRC, "var<workgroup> sh: array<f32, "),
         "gemv.wgsl: `sh` must hold one slot per (thread, column)"
+    );
+
+    // gemm_skinny.wgsl: TPB threads each walking a disjoint slice of k for an
+    // MT x NT patch of the output, reduced through one shared array in
+    // log2(TPB) halving steps.
+    let stpb = u32_after(GEMM_SKINNY_SRC, "const TPB: u32 = ");
+    // Checked before the `== 64` below, for the same reason as in gemv.
+    assert!(
+        stpb.is_power_of_two(),
+        "gemm_skinny.wgsl: the reduction halves the active thread count each step"
+    );
+    assert!(stpb == 64, "gemm_skinny.wgsl: TPB must be the thread count of the @workgroup_size");
+    // Matched literally, so a reformat trips this rather than going unnoticed.
+    assert!(
+        contains(GEMM_SKINNY_SRC, "@workgroup_size(64)"),
+        "gemm_skinny.wgsl: @workgroup_size must be spelled exactly `@workgroup_size(64)`"
+    );
+    assert!(
+        SKINNY_MT == 8 && SKINNY_NT == 2,
+        "gemm_skinny.wgsl: the c0_0..c7_1 accumulators are unrolled for MT == 8, NT == 2"
+    );
+    assert!(
+        stpb * SKINNY_MT * SKINNY_NT
+            == u32_after(GEMM_SKINNY_SRC, "var<workgroup> sh: array<f32, "),
+        "gemm_skinny.wgsl: `sh` must hold one slot per (thread, patch element)"
     );
 };
 /// Busy-poll budget for `Device::wait_for_queue` (see there), overridable with
