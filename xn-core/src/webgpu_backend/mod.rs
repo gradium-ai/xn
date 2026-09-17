@@ -177,6 +177,14 @@ const GEMV_TN: u32 = u32_after(GEMV_SRC, "const TN: u32 = ");
 /// `ceil(n/SKINNY_NT) x ceil(m/SKINNY_MT) x batch`. Same reasoning as `TILE`.
 const SKINNY_MT: u32 = u32_after(GEMM_SKINNY_SRC, "const MT: u32 = ");
 const SKINNY_NT: u32 = u32_after(GEMM_SKINNY_SRC, "const NT: u32 = ");
+/// Largest m the skinny kernel is considered for. Above this the tiled kernel
+/// has rows to fill its tile with.
+const SKINNY_MAX_M: usize = 16;
+/// Tiled-grid workgroup count at or below which the output does not supply
+/// enough parallelism, so k has to. Measured on an M5: at 16 workgroups the
+/// skinny kernel is 1.9-6.2x faster, at 48 it is 6% slower, so the gate sits
+/// between them.
+const SKINNY_MAX_GROUPS: u32 = 32;
 
 /// The sizes each kernel hardcodes, checked against the constants they were
 /// derived from. The kernels fully unroll their inner tile into named scalars

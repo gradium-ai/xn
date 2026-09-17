@@ -432,6 +432,16 @@ impl crate::Backend for Device {
                 &push,
                 (div_ceil(n, GEMV_TN), lhs_b as u32, 1),
             )
+        } else if m <= SKINNY_MAX_M
+            && div_ceil(n, TILE) * div_ceil(m, TILE) * lhs_b as u32 <= SKINNY_MAX_GROUPS
+        {
+            // Few enough rows that the tiled kernel would discard half of every
+            // tile, and too few tiles to fill the GPU. Take the parallelism from
+            // k instead: grid (ceil(n/SKINNY_NT), ceil(m/SKINNY_MT), batch).
+            // See gemm_skinny.wgsl.
+            let buffers = [&dst.buffer, &lhs.0.buffer, &rhs.0.buffer, &rhs.0.buffer];
+            let groups = (div_ceil(n, SKINNY_NT), div_ceil(m, SKINNY_MT), lhs_b as u32);
+            dst.device.dispatch_nd(&format!("gemm_skinny_{dt}"), &buffers, &push, groups)
         } else {
             // Tiled kernel: grid (ceil(n/TILE), ceil(m/TILE), batch).
             let buffers = [&dst.buffer, &lhs.0.buffer, &rhs.0.buffer];
