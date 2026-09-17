@@ -34,6 +34,8 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
+pub mod quantization;
+
 fn wgpuerr<E: std::fmt::Debug>(context: &str) -> impl Fn(E) -> crate::Error + '_ {
     move |e| crate::Error::msg(format!("webgpu: {context}: {e:?}"))
 }
@@ -992,6 +994,22 @@ impl Device {
         }
         let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
         self.queue.write_buffer(buf, 0, src);
+    }
+
+    /// Upload raw bytes to a buffer. `write_buffer_data` is keyed off
+    /// `WithDType`, which the packed q8_0 streams are not -- they are `u32`
+    /// quants and `f32` scales with no tensor dtype between them.
+    fn write_buffer_bytes(&self, buf: &wgpu::Buffer, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if bytes.len().is_multiple_of(4) {
+            self.queue.write_buffer(buf, 0, bytes);
+        } else {
+            let mut padded = bytes.to_vec();
+            padded.resize(round4(bytes.len()), 0);
+            self.queue.write_buffer(buf, 0, &padded);
+        }
     }
 
     /// Upload host data into a GPU buffer. The write is applied at the next
