@@ -118,35 +118,41 @@ const fn contains(src: &str, pat: &str) -> bool {
 /// above the real one -- quietly decide the dispatch geometry, which is the
 /// silent failure this whole mechanism exists to prevent.
 const fn u32_after(src: &str, pat: &str) -> u32 {
-    assert!(
-        count(src, pat) != 0,
-        "WGSL: pattern not found -- the shader no longer declares what Rust reads from it"
-    );
-    assert!(
-        count(src, pat) == 1,
-        "WGSL: pattern occurs more than once -- which one sets the constant is ambiguous"
-    );
+    // One pass, counting matches and remembering the first: this runs at
+    // compile time for every constant below, and rescanning each shader once
+    // per assertion is enough const-eval work to trip `long_running_const_eval`.
     let (s, p) = (src.as_bytes(), pat.as_bytes());
-    let mut i = 0;
+    let (mut i, mut n, mut at) = (0, 0, 0);
     while i + p.len() <= s.len() {
         let mut j = 0;
         while j < p.len() && s[i + j] == p[j] {
             j += 1;
         }
         if j == p.len() {
-            let mut k = i + p.len();
-            let (mut v, mut digits) = (0u32, 0u32);
-            while k < s.len() && s[k].is_ascii_digit() {
-                v = v * 10 + (s[k] - b'0') as u32;
-                k += 1;
-                digits += 1;
+            if n == 0 {
+                at = i;
             }
-            assert!(digits > 0, "WGSL: pattern is not followed by a number");
-            return v;
+            n += 1;
         }
         i += 1;
     }
-    unreachable!()
+    assert!(
+        n != 0,
+        "WGSL: pattern not found -- the shader no longer declares what Rust reads from it"
+    );
+    assert!(
+        n == 1,
+        "WGSL: pattern occurs more than once -- which one sets the constant is ambiguous"
+    );
+    let mut k = at + p.len();
+    let (mut v, mut digits) = (0u32, 0u32);
+    while k < s.len() && s[k].is_ascii_digit() {
+        v = v * 10 + (s[k] - b'0') as u32;
+        k += 1;
+        digits += 1;
+    }
+    assert!(digits > 0, "WGSL: pattern is not followed by a number");
+    v
 }
 
 /// GEMM output-tile edge: the grid is `ceil(n/TILE) x ceil(m/TILE) x batch`.
