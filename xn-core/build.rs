@@ -70,7 +70,26 @@ fn build_vulkan_shaders() {
         } else {
             &[]
         };
-        for (suffix, target, define) in variants.iter().chain(i64_variant) {
+        // The q8_0 weight kernels read f32 activations and packed int8
+        // weights whatever the model's compute dtype, so they get one build.
+        let f32_only: &[_] = &variants[..1];
+        // The subgroup variant needs SPIR-V 1.3 for GroupNonUniform ops.
+        let f32_subgroup: &[_] = &[("F32", "vulkan1.1", None)];
+        // Row-block kernels are built once per block height MR.
+        let row_blocks: &[_] = &[
+            ("R1", "vulkan1.1", Some("MR=1")),
+            ("R2", "vulkan1.1", Some("MR=2")),
+            ("R4", "vulkan1.1", Some("MR=4")),
+            ("R8", "vulkan1.1", Some("MR=8")),
+            ("R16", "vulkan1.1", Some("MR=16")),
+        ];
+        let shader_variants: Vec<_> = match stem {
+            "gemv_q8" | "gemm_q8" | "dequant_q8" => f32_only.to_vec(),
+            "gemv_q8_sg" => f32_subgroup.to_vec(),
+            "gemm_q8_sg" => row_blocks.to_vec(),
+            _ => variants.iter().chain(i64_variant).copied().collect(),
+        };
+        for (suffix, target, define) in shader_variants {
             let spv_path = Path::new(&out_dir).join(format!("{stem}_{suffix}.spv"));
             let mut cmd = std::process::Command::new("glslc");
             cmd.arg(format!("--target-env={target}")).arg("-O");
