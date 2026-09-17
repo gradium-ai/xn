@@ -214,6 +214,10 @@ struct Batch {
     prof_names: Vec<String>,
     /// Profiling: timestamps written, including the batch's opening one.
     n_queries: u32,
+    /// Buffers bound by the ops recorded since the last barrier. An op whose
+    /// buffers are all new here cannot depend on those ops, so it needs no
+    /// barrier; any overlap gets the conservative global one.
+    touched: Vec<vk::Buffer>,
 }
 
 /// The recording state: a ring of batches. `cur` is the batch being recorded
@@ -566,6 +570,7 @@ impl Device {
                 free_bufs: Vec::new(),
                 prof_names: Vec::new(),
                 n_queries: 0,
+                touched: Vec::new(),
             });
         }
 
@@ -761,7 +766,7 @@ impl Device {
         let (pipeline, layout, bindings) = self.get_pipeline(kernel)?;
         assert_eq!(bindings as usize, buffers.len(), "kernel {kernel} binding count mismatch");
         let mut ctx = self.ctx.lock().unwrap();
-        self.begin_if_needed(&mut ctx)?;
+        self.begin_if_needed(&mut ctx, buffers)?;
         let dev = &self.device;
         let cur = ctx.cur;
         let batch = &mut ctx.batches[cur];
@@ -823,7 +828,7 @@ impl Device {
             return Ok(());
         }
         let mut ctx = self.ctx.lock().unwrap();
-        self.begin_if_needed(&mut ctx)?;
+        self.begin_if_needed(&mut ctx, &[dst, src])?;
         let cur = ctx.cur;
         let batch = &mut ctx.batches[cur];
         unsafe {
@@ -846,11 +851,14 @@ impl Device {
     /// Makes `ctx.cur` ready to record into, opening its command buffer if
     /// nothing is recorded yet (waiting for the batch previously submitted
     /// from that slot, if it is still in flight), and inserts the global
-    /// memory barrier every op runs behind so that it observes the writes of
-    /// everything before it, in this batch or an earlier one on the queue.
-    fn begin_if_needed(&self, ctx: &mut OpCtx) -> Result<()> {
+    /// memory barrier an op needs to observe the writes of everything before
+    /// it -- unless nothing recorded since the last barrier touches the
+    /// buffers this op binds, in which case it depends on none of it.
+    fn begin_if_needed(&self, ctx: &mut OpCtx, buffers: &[vk::Buffer]) -> Result<()> {
         let dev = &self.device;
+        let mut fresh = false;
         if !ctx.open {
+            fresh = true;
             let cur = ctx.cur;
             if ctx.batches[cur].in_flight {
                 self.wait_and_retire(&mut ctx.batches[cur])?;
@@ -884,6 +892,18 @@ impl Device {
             }
             ctx.open = true;
         }
+        // A fresh batch runs behind everything submitted before it; within a
+        // batch, an op only needs the barrier if it shares a buffer with an
+        // op recorded since the last one.
+        let cur = ctx.cur;
+        let touched = &mut ctx.batches[cur].touched;
+        let overlaps = touched.iter().any(|t| buffers.contains(t));
+        if !fresh && !overlaps {
+            touched.extend_from_slice(buffers);
+            return Ok(());
+        }
+        touched.clear();
+        touched.extend_from_slice(buffers);
         let stages = vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
         let barrier = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
@@ -1021,6 +1041,7 @@ impl Device {
             batch.n_queries = 0;
         }
         batch.n_sets = 0;
+        batch.touched.clear();
         batch.in_flight = false;
         Ok(())
     }
