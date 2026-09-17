@@ -235,6 +235,9 @@ pub struct DeviceInner {
     pipelines: Mutex<HashMap<String, CachedPipeline>>,
     supports_f16: bool,
     supports_bf16: bool,
+    /// Subgroup size usable for `subgroupAdd` in compute shaders, 0 when
+    /// subgroup arithmetic is unavailable (or disabled via env).
+    subgroup_size: u32,
     pool: Mutex<BufferPool>,
     /// Set when `XN_VULKAN_PROFILE=1` and the queue supports timestamps.
     profile_enabled: bool,
@@ -346,6 +349,21 @@ impl Device {
         let storage16_ok = storage16.storage_buffer16_bit_access != 0;
         let supports_f16 = f16_int8.shader_float16 != 0 && storage16_ok && has_ext(f16_ext_name);
         let supports_bf16 = shader_int16 && storage16_ok;
+
+        // Subgroup arithmetic, for the reductions in the q8_0 GEMV. The
+        // kernel packs `256 / subgroup_size` columns into a workgroup, so the
+        // size has to divide the workgroup. `XN_VULKAN_SUBGROUP=0` forces the
+        // shared-memory fallback, for comparison or for a driver that lies.
+        let mut sg_props = vk::PhysicalDeviceSubgroupProperties::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sg_props);
+        unsafe { instance.get_physical_device_properties2(pdevice, &mut props2) };
+        let subgroup_forced_off = matches!(std::env::var("XN_VULKAN_SUBGROUP").as_deref(), Ok("0"));
+        let subgroup_ok = sg_props.supported_stages.contains(vk::ShaderStageFlags::COMPUTE)
+            && sg_props.supported_operations.contains(vk::SubgroupFeatureFlags::ARITHMETIC)
+            && sg_props.subgroup_size > 0
+            && WORKGROUP_SIZE.is_multiple_of(sg_props.subgroup_size)
+            && !subgroup_forced_off;
+        let subgroup_size = if subgroup_ok { sg_props.subgroup_size } else { 0 };
 
         let priorities = [1.0f32];
         let queue_info = vk::DeviceQueueCreateInfo::default()
@@ -463,6 +481,7 @@ impl Device {
             pipelines: Mutex::new(HashMap::new()),
             supports_f16,
             supports_bf16,
+            subgroup_size,
             pool: Mutex::new(BufferPool::default()),
             profile_enabled,
             query_pool,
@@ -496,6 +515,12 @@ impl Device {
     /// buffers with f32 compute; needs shaderInt16 + 16-bit SSBO storage).
     pub fn supports_bf16(&self) -> bool {
         self.supports_bf16
+    }
+
+    /// The device's compute subgroup size when subgroup arithmetic can be used,
+    /// else 0.
+    pub fn subgroup_size(&self) -> u32 {
+        self.subgroup_size
     }
 
     /// Find a memory type index within `type_bits` that has all of `flags`.
