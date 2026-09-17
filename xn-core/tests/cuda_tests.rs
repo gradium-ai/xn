@@ -2030,3 +2030,146 @@ fn test_fp8_matmul_t_per_token() -> Result<()> {
 
     Ok(())
 }
+
+// =============================================================================
+// q8_0 weights on the GPU
+// =============================================================================
+//
+// The oracle is the *dequantized* weight multiplied on the CPU backend, not
+// the original f32 weight: quantizing to 8 bits is lossy, and comparing
+// against what the kernel actually holds isolates the kernel from the
+// quantizer.
+
+fn q8_assert_close(want: &[f32], got: &[f32], tol: f32) {
+    assert_eq!(want.len(), got.len(), "length mismatch");
+    for (i, (x, y)) in want.iter().zip(got.iter()).enumerate() {
+        let d = (x - y).abs();
+        let scale = x.abs().max(y.abs());
+        assert!(d <= tol + tol * scale, "mismatch at {i}: cpu={x} cuda={y} (|d|={d})");
+    }
+}
+
+fn q8_roundtrip(w: &[f32]) -> Vec<f32> {
+    use xn::quantized::GgmlType;
+    use xn::quantized::k_quants::BlockQ8_0;
+    let mut blocks = vec![BlockQ8_0::zeros(); w.len() / 32];
+    BlockQ8_0::from_float(w, &mut blocks).unwrap();
+    let mut out = vec![0f32; w.len()];
+    BlockQ8_0::to_float(&blocks, &mut out).unwrap();
+    out
+}
+
+fn cmp_q8_matmul(m: usize, k: usize, n: usize) -> Result<()> {
+    use xn::cuda_backend::q8::Q8Tensor;
+    use xn::{CPU, Shape};
+    let d = get_device();
+    let w: Vec<f32> = (0..n * k)
+        .map(|i| ((i % 71) as f32 - 35.0) * 0.013 * (1.0 + (i / k) as f32 * 0.1))
+        .collect();
+    let x: Vec<f32> = (0..m * k).map(|i| ((i % 53) as f32 - 26.0) * 0.021).collect();
+
+    let wq = Q8Tensor::from_f32(&d, &w, &Shape::from((n, k)))?;
+    let xt: Tensor<f32, Device> = Tensor::from_vec(x.clone(), (m, k), &d)?;
+    let got = wq.matmul_t(&xt)?.to_vec()?;
+
+    let wd = q8_roundtrip(&w);
+    let wt: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(wd, (n, k), &CPU)?;
+    let xc: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(x, (m, k), &CPU)?;
+    let want = xc.matmul_t(&wt)?.to_vec()?;
+    q8_assert_close(&want, &got, 1e-4);
+    Ok(())
+}
+
+#[test]
+fn test_q8_matmul_decode() -> Result<()> {
+    // m == 1 takes the single-row kernel.
+    for (k, n) in [(32, 4), (64, 1), (256, 7), (1024, 256), (1536, 512)] {
+        cmp_q8_matmul(1, k, n)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn test_q8_matmul_rows() -> Result<()> {
+    // 2..=16 takes the row-block kernels, including every MR variant and
+    // partial row blocks.
+    for (m, k, n) in [(2, 64, 8), (3, 256, 5), (4, 512, 64), (6, 1024, 130), (16, 128, 33)] {
+        cmp_q8_matmul(m, k, n)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn test_q8_matmul_large_m() -> Result<()> {
+    // 17..=128 walks m in blocks of up to 32 (r16 / r32 with a 2D grid);
+    // past 128 the weight is dequantized and goes through cuBLAS.
+    for (m, k, n) in [(17, 64, 4), (30, 288, 96), (64, 512, 128), (125, 1024, 96), (200, 96, 65)] {
+        cmp_q8_matmul(m, k, n)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn test_q8_matmul_batched_shape() -> Result<()> {
+    use xn::cuda_backend::q8::Q8Tensor;
+    use xn::{CPU, Shape};
+    let (b, t, k, n) = (2usize, 3usize, 128usize, 16usize);
+    let d = get_device();
+    let w: Vec<f32> = (0..n * k).map(|i| ((i % 29) as f32 - 14.0) * 0.02).collect();
+    let x: Vec<f32> = (0..b * t * k).map(|i| ((i % 37) as f32 - 18.0) * 0.011).collect();
+    let wq = Q8Tensor::from_f32(&d, &w, &Shape::from((n, k)))?;
+    let xt: Tensor<f32, Device> = Tensor::from_vec(x.clone(), (b, t, k), &d)?;
+    let out = wq.matmul_t(&xt)?;
+    assert_eq!(out.dims(), &[b, t, n]);
+
+    let wd = q8_roundtrip(&w);
+    let wt: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(wd, (n, k), &CPU)?;
+    let xc: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(x, (b, t, k), &CPU)?;
+    q8_assert_close(&xc.matmul_t(&wt)?.to_vec()?, &out.to_vec()?, 1e-4);
+    Ok(())
+}
+
+#[test]
+fn test_q8_gguf_blocks_match_in_process_quantization() -> Result<()> {
+    use xn::Shape;
+    use xn::cuda_backend::q8::Q8Tensor;
+    use xn::quantized::{GgmlDType, QTensor};
+    let (k, n, m) = (256usize, 24usize, 3usize);
+    let d = get_device();
+    let w: Vec<f32> = (0..n * k).map(|i| ((i % 67) as f32 - 33.0) * 0.019).collect();
+    let x: Vec<f32> = (0..m * k).map(|i| ((i % 41) as f32 - 20.0) * 0.027).collect();
+    let qt = QTensor::quantize_f32(&w, &Shape::from((n, k)), GgmlDType::Q8_0)?;
+    let from_blocks = Q8Tensor::from_qtensor(&d, &qt)?;
+    let from_f32 = Q8Tensor::from_f32(&d, &w, &Shape::from((n, k)))?;
+    let xt: Tensor<f32, Device> = Tensor::from_vec(x, (m, k), &d)?;
+    assert_eq!(from_blocks.matmul_t(&xt)?.to_vec()?, from_f32.matmul_t(&xt)?.to_vec()?);
+    Ok(())
+}
+
+#[test]
+fn test_q8_linear_matches_dequantized() -> Result<()> {
+    use xn::cuda_backend::q8::Q8F32;
+    use xn::nn::Linear;
+    use xn::{BackendQ, CPU};
+    let d = get_device();
+    let (k, n, m) = (256usize, 64usize, 2usize);
+    let w: Vec<f32> = (0..n * k).map(|i| ((i % 61) as f32 - 30.0) * 0.017).collect();
+    let bias: Vec<f32> = (0..n).map(|i| i as f32 * 0.01).collect();
+
+    let wt: Tensor<f32, Device> = Tensor::from_vec(w.clone(), (n, k), &d)?;
+    let bt: Tensor<f32, Device> = Tensor::from_vec(bias.clone(), (n,), &d)?;
+    let lin = Linear::new(wt).with_bias(bt);
+    let q = Q8F32::from_linear(lin)?;
+
+    let x: Vec<f32> = (0..m * k).map(|i| ((i % 43) as f32 - 21.0) * 0.03).collect();
+    let xt: Tensor<f32, Device> = Tensor::from_vec(x.clone(), (m, k), &d)?;
+    let got = q.forward(&xt)?.to_vec()?;
+
+    let wd = q8_roundtrip(&w);
+    let wc: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(wd, (n, k), &CPU)?;
+    let bc: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(bias, (n,), &CPU)?;
+    let xc: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(x, (m, k), &CPU)?;
+    let want = xc.matmul_t(&wc)?.broadcast_add(&bc)?.to_vec()?;
+    q8_assert_close(&want, &got, 1e-4);
+    Ok(())
+}
