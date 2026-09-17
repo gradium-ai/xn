@@ -1,6 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 mod cublaslt;
 mod kernels;
+pub mod q8;
 pub mod quantization;
 
 use crate::{BinaryOp, DType, Result, UnaryOp, WithDType, WithDTypeF};
@@ -24,6 +25,7 @@ pub enum PTXModule {
     Fp8,
     Indexing,
     Layout,
+    Q8,
     Reduce,
     Rope,
 }
@@ -38,6 +40,7 @@ struct ModuleCache {
     fp8: Option<Arc<cudarc::driver::CudaModule>>,
     indexing: Option<Arc<cudarc::driver::CudaModule>>,
     layout: Option<Arc<cudarc::driver::CudaModule>>,
+    q8: Option<Arc<cudarc::driver::CudaModule>>,
     reduce: Option<Arc<cudarc::driver::CudaModule>>,
     rope: Option<Arc<cudarc::driver::CudaModule>>,
 }
@@ -388,6 +391,14 @@ impl Device {
                 }
                 let m = self.cuda.load_module(kernels::ROPE.into())?;
                 modules.rope = Some(m.clone());
+                Ok(m)
+            }
+            PTXModule::Q8 => {
+                if let Some(ref m) = modules.q8 {
+                    return Ok(m.clone());
+                }
+                let m = self.cuda.load_module(kernels::Q8.into())?;
+                modules.q8 = Some(m.clone());
                 Ok(m)
             }
         }
