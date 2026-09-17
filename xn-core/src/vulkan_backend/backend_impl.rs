@@ -54,15 +54,22 @@ impl crate::Backend for Device {
     }
 
     unsafe fn alloc_uninit<T: WithDType>(len: usize, dev: &Self) -> Result<Self::Storage<T>> {
-        let (buffer, memory, ptr, class) = dev.alloc_buffer(len * T::BYTE_SIZE)?;
-        Ok(Storage { buffer, memory, ptr, len, class, device: dev.clone(), _t: PhantomData })
+        let kind = dev.tensor_kind;
+        let (buffer, memory, ptr, class) = dev.alloc_buffer(len * T::BYTE_SIZE, kind)?;
+        Ok(Storage { buffer, memory, ptr, len, kind, class, device: dev.clone(), _t: PhantomData })
     }
 
     fn from_vec<T: WithDType>(v: Vec<T>, dev: &Self) -> Result<Self::Storage<T>> {
         let len = v.len();
-        let storage = unsafe { Self::alloc_uninit::<T>(len, dev)? };
-        unsafe {
-            std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, storage.ptr, len * T::BYTE_SIZE);
+        let mut storage = unsafe { Self::alloc_uninit::<T>(len, dev)? };
+        if !storage.ptr.is_null() {
+            // A fresh mapped buffer: nothing recorded can reference it, so the
+            // host write needs no flush.
+            unsafe {
+                std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, storage.ptr, len * T::BYTE_SIZE);
+            }
+        } else {
+            storage.host_write(&v)?;
         }
         Ok(storage)
     }
@@ -78,9 +85,9 @@ impl crate::Backend for Device {
                 div_ceil(len, WORKGROUP_SIZE),
             );
         }
-        dst.device.flush("fill-host")?;
-        dst.as_mut_slice()[..len].fill(elem);
-        Ok(())
+        let mut d = dst.host_read(dst.len)?;
+        d[..len].fill(elem);
+        dst.host_write(&d)
     }
 
     fn rand_uniform(dst: &mut Self::Storage<f32>, len: usize, lo: f32, up: f32) -> Result<()> {
@@ -148,12 +155,15 @@ impl crate::Backend for Device {
                 div_ceil(len, WORKGROUP_SIZE),
             );
         }
-        // Host fallback for the remaining pairs.
-        dev.flush("to_dtype-host")?;
+        // Host fallback for the remaining pairs: read both back, convert,
+        // write dst. `T`/`U` are the runtime dtypes, so the vectors are
+        // reinterpreted at the concrete types the arms name.
+        let sv = src.host_read(len)?;
+        let mut dv = dst.host_read(len)?;
         macro_rules! cast {
             ($s:ty, $d:ty, |$v:ident| $e:expr) => {{
-                let s = unsafe { std::slice::from_raw_parts(src.ptr as *const $s, len) };
-                let d = unsafe { std::slice::from_raw_parts_mut(dst.ptr as *mut $d, len) };
+                let s = unsafe { std::slice::from_raw_parts(sv.as_ptr() as *const $s, len) };
+                let d = unsafe { std::slice::from_raw_parts_mut(dv.as_mut_ptr() as *mut $d, len) };
                 for (o, i) in d.iter_mut().zip(s.iter()) {
                     let $v = *i;
                     *o = $e;
@@ -188,12 +198,11 @@ impl crate::Backend for Device {
             (I64, U8) => cast!(i64, u8, |v| v as u8),
             (U8, I64) => cast!(u8, i64, |v| v as i64),
         }
-        Ok(())
+        dst.host_write(&dv)
     }
 
     fn data<T: WithDType>(src: &Self::Storage<T>, len: usize) -> Result<std::borrow::Cow<'_, [T]>> {
-        src.device.flush("data-readback")?;
-        Ok(std::borrow::Cow::Owned(src.as_slice()[..len].to_vec()))
+        Ok(std::borrow::Cow::Owned(src.host_read(len)?))
     }
 
     fn inplace_unary<T: WithDTypeF>(dst: &mut Self::Storage<T>, len: usize, op: UnaryOp) -> Result<()> {
@@ -240,12 +249,12 @@ impl crate::Backend for Device {
                 div_ceil(len, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush("bin_assign-host")?;
-            let src = s.as_slice()[..len].to_vec();
-            for (d, sv) in dst.as_mut_slice()[..len].iter_mut().zip(src) {
+            let src = s.host_read(len)?;
+            let mut d = dst.host_read(dst.len)?;
+            for (d, sv) in d[..len].iter_mut().zip(src) {
                 *d = bin_apply(op, *d, sv);
             }
-            Ok(())
+            dst.host_write(&d)
         }
     }
 
@@ -265,14 +274,13 @@ impl crate::Backend for Device {
                 div_ceil(len, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush("binary-host")?;
-            let l = lhs.as_slice();
-            let r = rhs.as_slice();
-            let d = dst.as_mut_slice();
+            let l = lhs.host_read(len)?;
+            let r = rhs.host_read(len)?;
+            let mut d = dst.host_read(dst.len)?;
             for i in 0..len {
                 d[i] = bin_apply(op, l[i], r[i]);
             }
-            Ok(())
+            dst.host_write(&d)
         }
     }
 
@@ -295,12 +303,12 @@ impl crate::Backend for Device {
                 div_ceil(len, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush("scale_add-host")?;
-            let s = src.as_slice()[..len].to_vec();
-            for (d, sv) in dst.as_mut_slice()[..len].iter_mut().zip(s) {
+            let s = src.host_read(len)?;
+            let mut d = dst.host_read(dst.len)?;
+            for (d, sv) in d[..len].iter_mut().zip(s) {
                 *d = sv * scale + add;
             }
-            Ok(())
+            dst.host_write(&d)
         }
     }
 
@@ -330,9 +338,8 @@ impl crate::Backend for Device {
                 div_ceil(numel, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush("transpose-host")?;
-            let s = src.as_slice();
-            let d = dst.as_mut_slice();
+            let s = src.host_read(src.len)?;
+            let mut d = dst.host_read(dst.len)?;
             for dst_idx in 0..numel {
                 let mut rem = dst_idx;
                 let i = rem / (d2 * d_j * d1 * d_k);
@@ -351,7 +358,7 @@ impl crate::Backend for Device {
                     + k;
                 d[dst_idx] = s[src_idx];
             }
-            Ok(())
+            dst.host_write(&d)
         }
     }
 
@@ -378,15 +385,14 @@ impl crate::Backend for Device {
                 div_ceil(d1 * d2, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush("copy2d-host")?;
-            let s = src.as_slice();
-            let d = dst.as_mut_slice();
+            let s = src.host_read(src.len)?;
+            let mut d = dst.host_read(dst.len)?;
             for i1 in 0..d1 {
                 for i2 in 0..d2 {
                     d[dst_o + i1 * dst_s + i2] = s[src_o + i1 * src_s + i2];
                 }
             }
-            Ok(())
+            dst.host_write(&d)
         }
     }
 
@@ -547,10 +553,9 @@ impl crate::Backend for Device {
                 div_ceil(total, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush("index_select-host")?;
-            let ids_h = ids.as_slice();
-            let s = src.as_slice();
-            let d = dst.as_mut_slice();
+            let ids_h = ids.host_read(ids.len)?;
+            let s = src.host_read(src.len)?;
+            let mut d = dst.host_read(dst.len)?;
             for left in 0..left_size {
                 for id_i in 0..num_ids {
                     let idx = ids_h[id_i];
@@ -565,7 +570,7 @@ impl crate::Backend for Device {
                     }
                 }
             }
-            Ok(())
+            dst.host_write(&d)
         }
     }
 
@@ -712,10 +717,9 @@ impl crate::Backend for Device {
             dst.device.defer_free(scratch);
             res
         } else {
-            dst.device.flush("copy_strided-host")?;
             let n = dims.len();
-            let s = src.as_slice();
-            let d = dst.as_mut_slice();
+            let s = src.host_read(src.len)?;
+            let mut d = dst.host_read(dst.len)?;
             for idx in 0..numel {
                 let mut si = 0usize;
                 let mut rem = idx;
@@ -725,7 +729,7 @@ impl crate::Backend for Device {
                 }
                 d[idx] = s[src_offset + si];
             }
-            Ok(())
+            dst.host_write(&d)
         }
     }
 
@@ -753,10 +757,9 @@ impl crate::Backend for Device {
                 div_ceil(numel, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush("scatter_set-host")?;
-            let ids_h = ids.as_slice();
-            let s = src.as_slice();
-            let d = dst.as_mut_slice();
+            let ids_h = ids.host_read(ids.len)?;
+            let s = src.host_read(src.len)?;
+            let mut d = dst.host_read(dst.len)?;
             for i in 0..numel {
                 let right = i % right_size;
                 let left = i / (right_size * src_dim_size);
@@ -764,7 +767,7 @@ impl crate::Backend for Device {
                 let dst_off = left * dst_dim_size * right_size + idx * right_size + right;
                 d[dst_off] = s[i];
             }
-            Ok(())
+            dst.host_write(&d)
         }
     }
 
@@ -800,11 +803,10 @@ impl crate::Backend for Device {
             dst.device.defer_free(scratch);
             res
         } else {
-            dst.device.flush("broadcast-host")?;
             let n = dst_shape.len();
-            let l = lhs.as_slice();
-            let r = rhs.as_slice();
-            let d = dst.as_mut_slice();
+            let l = lhs.host_read(lhs.len)?;
+            let r = rhs.host_read(rhs.len)?;
+            let mut d = dst.host_read(dst.len)?;
             for idx in 0..numel {
                 let mut li = 0usize;
                 let mut ri = 0usize;
@@ -817,7 +819,7 @@ impl crate::Backend for Device {
                 }
                 d[idx] = bin_apply(op, l[li], r[ri]);
             }
-            Ok(())
+            dst.host_write(&d)
         }
     }
 

@@ -1,11 +1,23 @@
 //! Vulkan compute backend.
 //!
-//! This backend targets integrated GPUs (in particular AMD APUs) where the GPU
-//! shares system memory with the CPU. It allocates all tensor storage from a
-//! memory type that is simultaneously `DEVICE_LOCAL`, `HOST_VISIBLE` and
-//! `HOST_COHERENT` (the "BAR"/unified type exposed by APUs), and keeps every
-//! buffer persistently mapped. Uploads, readbacks and fills are therefore plain
+//! This backend was written for integrated GPUs (in particular AMD APUs)
+//! where the GPU shares system memory with the CPU, and there it allocates all
+//! tensor storage from a memory type that is simultaneously `DEVICE_LOCAL`,
+//! `HOST_VISIBLE` and `HOST_COHERENT` (the "BAR"/unified type exposed by
+//! APUs), kept persistently mapped, so uploads, readbacks and fills are plain
 //! `memcpy`s with no staging buffers.
+//!
+//! On a discrete GPU that memory type is the PCIe BAR window and, at least on
+//! NVIDIA, the GPU does not cache it in L2: a weight that would be served
+//! from L2 on the CUDA backend is streamed from DRAM on every use, and a GEMV
+//! over an L2-sized weight runs no faster than one over a 100 MB one. So on a
+//! discrete GPU ([`MemKind::Device`] as `tensor_kind`) tensors live in plain
+//! `DEVICE_LOCAL` memory and every host access -- uploads, readbacks and the
+//! host fallbacks for unsupported dtypes -- goes through a staging buffer in
+//! system memory and a recorded copy. Staging is system memory rather than
+//! the BAR even where tensors are BAR-resident, because CPU reads of the BAR
+//! are uncached PCIe round trips: a 7 KB readback through it costs ~100 us.
+//! `XN_VULKAN_DEVICE_LOCAL=0/1` overrides the tensor placement.
 //!
 //! Compute kernels are GLSL compute shaders compiled to SPIR-V at build time
 //! (see `build.rs` / `vulkan-kernels/`). They currently operate on `f32`, which
@@ -259,9 +271,34 @@ const BATCH_QUERIES: u32 = 2 * MAX_SETS_PER_BATCH + 8;
 struct PooledBuf {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
+    /// Mapped pointer, 0 for memory the host cannot see.
     ptr: usize,
     class: u64,
+    kind: MemKind,
+    /// Destroyed when its batch retires instead of returning to the pool: the
+    /// staging copy of a large upload, which would otherwise pin its size
+    /// class in the pool for the life of the device.
+    transient: bool,
 }
+
+/// Where a buffer's memory lives.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum MemKind {
+    /// Device memory the GPU caches; not visible to the host. Falls back to
+    /// `Unified` on a device without such a type (an APU).
+    Device,
+    /// Device-local and host-visible: an APU's shared memory, or a discrete
+    /// GPU's BAR window. Persistently mapped. The GPU's own memory, but CPU
+    /// *reads* of a discrete GPU's BAR are uncached PCIe round trips at
+    /// roughly 100 MB/s, so this kind is for tensors, never for readbacks.
+    Unified,
+    /// System memory, host-cached where available: for staging uploads and
+    /// readbacks and for the small host-written scratch buffers kernels read.
+    Staging,
+}
+
+/// Staging buffers past this size are transient (see [`PooledBuf::transient`]).
+const TRANSIENT_STAGING_BYTES: usize = 1 << 20;
 
 /// Recycling pool for buffer allocations, keyed by size class.
 /// `vkAllocateMemory` costs tens of microseconds and decoding allocates
@@ -270,7 +307,7 @@ struct PooledBuf {
 /// being destroyed.
 #[derive(Default)]
 struct BufferPool {
-    free: HashMap<u64, Vec<PooledBuf>>,
+    free: HashMap<(u64, MemKind), Vec<PooledBuf>>,
     hits: u64,
     misses: u64,
 }
@@ -325,6 +362,8 @@ pub struct DeviceInner {
     /// Subgroup size usable for `subgroupAdd` in compute shaders, 0 when
     /// subgroup arithmetic is unavailable (or disabled via env).
     subgroup_size: u32,
+    /// Memory tensors are allocated from (see the module docs).
+    tensor_kind: MemKind,
     /// `XN_VULKAN_GEMM`, a kernel name to force for every f32 GEMM it can
     /// serve (`tiled16`, `tiled32`, `tiled64`, `tiled`, `rowblock`, `generic`).
     /// For measuring; unset in normal use.
@@ -490,6 +529,22 @@ impl Device {
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
         let mem_props = unsafe { instance.get_physical_device_memory_properties(pdevice) };
 
+        // Plain device-local memory for tensors on a discrete GPU, where the
+        // host-visible kind is uncached (module docs); the unified kind on
+        // anything else. Only a type the host cannot see qualifies.
+        let has_private_device_memory = (0..mem_props.memory_type_count).any(|i| {
+            let f = mem_props.memory_types[i as usize].property_flags;
+            f.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                && !f.contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+        });
+        let discrete = props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU;
+        let tensor_kind = match std::env::var("XN_VULKAN_DEVICE_LOCAL").as_deref() {
+            Ok("0") => MemKind::Unified,
+            Ok("1") => MemKind::Device,
+            _ if discrete && has_private_device_memory => MemKind::Device,
+            _ => MemKind::Unified,
+        };
+
         // Optional GPU profiling via timestamp queries (XN_VULKAN_PROFILE=1).
         let profile_requested =
             std::env::var("XN_VULKAN_PROFILE").is_ok_and(|v| !v.is_empty() && v != "0");
@@ -589,6 +644,7 @@ impl Device {
             supports_f16,
             supports_bf16,
             subgroup_size,
+            tensor_kind,
             gemm_force: std::env::var("XN_VULKAN_GEMM").ok().filter(|v| !v.is_empty()),
             submit_at: std::env::var("XN_VULKAN_SUBMIT_AT")
                 .ok()
@@ -635,18 +691,33 @@ impl Device {
         })
     }
 
-    /// Allocate a buffer of at least `size_bytes`, reusing a pooled buffer of
-    /// the same size class when one is available. Returns the buffer, its
-    /// memory, the persistently-mapped pointer, and the size class (needed to
-    /// return the buffer to the pool on free).
+    /// The first memory type with all of `flags` and none of `excluded`.
+    fn find_memory_type_excluding(
+        &self,
+        type_bits: u32,
+        flags: vk::MemoryPropertyFlags,
+        excluded: vk::MemoryPropertyFlags,
+    ) -> Option<u32> {
+        (0..self.mem_props.memory_type_count).find(|&i| {
+            let f = self.mem_props.memory_types[i as usize].property_flags;
+            (type_bits & (1 << i)) != 0 && f.contains(flags) && !f.intersects(excluded)
+        })
+    }
+
+    /// Allocate a buffer of at least `size_bytes` in `kind` memory, reusing a
+    /// pooled buffer of the same size class and kind when one is available.
+    /// Returns the buffer, its memory, the persistently-mapped pointer (null
+    /// for [`MemKind::Device`] memory) and the size class (needed to return
+    /// the buffer to the pool on free).
     fn alloc_buffer(
         &self,
         size_bytes: usize,
+        kind: MemKind,
     ) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8, u64)> {
         let class = size_class(size_bytes);
         {
             let mut pool = self.pool.lock().unwrap();
-            if let Some(b) = pool.free.get_mut(&class).and_then(|v| v.pop()) {
+            if let Some(b) = pool.free.get_mut(&(class, kind)).and_then(|v| v.pop()) {
                 pool.hits += 1;
                 return Ok((b.buffer, b.memory, b.ptr as *mut u8, class));
             }
@@ -666,15 +737,43 @@ impl Device {
             unsafe { self.device.create_buffer(&info, None) }.map_err(vkerr("create_buffer"))?;
         let req = unsafe { self.device.get_buffer_memory_requirements(buffer) };
 
-        // Prefer the unified APU type (device-local + host-visible + coherent),
-        // fall back to any host-visible coherent type.
         let unified = vk::MemoryPropertyFlags::DEVICE_LOCAL
             | vk::MemoryPropertyFlags::HOST_VISIBLE
             | vk::MemoryPropertyFlags::HOST_COHERENT;
         let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let mem_type = self
-            .find_memory_type(req.memory_type_bits, unified)
-            .or_else(|| self.find_memory_type(req.memory_type_bits, host));
+        let cached = host | vk::MemoryPropertyFlags::HOST_CACHED;
+        let bits = req.memory_type_bits;
+        // `Device`: memory the host cannot see, falling through to the mapped
+        // kinds where there is none. `Unified`: the device-local host-visible
+        // type, then any host-visible coherent one. `Staging`: system memory
+        // the CPU can read at full speed -- cached, else at least not
+        // device-local -- falling back to whatever is mapped.
+        let private = (kind == MemKind::Device)
+            .then(|| {
+                self.find_memory_type_excluding(
+                    bits,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE,
+                )
+            })
+            .flatten();
+        let mapped = private.is_none();
+        let mem_type = match kind {
+            MemKind::Device | MemKind::Unified => private
+                .or_else(|| self.find_memory_type(bits, unified))
+                .or_else(|| self.find_memory_type(bits, host)),
+            MemKind::Staging => self
+                .find_memory_type_excluding(bits, cached, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                .or_else(|| {
+                    self.find_memory_type_excluding(
+                        bits,
+                        host,
+                        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    )
+                })
+                .or_else(|| self.find_memory_type(bits, unified))
+                .or_else(|| self.find_memory_type(bits, host)),
+        };
         let mem_type = match mem_type {
             Some(m) => m,
             None => {
@@ -689,10 +788,14 @@ impl Device {
             .map_err(vkerr("allocate_memory"))?;
         unsafe { self.device.bind_buffer_memory(buffer, memory, 0) }
             .map_err(vkerr("bind_buffer_memory"))?;
-        let ptr = unsafe {
-            self.device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-        }
-        .map_err(vkerr("map_memory"))? as *mut u8;
+        let ptr = if mapped {
+            unsafe {
+                self.device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+            }
+            .map_err(vkerr("map_memory"))? as *mut u8
+        } else {
+            std::ptr::null_mut()
+        };
         Ok((buffer, memory, ptr, class))
     }
 
@@ -997,6 +1100,23 @@ impl Device {
         self.retire(batch)
     }
 
+    /// Returns the buffers a finished batch released to the pool, destroying
+    /// the transient ones.
+    fn retire_buffers(&self, batch: &mut Batch) {
+        let dev = &self.device;
+        let mut pool = self.pool.lock().unwrap();
+        for b in batch.free_bufs.drain(..) {
+            if b.transient {
+                unsafe {
+                    dev.destroy_buffer(b.buffer, None);
+                    dev.free_memory(b.memory, None);
+                }
+            } else {
+                pool.free.entry((b.class, b.kind)).or_default().push(b);
+            }
+        }
+    }
+
     /// Reclaims a batch whose fence has signalled: its fence and descriptor
     /// pool are reset, the buffers it released go back to the pool, and its
     /// profiling timestamps are read out.
@@ -1008,10 +1128,7 @@ impl Device {
                 .map_err(vkerr("reset_descriptor_pool"))?;
         }
         if !batch.free_bufs.is_empty() {
-            let mut pool = self.pool.lock().unwrap();
-            for b in batch.free_bufs.drain(..) {
-                pool.free.entry(b.class).or_default().push(b);
-            }
+            self.retire_buffers(batch);
         }
         if self.profile_enabled {
             let nq = batch.n_queries as usize;
@@ -1072,12 +1189,8 @@ impl Device {
         // Buffers dropped while nothing was recording sit in the current
         // slot's list; the GPU is idle now, so they can go back too.
         let cur = ctx.cur;
-        let batch = &mut ctx.batches[cur];
-        if !batch.free_bufs.is_empty() {
-            let mut pool = self.pool.lock().unwrap();
-            for b in batch.free_bufs.drain(..) {
-                pool.free.entry(b.class).or_default().push(b);
-            }
+        if !ctx.batches[cur].free_bufs.is_empty() {
+            self.retire_buffers(&mut ctx.batches[cur]);
         }
         if had_work && self.profile_enabled {
             self.pstats.lock().unwrap().flushes += 1;
@@ -1095,7 +1208,10 @@ impl DeviceInner {
         }
         let mut rows: Vec<_> = stats.per_kernel.iter().collect();
         rows.sort_by_key(|r| std::cmp::Reverse(r.1.1));
-        eprintln!("\n=== xn vulkan profile: {} ===", self.device_name);
+        eprintln!(
+            "\n=== xn vulkan profile: {} (tensors in {:?} memory) ===",
+            self.device_name, self.tensor_kind
+        );
         let width = rows.iter().map(|r| r.0.len()).max().unwrap_or(22).max(22);
         eprintln!(
             "{:<width$} {:>9} {:>11} {:>9} {:>7}",
@@ -1188,8 +1304,10 @@ impl Drop for DeviceInner {
 pub struct Storage<T: WithDType> {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
+    /// Mapped pointer; null when the memory is not host-visible.
     ptr: *mut u8,
     len: usize,
+    kind: MemKind,
     /// Allocation size class; used to return the buffer to the pool on drop.
     class: u64,
     device: Device,
@@ -1209,12 +1327,44 @@ impl<T: WithDType> Storage<T> {
         self.len == 0
     }
 
-    /// Host view of the mapped memory as `&[T]`.
-    fn as_slice(&self) -> &[T] {
-        unsafe { std::slice::from_raw_parts(self.ptr as *const T, self.len) }
+    /// The first `len` elements, read back to the host after every pending
+    /// GPU op. Mapped memory is read in place; device-local memory is copied
+    /// to a staging buffer inside the batch first.
+    fn host_read(&self, len: usize) -> Result<Vec<T>> {
+        let bytes = len * T::BYTE_SIZE;
+        if bytes == 0 {
+            return Ok(Vec::new());
+        }
+        if !self.ptr.is_null() {
+            self.device.flush("host-read")?;
+            return Ok(unsafe { std::slice::from_raw_parts(self.ptr as *const T, len) }.to_vec());
+        }
+        let staging = self.device.alloc_staging(bytes)?;
+        let copied = self.device.record_copy(staging.buffer, self.buffer, bytes);
+        let out = copied
+            .and_then(|()| self.device.flush("host-read"))
+            .map(|()| unsafe { std::slice::from_raw_parts(staging.ptr as *const T, len) }.to_vec());
+        self.device.defer_free(staging);
+        out
     }
-    fn as_mut_slice(&mut self) -> &mut [T] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut T, self.len) }
+
+    /// Overwrites the first `data.len()` elements, ordered after every
+    /// pending GPU op. Mapped memory is written in place after a flush;
+    /// device-local memory gets a staging buffer and a recorded copy.
+    fn host_write(&mut self, data: &[T]) -> Result<()> {
+        let bytes = std::mem::size_of_val(data);
+        if bytes == 0 {
+            return Ok(());
+        }
+        if !self.ptr.is_null() {
+            self.device.flush("host-write")?;
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, self.ptr, bytes) };
+            return Ok(());
+        }
+        let staging = self.device.scratch_from_slice(data)?;
+        let res = self.device.record_copy(self.buffer, staging.buffer, bytes);
+        self.device.defer_free(staging);
+        res
     }
 }
 
@@ -1227,6 +1377,8 @@ impl<T: WithDType> Drop for Storage<T> {
             memory: self.memory,
             ptr: self.ptr as usize,
             class: self.class,
+            kind: self.kind,
+            transient: false,
         });
     }
 }
@@ -1241,11 +1393,27 @@ impl Device {
     /// the `defer_free` invariant).
     fn scratch_from_slice<T: Copy>(&self, data: &[T]) -> Result<PooledBuf> {
         let bytes = std::mem::size_of_val(data);
-        let (buffer, memory, ptr, class) = self.alloc_buffer(bytes)?;
+        let mut buf = self.alloc_staging(bytes)?;
         unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, ptr, bytes);
+            std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, buf.ptr as *mut u8, bytes);
         }
-        Ok(PooledBuf { buffer, memory, ptr: ptr as usize, class })
+        // A weight-sized upload should not pin its size class in the pool.
+        buf.transient = bytes > TRANSIENT_STAGING_BYTES;
+        Ok(buf)
+    }
+
+    /// A fresh host-visible buffer of `bytes`, for staging an upload or a
+    /// readback. Same lifetime rules as [`Self::scratch_from_slice`].
+    fn alloc_staging(&self, bytes: usize) -> Result<PooledBuf> {
+        let (buffer, memory, ptr, class) = self.alloc_buffer(bytes, MemKind::Staging)?;
+        Ok(PooledBuf {
+            buffer,
+            memory,
+            ptr: ptr as usize,
+            class,
+            kind: MemKind::Staging,
+            transient: false,
+        })
     }
 
     /// Schedule a buffer to be recycled into the pool on the next flush.
