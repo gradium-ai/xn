@@ -81,8 +81,8 @@ impl Q8Tensor {
         let scales_buf = dev.alloc_buffer(std::mem::size_of_val(scales.as_slice()));
         // Fresh buffers: nothing recorded can reference them yet, so the
         // uploads need no flush and land before any command that reads them.
-        dev.write_buffer_bytes(&qs_buf, bytemuck_cast_u32(&qs));
-        dev.write_buffer_bytes(&scales_buf, bytemuck_cast_f32(&scales));
+        dev.write_buffer_u32(&qs_buf, &qs);
+        dev.write_buffer_data(&scales_buf, &scales);
 
         Ok(Self { qs: qs_buf, scales: scales_buf, shape: shape.clone(), device: dev.clone() })
     }
@@ -160,16 +160,6 @@ impl Q8Tensor {
         }
         Ok(out)
     }
-}
-
-fn bytemuck_cast_u32(v: &[u32]) -> &[u8] {
-    // Safety: `u32` has no padding and any bit pattern is a valid `u8`.
-    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
-}
-
-fn bytemuck_cast_f32(v: &[f32]) -> &[u8] {
-    // Safety: as above.
-    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
 /// A linear layer with q8_0 weights, computed on the GPU.

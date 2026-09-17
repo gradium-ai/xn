@@ -57,9 +57,11 @@ fn main(
     let kw = pc.k >> 2u;   // packed words per row
     let kb = pc.k >> 5u;   // blocks per row
 
-    // Column bases. Columns past `n` are read and discarded at store time:
-    // WebGPU bounds-checks out-of-range storage reads, so the guard stays out
-    // of the k loop.
+    // Column bases. Columns past `n` are read unguarded so the guard stays out
+    // of the k loop, and are discarded at store time -- not neutralised by the
+    // read. Buffers are pooled, rounded up to a size class and bound whole, so
+    // such a read returns stale bytes rather than zero; only the `jj < pc.n`
+    // guard on the store keeps them out of dst.
     let q0 = (j0 + 0u) * kw;
     let q1 = (j0 + 1u) * kw;
     let q2 = (j0 + 2u) * kw;
