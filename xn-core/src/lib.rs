@@ -239,11 +239,13 @@ impl Runner {
                 DTypeQ::F16 => w.run::<Unquantized<half::f16, _>>(dev),
                 DTypeQ::BF16 => w.run::<Unquantized<half::bf16, _>>(dev),
                 DTypeQ::F32 => w.run::<Unquantized<f32, _>>(dev),
+                // q8_0 weights with f32 activations, dequantized inside the
+                // matmul (see `cuda_backend::q8`).
+                DTypeQ::Q8_0 => w.run::<cuda_backend::q8::Q8F32>(dev),
                 DTypeQ::Q4_0
                 | DTypeQ::Q4_1
                 | DTypeQ::Q5_0
                 | DTypeQ::Q5_1
-                | DTypeQ::Q8_0
                 | DTypeQ::Q8_1
                 | DTypeQ::Q2K
                 | DTypeQ::Q3K
