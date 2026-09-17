@@ -283,6 +283,10 @@ pub struct DeviceInner {
     /// Subgroup size usable for `subgroupAdd` in compute shaders, 0 when
     /// subgroup arithmetic is unavailable (or disabled via env).
     subgroup_size: u32,
+    /// `XN_VULKAN_GEMM`, a kernel name to force for every f32 GEMM it can
+    /// serve (`tiled16`, `tiled32`, `tiled64`, `tiled`, `rowblock`, `generic`).
+    /// For measuring; unset in normal use.
+    gemm_force: Option<String>,
     pool: Mutex<BufferPool>,
     /// Set when `XN_VULKAN_PROFILE=1` and the queue supports timestamps.
     profile_enabled: bool,
@@ -527,6 +531,7 @@ impl Device {
             supports_f16,
             supports_bf16,
             subgroup_size,
+            gemm_force: std::env::var("XN_VULKAN_GEMM").ok().filter(|v| !v.is_empty()),
             pool: Mutex::new(BufferPool::default()),
             profile_enabled,
             query_pool,

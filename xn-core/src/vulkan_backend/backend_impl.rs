@@ -1329,6 +1329,7 @@ fn row_block_gemm<T: WithDType>(
         dispatch_tiled_gemm(dev, dst.buffer, buffers, &push_all(), label, m, n, k, lhs_b, splittable)
     };
 
+    let force = dev.gemm_force.as_deref();
     let tiles16 = m.div_ceil(16) * n.div_ceil(16) * lhs_b;
     let dispatch_tiled16 = |dev: &Device| -> Result<()> {
         let groups = (div_ceil(n, 16), div_ceil(m, 16), lhs_b as u32);
@@ -1341,6 +1342,24 @@ fn row_block_gemm<T: WithDType>(
         dev.dispatch_labeled(&kernel, label(&kernel), &buffers, &push_all(), groups)
     };
     let nn_any = lhs_cs == 1 && rhs_cs == 1;
+    if let Some(force) = force {
+        match force {
+            "generic" => return Ok(false),
+            "tiled16" => dispatch_tiled16(dev)?,
+            "tiled32" | "tiled64" => {
+                let tm = if force == "tiled64" { 64 } else { 32 };
+                let kernel = if tm == 64 { "gemm_tiled64" } else { "gemm_tiled32" };
+                let groups = (div_ceil(n, 64), div_ceil(m, tm), lhs_b as u32);
+                dev.dispatch_labeled(kernel, label(kernel), &buffers, &push_all().usize(1), groups)?;
+            }
+            "tiled" => dispatch_tiled(dev)?,
+            "rowblock" if nt => dispatch_nt(dev)?,
+            "rowblock" if nn_any => dispatch_nn(dev)?,
+            _ => return Ok(false),
+        }
+        return Ok(true);
+    }
+
     // The order below follows measurements over Phonon's shapes
     // (`examples/gemm_shapes_bench.rs`), which is also what the thresholds
     // encode; `XN_VULKAN_GEMM` overrides it for re-measuring.
