@@ -261,11 +261,16 @@ impl Runner {
             self.run_cpu(w)
         } else {
             // The Vulkan backend computes in f32, f16 or bf16 (device
-            // permitting). Quantized formats stay on CPU.
+            // permitting), with q8_0 weights dequantized inside the matmul.
+            // Other quantized formats stay on CPU.
             match self.dtype {
                 DTypeQ::F32 => {
                     let dev = vulkan_backend::Device::new(_device_id)?;
                     w.run::<Unquantized<f32, _>>(dev)
+                }
+                DTypeQ::Q8_0 => {
+                    let dev = vulkan_backend::Device::new(_device_id)?;
+                    w.run::<vulkan_backend::quantization::Q8F32>(dev)
                 }
                 DTypeQ::F16 => {
                     let dev = vulkan_backend::Device::new(_device_id)?;
