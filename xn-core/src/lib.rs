@@ -312,12 +312,22 @@ impl Runner {
             feature = "webgpu",
             not(any(feature = "cuda", feature = "vulkan", feature = "metal"))
         ))]
-        let res = if !self.cpu_only && self.dtype == DTypeQ::F32 {
-            // The WebGPU backend computes in f32; other formats stay on CPU.
-            let dev = webgpu_backend::Device::new(_device_id)?;
-            w.run::<Unquantized<f32, _>>(dev)
-        } else {
+        let res = if self.cpu_only {
             self.run_cpu(w)
+        } else {
+            // The WebGPU backend computes in f32, with q8_0 weights
+            // dequantized inside the matmul. Other formats stay on CPU.
+            match self.dtype {
+                DTypeQ::F32 => {
+                    let dev = webgpu_backend::Device::new(_device_id)?;
+                    w.run::<Unquantized<f32, _>>(dev)
+                }
+                DTypeQ::Q8_0 => {
+                    let dev = webgpu_backend::Device::new(_device_id)?;
+                    w.run::<webgpu_backend::quantization::Q8F32>(dev)
+                }
+                _ => self.run_cpu(w),
+            }
         };
         #[cfg(not(any(
             feature = "cuda",
