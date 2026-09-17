@@ -65,8 +65,15 @@ fn main(
     let s2 = (j0 + 2u) * kb;
     let s3 = (j0 + 3u) * kb;
 
-    // Row bases into lhs. Rows past `m` read out of range, which WebGPU
-    // bounds-checks to zero; the store is guarded.
+    // Row bases into lhs. Rows past `m` are read unguarded, but NOT because
+    // they come back zero -- buffers are pooled, rounded up to a size class
+    // and bound whole, so such a read usually lands inside the binding and
+    // returns stale bytes from a previously freed tensor. What makes it
+    // correct is the store: accumulator rr*TN + cc maps to exactly one
+    // output, the reduction sums each slot without crossing into another, and
+    // the store writes only if both ii < m and jj < n -- so the junk is
+    // discarded, never accumulated into a live result. Any future fast path
+    // that writes a full tile unguarded would put that stale data in dst.
     let r0 = (i0 + 0u) * pc.k;
     let r1 = (i0 + 1u) * pc.k;
     let r2 = (i0 + 2u) * pc.k;

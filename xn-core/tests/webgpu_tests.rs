@@ -614,8 +614,10 @@ fn q8_matmul_decode() -> Result<()> {
 
 #[test]
 fn q8_matmul_rows() -> Result<()> {
-    // m > 1 takes gemm_q8, including partial row and column tiles.
-    for (m, k, n) in [(2, 64, 8), (3, 256, 5), (4, 512, 64), (6, 1024, 130), (8, 128, 33)] {
+    // 1 < m <= 16 takes gemm_q8, including partial row and column tiles.
+    for (m, k, n) in
+        [(2, 64, 8), (3, 256, 5), (4, 512, 64), (6, 1024, 130), (8, 128, 33), (9, 64, 4)]
+    {
         cmp_q8_matmul(m, k, n)?;
     }
     Ok(())
@@ -623,9 +625,10 @@ fn q8_matmul_rows() -> Result<()> {
 
 #[test]
 fn q8_matmul_tiled() -> Result<()> {
-    // m > 8 takes gemm_q8_tiled, including tiles that are partial in every
-    // direction at once (m, n and k all off the 32/8 boundaries).
-    for (m, k, n) in [(9, 64, 4), (30, 288, 96), (33, 128, 33), (64, 512, 128), (120, 96, 65)] {
+    // m > 16 takes gemm_q8_tiled. `k` is always a multiple of the 32-value
+    // q8_0 block, so only m and n can be partial; (17, 64, 3) is partial in
+    // both at once, just past the gate.
+    for (m, k, n) in [(17, 64, 3), (30, 288, 96), (33, 128, 33), (64, 512, 128), (120, 96, 65)] {
         cmp_q8_matmul(m, k, n)?;
     }
     Ok(())
