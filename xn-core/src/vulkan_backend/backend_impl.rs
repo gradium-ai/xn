@@ -963,10 +963,12 @@ fn conv1d_im2col<T: WithDTypeF>(
         div_ceil(batch * out_length * k, WORKGROUP_SIZE),
     )?;
 
-    // result[b, l, oc] = sum_k col[b, l, k] * kernel[oc, k]
-    let mut result = unsafe { <Device as crate::Backend>::alloc_uninit::<T>(batch * out_length * out_channels, &dev)? };
+    // dst[b, oc, l] = sum_k col[b, l, k] * kernel[oc, k]: the GEMM's rows are
+    // output positions and its columns output channels, and it writes them
+    // transposed into dst's [batch, out_channels, out_length] through the
+    // destination strides, so no separate transpose pass and no temporary.
     <Device as crate::Backend>::gemm(
-        &mut result,
+        dst,
         (&col, 0),
         (kernel, 0),
         out_length,
@@ -975,13 +977,10 @@ fn conv1d_im2col<T: WithDTypeF>(
         batch,
         out_length * k,
         0,
-        (1, out_channels),
+        (out_length, 1),
         (1, k),
         (k, 1),
-    )?;
-
-    // [batch, out_length, out_channels] -> dst's [batch, out_channels, out_length].
-    <Device as crate::Backend>::transpose(dst, &result, 1, 2, &[batch, out_length, out_channels])
+    )
 }
 
 /// `groups == 1`, no padding/output_padding conv_transpose1d via transpose +
