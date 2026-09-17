@@ -193,25 +193,61 @@ struct CachedPipeline {
 /// batch is flushed (on host readback / `synchronize` / before host access to
 /// mapped memory, or when the descriptor pool is about to overflow). This keeps
 /// the GPU busy across many ops instead of paying a CPU↔GPU round-trip per op.
-struct OpCtx {
+/// One unit of GPU work in flight: a command buffer with its fence,
+/// descriptor pool and profiling queries, plus the buffers to recycle once it
+/// has executed.
+struct Batch {
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     descriptor_pool: vk::DescriptorPool,
-    /// Whether `command_buffer` currently has recorded, unsubmitted commands.
-    open: bool,
-    /// Descriptor sets allocated in the current (unflushed) batch.
+    /// First timestamp query of this batch's slice of the query pool.
+    query_base: u32,
+    /// Submitted and not yet retired.
+    in_flight: bool,
+    /// Descriptor sets allocated while recording this batch.
     n_sets: u32,
-    /// Buffers (dropped tensors + scratch) to recycle into the pool on the
-    /// next flush, once any batch referencing them has finished executing.
+    /// Buffers (dropped tensors + scratch) to recycle into the pool once this
+    /// batch has finished executing: a buffer's last recorded use is in this
+    /// batch or an earlier one, and the queue runs batches in order.
     free_bufs: Vec<PooledBuf>,
-    /// Profiling: kernel name per recorded command in the current batch.
+    /// Profiling: kernel name per recorded command.
     prof_names: Vec<String>,
-    /// Profiling: number of timestamps written in the current batch.
+    /// Profiling: timestamps written, including the batch's opening one.
     n_queries: u32,
 }
 
-/// Max descriptor sets per batch before we force a flush (pool capacity).
-const MAX_SETS_PER_BATCH: u32 = 4096;
+/// The recording state: a ring of batches. `cur` is the batch being recorded
+/// (or the next to record into); the others may be in flight on the GPU.
+///
+/// Work is submitted every [`SUBMIT_AT`] dispatches without waiting, so the
+/// GPU starts on a frame while the CPU is still recording the rest of it;
+/// only a readback or host fallback waits for everything. Buffers a batch
+/// released come back to the pool when that batch is retired, which happens
+/// as soon as its fence is seen signalled at a later submit, or at a flush.
+struct OpCtx {
+    batches: Vec<Batch>,
+    cur: usize,
+    /// Whether `batches[cur]` has recorded, unsubmitted commands.
+    open: bool,
+}
+
+/// Batches in the ring: how many can be in flight before recording blocks on
+/// the oldest. A frame of decode is ~450 dispatches, so this is a frame.
+const RING: usize = 8;
+/// Dispatches recorded into a batch before it is submitted. Fewer means the
+/// GPU starts sooner and more submits; each submit is a few microseconds of
+/// CPU and a small gap on the GPU. Measured on Phonon's Mimi decoder (~180
+/// dispatches a frame): 32 beat 16 and 64 by 3-5%.
+const SUBMIT_AT: u32 = 32;
+/// Dispatches before the first submit when nothing is in flight: the GPU is
+/// idle, so getting it started matters more than amortizing the submit.
+const FIRST_SUBMIT_AT: u32 = 8;
+/// Descriptor sets a batch's pool holds: `SUBMIT_AT` dispatches plus slack for
+/// the ops recorded after the threshold is crossed within one operator.
+const MAX_SETS_PER_BATCH: u32 = SUBMIT_AT + 64;
+/// Timestamps a batch may write when profiling: one per dispatch or copy,
+/// plus the opening one. Copies do not allocate sets, so this is generous.
+const BATCH_QUERIES: u32 = 2 * MAX_SETS_PER_BATCH + 8;
 
 /// A buffer plus its memory and persistently-mapped pointer, as kept in the
 /// recycling pool. The pointer is stored as `usize` so the struct stays
@@ -245,7 +281,7 @@ fn size_class(bytes: usize) -> u64 {
     if np2 <= (1 << 20) { np2.max(256) } else { bytes.div_ceil(np2 / 16) * (np2 / 16) }
 }
 /// Timestamp query pool capacity (only used with `XN_VULKAN_PROFILE=1`).
-const QUERY_CAP: u32 = 8192;
+const QUERY_CAP: u32 = RING as u32 * BATCH_QUERIES;
 
 /// Accumulated profiling counters (enabled via `XN_VULKAN_PROFILE=1`).
 /// GPU times come from timestamp queries written after every dispatch; the
@@ -258,6 +294,8 @@ struct ProfStats {
     gpu_ns: u128,
     dispatches: u64,
     flushes: u64,
+    /// Batches submitted (each `SUBMIT_AT` dispatches or a flush).
+    submits: u64,
     /// What triggered each flush (profiling only) — readbacks vs host
     /// fallbacks vs forced batch splits.
     flush_reasons: HashMap<&'static str, u64>,
@@ -287,6 +325,9 @@ pub struct DeviceInner {
     /// serve (`tiled16`, `tiled32`, `tiled64`, `tiled`, `rowblock`, `generic`).
     /// For measuring; unset in normal use.
     gemm_force: Option<String>,
+    /// Dispatches per batch before it is submitted (`SUBMIT_AT`, or
+    /// `XN_VULKAN_SUBMIT_AT` for measuring).
+    submit_at: u32,
     pool: Mutex<BufferPool>,
     /// Set when `XN_VULKAN_PROFILE=1` and the queue supports timestamps.
     profile_enabled: bool,
@@ -500,21 +541,33 @@ impl Device {
         let cb_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let command_buffer = unsafe { device.allocate_command_buffers(&cb_info) }
-            .map_err(vkerr("alloc_cmd_buffer"))?[0];
-
-        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
-            .map_err(vkerr("create_fence"))?;
-
-        let pool_sizes = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(MAX_SETS_PER_BATCH * MAX_BINDINGS as u32)];
-        let dp_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(MAX_SETS_PER_BATCH)
-            .pool_sizes(&pool_sizes);
-        let descriptor_pool = unsafe { device.create_descriptor_pool(&dp_info, None) }
-            .map_err(vkerr("create_desc_pool"))?;
+            .command_buffer_count(RING as u32);
+        let command_buffers = unsafe { device.allocate_command_buffers(&cb_info) }
+            .map_err(vkerr("alloc_cmd_buffer"))?;
+        let mut batches = Vec::with_capacity(RING);
+        for (i, &command_buffer) in command_buffers.iter().enumerate() {
+            let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
+                .map_err(vkerr("create_fence"))?;
+            let pool_sizes = [vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(MAX_SETS_PER_BATCH * MAX_BINDINGS as u32)];
+            let dp_info = vk::DescriptorPoolCreateInfo::default()
+                .max_sets(MAX_SETS_PER_BATCH)
+                .pool_sizes(&pool_sizes);
+            let descriptor_pool = unsafe { device.create_descriptor_pool(&dp_info, None) }
+                .map_err(vkerr("create_desc_pool"))?;
+            batches.push(Batch {
+                command_buffer,
+                fence,
+                descriptor_pool,
+                query_base: i as u32 * BATCH_QUERIES,
+                in_flight: false,
+                n_sets: 0,
+                free_bufs: Vec::new(),
+                prof_names: Vec::new(),
+                n_queries: 0,
+            });
+        }
 
         let inner = DeviceInner {
             entry,
@@ -532,21 +585,17 @@ impl Device {
             supports_bf16,
             subgroup_size,
             gemm_force: std::env::var("XN_VULKAN_GEMM").ok().filter(|v| !v.is_empty()),
+            submit_at: std::env::var("XN_VULKAN_SUBMIT_AT")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .map(|v| v.clamp(1, MAX_SETS_PER_BATCH - 8))
+                .unwrap_or(SUBMIT_AT),
             pool: Mutex::new(BufferPool::default()),
             profile_enabled,
             query_pool,
             timestamp_period,
             pstats: Mutex::new(ProfStats::default()),
-            ctx: Mutex::new(OpCtx {
-                command_buffer,
-                fence,
-                descriptor_pool,
-                open: false,
-                n_sets: 0,
-                free_bufs: Vec::new(),
-                prof_names: Vec::new(),
-                n_queries: 0,
-            }),
+            ctx: Mutex::new(OpCtx { batches, cur: 0, open: false }),
             device_name,
         };
         let _ = inner.pdevice;
@@ -712,22 +761,18 @@ impl Device {
         let (pipeline, layout, bindings) = self.get_pipeline(kernel)?;
         assert_eq!(bindings as usize, buffers.len(), "kernel {kernel} binding count mismatch");
         let mut ctx = self.ctx.lock().unwrap();
-        if ctx.n_sets >= MAX_SETS_PER_BATCH || ctx.n_queries + 1 >= QUERY_CAP {
-            if self.profile_enabled {
-                *self.pstats.lock().unwrap().flush_reasons.entry("batch-full").or_insert(0) += 1;
-            }
-            self.flush_locked(&mut ctx)?;
-        }
         self.begin_if_needed(&mut ctx)?;
         let dev = &self.device;
+        let cur = ctx.cur;
+        let batch = &mut ctx.batches[cur];
         unsafe {
             let set_layouts = [self.set_layouts[bindings as usize]];
             let alloc_info = vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(ctx.descriptor_pool)
+                .descriptor_pool(batch.descriptor_pool)
                 .set_layouts(&set_layouts);
             let set =
                 dev.allocate_descriptor_sets(&alloc_info).map_err(vkerr("alloc_desc_set"))?[0];
-            ctx.n_sets += 1;
+            batch.n_sets += 1;
 
             let infos: Vec<vk::DescriptorBufferInfo> = buffers
                 .iter()
@@ -746,7 +791,7 @@ impl Device {
                 .collect();
             dev.update_descriptor_sets(&writes, &[]);
 
-            let cb = ctx.command_buffer;
+            let cb = batch.command_buffer;
             dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline);
             dev.cmd_bind_descriptor_sets(
                 cb,
@@ -763,13 +808,13 @@ impl Device {
                     cb,
                     vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                     self.query_pool,
-                    ctx.n_queries,
+                    batch.query_base + batch.n_queries,
                 );
-                ctx.prof_names.push(label.unwrap_or_else(|| kernel.to_string()));
-                ctx.n_queries += 1;
+                batch.prof_names.push(label.unwrap_or_else(|| kernel.to_string()));
+                batch.n_queries += 1;
             }
         }
-        Ok(())
+        self.submit_if_full(&mut ctx)
     }
 
     /// Record a buffer-to-buffer copy of `bytes` into the current batch.
@@ -778,131 +823,191 @@ impl Device {
             return Ok(());
         }
         let mut ctx = self.ctx.lock().unwrap();
-        if ctx.n_queries + 1 >= QUERY_CAP {
-            self.flush_locked(&mut ctx)?;
-        }
         self.begin_if_needed(&mut ctx)?;
+        let cur = ctx.cur;
+        let batch = &mut ctx.batches[cur];
         unsafe {
             let region = vk::BufferCopy::default().src_offset(0).dst_offset(0).size(bytes as u64);
-            self.device.cmd_copy_buffer(ctx.command_buffer, src, dst, &[region]);
+            self.device.cmd_copy_buffer(batch.command_buffer, src, dst, &[region]);
             if self.profile_enabled {
                 self.device.cmd_write_timestamp(
-                    ctx.command_buffer,
+                    batch.command_buffer,
                     vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                     self.query_pool,
-                    ctx.n_queries,
+                    batch.query_base + batch.n_queries,
                 );
-                ctx.prof_names.push("buffer_copy".to_string());
-                ctx.n_queries += 1;
+                batch.prof_names.push("buffer_copy".to_string());
+                batch.n_queries += 1;
             }
         }
-        Ok(())
+        self.submit_if_full(&mut ctx)
     }
 
-    /// Begin the command buffer if the batch is not already open, inserting a
-    /// conservative global memory barrier before each op after the first so
-    /// that reads observe prior writes (compute and transfer).
+    /// Makes `ctx.cur` ready to record into, opening its command buffer if
+    /// nothing is recorded yet (waiting for the batch previously submitted
+    /// from that slot, if it is still in flight), and inserts the global
+    /// memory barrier every op runs behind so that it observes the writes of
+    /// everything before it, in this batch or an earlier one on the queue.
     fn begin_if_needed(&self, ctx: &mut OpCtx) -> Result<()> {
         let dev = &self.device;
-        let stages = vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
-        unsafe {
-            if !ctx.open {
-                dev.reset_command_buffer(ctx.command_buffer, vk::CommandBufferResetFlags::empty())
-                    .map_err(vkerr("reset_command_buffer"))?;
+        if !ctx.open {
+            let cur = ctx.cur;
+            if ctx.batches[cur].in_flight {
+                self.wait_and_retire(&mut ctx.batches[cur])?;
+            }
+            let batch = &mut ctx.batches[cur];
+            unsafe {
+                dev.reset_command_buffer(
+                    batch.command_buffer,
+                    vk::CommandBufferResetFlags::empty(),
+                )
+                .map_err(vkerr("reset_command_buffer"))?;
                 let begin = vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-                dev.begin_command_buffer(ctx.command_buffer, &begin)
+                dev.begin_command_buffer(batch.command_buffer, &begin)
                     .map_err(vkerr("begin_command_buffer"))?;
                 if self.profile_enabled {
-                    dev.cmd_reset_query_pool(ctx.command_buffer, self.query_pool, 0, QUERY_CAP);
+                    dev.cmd_reset_query_pool(
+                        batch.command_buffer,
+                        self.query_pool,
+                        batch.query_base,
+                        BATCH_QUERIES,
+                    );
                     dev.cmd_write_timestamp(
-                        ctx.command_buffer,
+                        batch.command_buffer,
                         vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                         self.query_pool,
-                        0,
+                        batch.query_base,
                     );
-                    ctx.n_queries = 1;
+                    batch.n_queries = 1;
                 }
-                ctx.open = true;
-            } else {
-                let barrier = vk::MemoryBarrier::default()
-                    .src_access_mask(
-                        vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
-                    )
-                    .dst_access_mask(
-                        vk::AccessFlags::SHADER_READ
-                            | vk::AccessFlags::SHADER_WRITE
-                            | vk::AccessFlags::TRANSFER_READ
-                            | vk::AccessFlags::TRANSFER_WRITE,
-                    );
-                dev.cmd_pipeline_barrier(
-                    ctx.command_buffer,
-                    stages,
-                    stages,
-                    vk::DependencyFlags::empty(),
-                    &[barrier],
-                    &[],
-                    &[],
-                );
             }
+            ctx.open = true;
+        }
+        let stages = vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(
+                vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_READ
+                    | vk::AccessFlags::TRANSFER_WRITE,
+            );
+        unsafe {
+            dev.cmd_pipeline_barrier(
+                ctx.batches[ctx.cur].command_buffer,
+                stages,
+                stages,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
         }
         Ok(())
     }
 
-    /// Submit any pending recorded commands and wait for completion. Safe to
-    /// call when nothing is pending. `reason` attributes the flush in the
-    /// profiling report (only recorded when the flush actually submits work).
-    fn flush(&self, reason: &'static str) -> Result<()> {
-        let mut ctx = self.ctx.lock().unwrap();
-        if self.profile_enabled && ctx.open {
-            *self.pstats.lock().unwrap().flush_reasons.entry(reason).or_insert(0) += 1;
+    /// Submits the current batch once it holds `SUBMIT_AT` dispatches, or is
+    /// about to run out of descriptor sets or profiling queries.
+    fn submit_if_full(&self, ctx: &mut OpCtx) -> Result<()> {
+        let idle = !ctx.batches.iter().any(|b| b.in_flight);
+        let threshold = if idle { FIRST_SUBMIT_AT.min(self.submit_at) } else { self.submit_at };
+        let batch = &ctx.batches[ctx.cur];
+        if ctx.open
+            && (batch.n_sets >= threshold
+                || batch.n_sets + 8 >= MAX_SETS_PER_BATCH
+                || batch.n_queries + 2 >= BATCH_QUERIES)
+        {
+            self.submit_locked(ctx)?;
         }
-        self.flush_locked(&mut ctx)
+        Ok(())
     }
 
-    fn flush_locked(&self, ctx: &mut OpCtx) -> Result<()> {
+    /// Submits the current batch without waiting and moves recording on to
+    /// the next slot. Batches whose fences have already signalled are
+    /// retired on the way, so their buffers return to the pool promptly.
+    fn submit_locked(&self, ctx: &mut OpCtx) -> Result<()> {
         if !ctx.open {
             return Ok(());
         }
         let dev = &self.device;
         let t0 = if self.profile_enabled { Some(std::time::Instant::now()) } else { None };
-        unsafe {
-            dev.end_command_buffer(ctx.command_buffer).map_err(vkerr("end_command_buffer"))?;
-            let cbs = [ctx.command_buffer];
-            let submit = vk::SubmitInfo::default().command_buffers(&cbs);
-            dev.queue_submit(self.queue, &[submit], ctx.fence).map_err(vkerr("queue_submit"))?;
-            dev.wait_for_fences(&[ctx.fence], true, u64::MAX).map_err(vkerr("wait_for_fences"))?;
-            dev.reset_fences(&[ctx.fence]).map_err(vkerr("reset_fences"))?;
-            dev.reset_descriptor_pool(ctx.descriptor_pool, vk::DescriptorPoolResetFlags::empty())
-                .map_err(vkerr("reset_descriptor_pool"))?;
+        let cur = ctx.cur;
+        {
+            let batch = &mut ctx.batches[cur];
+            unsafe {
+                dev.end_command_buffer(batch.command_buffer)
+                    .map_err(vkerr("end_command_buffer"))?;
+                let cbs = [batch.command_buffer];
+                let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+                dev.queue_submit(self.queue, &[submit], batch.fence)
+                    .map_err(vkerr("queue_submit"))?;
+            }
+            batch.in_flight = true;
         }
-        // The GPU is now idle for this batch: buffers freed during it can be
-        // recycled for future allocations.
-        if !ctx.free_bufs.is_empty() {
-            let mut pool = self.pool.lock().unwrap();
-            for b in ctx.free_bufs.drain(..) {
-                pool.free.entry(b.class).or_default().push(b);
+        ctx.open = false;
+        ctx.cur = (cur + 1) % RING;
+        for i in 0..RING {
+            let b = &mut ctx.batches[i];
+            if b.in_flight
+                && unsafe { dev.get_fence_status(b.fence) }.map_err(vkerr("fence_status"))?
+            {
+                self.retire(b)?;
             }
         }
         if let Some(t0) = t0 {
-            let wait_ns = t0.elapsed().as_nanos();
-            let nq = ctx.n_queries as usize;
+            let mut stats = self.pstats.lock().unwrap();
+            stats.submits += 1;
+            stats.wait_ns += t0.elapsed().as_nanos();
+        }
+        Ok(())
+    }
+
+    /// Blocks until `batch` has executed, then retires it.
+    fn wait_and_retire(&self, batch: &mut Batch) -> Result<()> {
+        let t0 = if self.profile_enabled { Some(std::time::Instant::now()) } else { None };
+        unsafe {
+            self.device
+                .wait_for_fences(&[batch.fence], true, u64::MAX)
+                .map_err(vkerr("wait_for_fences"))?;
+        }
+        if let Some(t0) = t0 {
+            self.pstats.lock().unwrap().wait_ns += t0.elapsed().as_nanos();
+        }
+        self.retire(batch)
+    }
+
+    /// Reclaims a batch whose fence has signalled: its fence and descriptor
+    /// pool are reset, the buffers it released go back to the pool, and its
+    /// profiling timestamps are read out.
+    fn retire(&self, batch: &mut Batch) -> Result<()> {
+        let dev = &self.device;
+        unsafe {
+            dev.reset_fences(&[batch.fence]).map_err(vkerr("reset_fences"))?;
+            dev.reset_descriptor_pool(batch.descriptor_pool, vk::DescriptorPoolResetFlags::empty())
+                .map_err(vkerr("reset_descriptor_pool"))?;
+        }
+        if !batch.free_bufs.is_empty() {
+            let mut pool = self.pool.lock().unwrap();
+            for b in batch.free_bufs.drain(..) {
+                pool.free.entry(b.class).or_default().push(b);
+            }
+        }
+        if self.profile_enabled {
+            let nq = batch.n_queries as usize;
             if nq >= 2 {
                 let mut ts = vec![0u64; nq];
                 unsafe {
-                    self.device
-                        .get_query_pool_results::<u64>(
-                            self.query_pool,
-                            0,
-                            &mut ts,
-                            vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
-                        )
-                        .map_err(vkerr("get_query_results"))?;
+                    dev.get_query_pool_results::<u64>(
+                        self.query_pool,
+                        batch.query_base,
+                        &mut ts,
+                        vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                    )
+                    .map_err(vkerr("get_query_results"))?;
                 }
                 let mut stats = self.pstats.lock().unwrap();
-                stats.flushes += 1;
-                stats.wait_ns += wait_ns;
-                for (i, name) in ctx.prof_names.iter().enumerate() {
+                for (i, name) in batch.prof_names.iter().enumerate() {
                     let dt_ns =
                         (ts[i + 1].saturating_sub(ts[i]) as f64 * self.timestamp_period) as u128;
                     let e = stats.per_kernel.entry(name.clone()).or_insert((0, 0));
@@ -912,11 +1017,50 @@ impl Device {
                     stats.dispatches += 1;
                 }
             }
-            ctx.prof_names.clear();
-            ctx.n_queries = 0;
+            batch.prof_names.clear();
+            batch.n_queries = 0;
         }
-        ctx.open = false;
-        ctx.n_sets = 0;
+        batch.n_sets = 0;
+        batch.in_flight = false;
+        Ok(())
+    }
+
+    /// Submit any pending recorded commands and wait for completion. Safe to
+    /// call when nothing is pending. `reason` attributes the flush in the
+    /// profiling report (only recorded when the flush actually submits work).
+    fn flush(&self, reason: &'static str) -> Result<()> {
+        let mut ctx = self.ctx.lock().unwrap();
+        if self.profile_enabled && (ctx.open || ctx.batches.iter().any(|b| b.in_flight)) {
+            *self.pstats.lock().unwrap().flush_reasons.entry(reason).or_insert(0) += 1;
+        }
+        self.flush_locked(&mut ctx)
+    }
+
+    /// Submits whatever is recorded and waits for every batch in flight, so
+    /// the host may read or write mapped memory afterwards.
+    fn flush_locked(&self, ctx: &mut OpCtx) -> Result<()> {
+        let had_work = ctx.open || ctx.batches.iter().any(|b| b.in_flight);
+        self.submit_locked(ctx)?;
+        // Oldest first: the slot after `cur` was submitted longest ago.
+        for i in 1..=RING {
+            let idx = (ctx.cur + i) % RING;
+            if ctx.batches[idx].in_flight {
+                self.wait_and_retire(&mut ctx.batches[idx])?;
+            }
+        }
+        // Buffers dropped while nothing was recording sit in the current
+        // slot's list; the GPU is idle now, so they can go back too.
+        let cur = ctx.cur;
+        let batch = &mut ctx.batches[cur];
+        if !batch.free_bufs.is_empty() {
+            let mut pool = self.pool.lock().unwrap();
+            for b in batch.free_bufs.drain(..) {
+                pool.free.entry(b.class).or_default().push(b);
+            }
+        }
+        if had_work && self.profile_enabled {
+            self.pstats.lock().unwrap().flushes += 1;
+        }
         Ok(())
     }
 }
@@ -947,9 +1091,10 @@ impl DeviceInner {
             );
         }
         eprintln!(
-            "gpu total: {:.2} ms over {} dispatches in {} flushes; cpu submit+wait: {:.2} ms",
+            "gpu total: {:.2} ms over {} dispatches in {} submits, {} flushes; cpu submit+wait: {:.2} ms",
             stats.gpu_ns as f64 / 1e6,
             stats.dispatches,
+            stats.submits,
             stats.flushes,
             stats.wait_ns as f64 / 1e6,
         );
@@ -998,12 +1143,14 @@ impl Drop for DeviceInner {
             }
             drop(pipelines);
             let mut ctx = self.ctx.lock().unwrap();
-            for b in ctx.free_bufs.drain(..) {
-                self.device.destroy_buffer(b.buffer, None);
-                self.device.free_memory(b.memory, None);
+            for batch in ctx.batches.iter_mut() {
+                for b in batch.free_bufs.drain(..) {
+                    self.device.destroy_buffer(b.buffer, None);
+                    self.device.free_memory(b.memory, None);
+                }
+                self.device.destroy_descriptor_pool(batch.descriptor_pool, None);
+                self.device.destroy_fence(batch.fence, None);
             }
-            self.device.destroy_descriptor_pool(ctx.descriptor_pool, None);
-            self.device.destroy_fence(ctx.fence, None);
             drop(ctx);
             self.device.destroy_command_pool(self.command_pool, None);
             for n in 1..=MAX_BINDINGS {
@@ -1089,7 +1236,9 @@ impl Device {
     /// recycled by such a flush and overwritten while the subsequently-recorded
     /// dispatch still references it.
     fn defer_free(&self, buf: PooledBuf) {
-        self.ctx.lock().unwrap().free_bufs.push(buf);
+        let mut ctx = self.ctx.lock().unwrap();
+        let cur = ctx.cur;
+        ctx.batches[cur].free_bufs.push(buf);
     }
 }
 
