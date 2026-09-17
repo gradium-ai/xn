@@ -464,6 +464,24 @@ impl crate::Backend for Device {
         rhs_strides: (usize, usize),
     ) -> Result<()> {
         let dt = dtype_suffix::<T>(&dst.device, "gemm")?;
+        if T::DTYPE == DType::F32
+            && row_block_gemm(
+                dst,
+                lhs,
+                rhs,
+                m,
+                n,
+                k,
+                lhs_b,
+                lhs_b_stride,
+                rhs_b_stride,
+                dst_strides,
+                lhs_strides,
+                rhs_strides,
+            )?
+        {
+            return Ok(());
+        }
         let (dst_cs, dst_rs) = dst_strides;
         let (lhs_cs, lhs_rs) = lhs_strides;
         let (rhs_cs, rhs_rs) = rhs_strides;
@@ -1064,4 +1082,304 @@ impl Device {
             num_outputs as u32,
         )
     }
+}
+
+/// Tiles below which a tiled kernel leaves too much of the GPU idle and a
+/// row-block kernel, even re-reading one operand, is faster.
+const TILED_MIN_TILES: usize = 48;
+/// Largest value of `min(m, n)` the NT row-block kernel takes when the tiled
+/// kernel is short of tiles. Past it both operands are long and the tiled
+/// kernel's reuse wins even on a small grid.
+const ROW_BLOCK_NT_MAX_SHORT_SIDE: usize = 128;
+/// Largest `m` the NN split-k kernel takes; it re-reads rhs once per 32 rows
+/// of lhs.
+const ROW_BLOCK_NN_MAX_M: usize = 512;
+/// Smallest `n` for the NN kernel: below it the 16-row tile measured faster.
+const ROW_BLOCK_NN_MIN_N: usize = 128;
+/// 16x16 tiles below which the chunked 16-row tile kernel is short of
+/// workgroups and a row-block kernel does better.
+const TILED16_MIN_TILES: usize = 24;
+/// Largest k treated as "short": one staged chunk covers it.
+const SHORT_K: usize = 128;
+/// Outputs below which a short-k problem takes the 16-row tile rather than
+/// the 32-row one.
+const SHORT_K_TILED16_MAX_OUTPUTS: usize = 32 * 1024;
+
+/// The 14-word push constant block every f32 GEMM kernel shares.
+#[allow(clippy::too_many_arguments)]
+fn gemm_push(
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs_b: usize,
+    lhs_b_stride: usize,
+    rhs_b_stride: usize,
+    (dst_cs, dst_rs): (usize, usize),
+    (lhs_cs, lhs_rs): (usize, usize),
+    (rhs_cs, rhs_rs): (usize, usize),
+    lhs_o: usize,
+    rhs_o: usize,
+) -> Pc {
+    Pc::new()
+        .usize(m)
+        .usize(n)
+        .usize(k)
+        .usize(lhs_b)
+        .usize(lhs_b_stride)
+        .usize(rhs_b_stride)
+        .usize(lhs_cs)
+        .usize(lhs_rs)
+        .usize(rhs_cs)
+        .usize(rhs_rs)
+        .usize(dst_rs)
+        .usize(dst_cs)
+        .usize(lhs_o)
+        .usize(rhs_o)
+}
+
+/// `lhs @ w^T` for a contiguous `(.., k)` lhs and a contiguous `(n, k)` w,
+/// straight through the 64x64 tiled kernel whatever the shape. The q8 path
+/// uses it after dequantizing a long prefill's weight, where the shape
+/// heuristics of [`row_block_gemm`] would pick a row-block kernel and
+/// re-read the freshly written f32 weight several times.
+pub(crate) fn tiled_matmul_t(
+    lhs: &crate::Tensor<f32, Device>,
+    w: &crate::Tensor<f32, Device>,
+) -> Result<crate::Tensor<f32, Device>> {
+    let (n, k) = w.shape().dims2()?;
+    let dims = lhs.dims();
+    let m = lhs.shape().elem_count() / k;
+    let mut out_dims = dims[..dims.len() - 1].to_vec();
+    out_dims.push(n);
+    let dev = lhs.device();
+    let out: crate::Tensor<f32, Device> =
+        unsafe { crate::Tensor::alloc_uninit(crate::Shape::from(out_dims), dev)? };
+    if m == 0 {
+        return Ok(out);
+    }
+    let push = gemm_push(m, n, k, 1, m * k, 0, (1, n), (1, k), (k, 1), 0, 0);
+    {
+        let out_s = out.storage()?;
+        let lhs_s = lhs.storage()?;
+        let w_s = w.storage()?;
+        let buffers = [out_s.buffer, lhs_s.buffer, w_s.buffer];
+        let label =
+            |kernel: &str| dev.profile_enabled.then(|| format!("{kernel} m{m} n{n} k{k} b1 l1,{k} r{k},1"));
+        dispatch_tiled_gemm(dev, out_s.buffer, buffers, &push, label, m, n, k, 1, true)?;
+    }
+    Ok(out)
+}
+
+/// The tiled kernel, its row-tile height and its k split for a problem: 64
+/// rows when that still fills the GPU, else 32, which doubles the grid for
+/// the price of re-reading rhs once more; and when even that leaves the grid
+/// short, k is split across workgroups (up to 8 ways, keeping at least 128 k
+/// per split) with a reduce pass over the partial results.
+fn tiled_variant(m: usize, n: usize, batch: usize, k: usize) -> (&'static str, u32, usize) {
+    let tiles64 = m.div_ceil(64) * n.div_ceil(64) * batch;
+    if tiles64 >= TILED_MIN_TILES {
+        return ("gemm_tiled64", 64, 1);
+    }
+    // Half-height tiles are half the threads, so aim for twice the grid,
+    // and split k towards it when the tile count alone falls short.
+    let tiles32 = m.div_ceil(32) * n.div_ceil(64) * batch;
+    let splits = (2 * TILED_MIN_TILES).div_ceil(tiles32).clamp(1, 8).min(k / 128).max(1);
+    ("gemm_tiled32", 32, splits)
+}
+
+/// Records a tiled GEMM: the kernel picked by [`tiled_variant`] and, when it
+/// splits k, the workspace and the reduce pass. `dst` must be the contiguous
+/// `(batch, m, n)` result when splitting (`dst_strides == (1, n)`); callers
+/// pass `splittable` accordingly.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_tiled_gemm(
+    dev: &Device,
+    dst: vk::Buffer,
+    buffers: [vk::Buffer; 3],
+    push: &Pc,
+    label: impl Fn(&str) -> Option<String>,
+    m: usize,
+    n: usize,
+    k: usize,
+    batch: usize,
+    splittable: bool,
+) -> Result<()> {
+    let (kernel, tm, splits) = tiled_variant(m, n, batch, k);
+    let splits = if splittable { splits } else { 1 };
+    let push_k = push.clone().usize(splits);
+    let groups = (div_ceil(n, 64), div_ceil(m, tm), (batch * splits) as u32);
+    if splits == 1 {
+        return dev.dispatch_labeled(kernel, label(kernel), &buffers, &push_k, groups);
+    }
+    let total = batch * m * n;
+    let ws: crate::Tensor<f32, Device> =
+        unsafe { crate::Tensor::alloc_uninit((splits * total,), dev)? };
+    let ws_s = ws.storage()?;
+    let lbl = label(kernel).map(|l| format!("{l} ksplit{splits}"));
+    dev.dispatch_labeled(kernel, lbl, &[ws_s.buffer, buffers[1], buffers[2]], &push_k, groups)?;
+    let rpush = Pc::new().usize(total).usize(splits);
+    dev.dispatch_nd("ksplit_reduce", &[dst, ws_s.buffer], &rpush, (div_ceil(total, WORKGROUP_SIZE), 1, 1))
+}
+
+/// The f32 GEMM fast paths, picked by shape and layout:
+///
+/// * a pure GEMV (m or n is 1) with k contiguous on both sides goes to the
+///   subgroup row-block kernel, which streams the long operand coalesced;
+/// * a short k with enough outputs goes to the thread-per-output kernel;
+/// * a problem long in both m and n with enough 64x64 tiles goes to the tiled
+///   kernel, which reads each operand once;
+/// * otherwise a row-block kernel streams the longer operand against a block
+///   of the shorter one (gemm_nt_sg.comp when k is contiguous on both sides,
+///   gemm_nn_rows.comp for a row-major `matmul` rhs);
+/// * a problem long in both dimensions that fits none of those still takes
+///   the tiled kernel on a small grid.
+///
+/// Returns `false` when nothing applies and the caller falls back to the
+/// generic 16x16 tiled kernel.
+#[allow(clippy::too_many_arguments)]
+fn row_block_gemm<T: WithDType>(
+    dst: &Storage<T>,
+    lhs: (&Storage<T>, usize),
+    rhs: (&Storage<T>, usize),
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs_b: usize,
+    lhs_b_stride: usize,
+    rhs_b_stride: usize,
+    (dst_cs, dst_rs): (usize, usize),
+    (lhs_cs, lhs_rs): (usize, usize),
+    (rhs_cs, rhs_rs): (usize, usize),
+) -> Result<bool> {
+    let dev = &dst.device;
+    let Some(cols_per_wg) = WORKGROUP_SIZE.checked_div(dev.subgroup_size()) else {
+        return Ok(false);
+    };
+    if m == 0 || n == 0 || k == 0 || lhs_b == 0 {
+        return Ok(false);
+    }
+    let label = |kernel: &str| {
+        dev.profile_enabled.then(|| {
+            format!("{kernel} m{m} n{n} k{k} b{lhs_b} l{lhs_cs},{lhs_rs} r{rhs_cs},{rhs_rs}")
+        })
+    };
+    let push_all = || {
+        gemm_push(
+            m,
+            n,
+            k,
+            lhs_b,
+            lhs_b_stride,
+            rhs_b_stride,
+            (dst_cs, dst_rs),
+            (lhs_cs, lhs_rs),
+            (rhs_cs, rhs_rs),
+            lhs.1,
+            rhs.1,
+        )
+    };
+    let buffers = [dst.buffer, lhs.0.buffer, rhs.0.buffer];
+    // Batch strides only matter past the first batch; `matmul_` passes a
+    // placeholder for a single one.
+    let batch_aligned = lhs_b == 1 || (lhs_b_stride.is_multiple_of(4) && rhs_b_stride.is_multiple_of(4));
+    // NT: k contiguous on both sides, every row start 4-aligned for vec4 loads.
+    let nt = lhs_cs == 1
+        && rhs_rs == 1
+        && k.is_multiple_of(4)
+        && batch_aligned
+        && [lhs.1, lhs_rs, rhs.1, rhs_cs].iter().all(|v| v.is_multiple_of(4));
+    // NN: n contiguous in rhs, k contiguous in lhs, lhs rows 4-aligned.
+    let nn = lhs_cs == 1
+        && rhs_cs == 1
+        && k.is_multiple_of(4)
+        && batch_aligned
+        && [lhs.1, lhs_rs].iter().all(|v| v.is_multiple_of(4));
+
+    // The NT row-block kernel streams whichever operand has more rows and
+    // blocks the other 16 at a time; the kernel is symmetric in its two
+    // operands up to the dst strides, so a swap is a matter of which buffer
+    // sits in which binding.
+    let dispatch_nt = |dev: &Device| -> Result<()> {
+        let swap = m > n;
+        let (bm, sn) = if swap { (n, m) } else { (m, n) };
+        let (kernel, mr) = row_block_kernel("gemm_nt_sg", bm, 16);
+        let (push, buffers) = if swap {
+            let push = gemm_push(
+                n,
+                m,
+                k,
+                lhs_b,
+                rhs_b_stride,
+                lhs_b_stride,
+                (dst_rs, dst_cs),
+                (rhs_rs, rhs_cs),
+                (lhs_rs, lhs_cs),
+                rhs.1,
+                lhs.1,
+            );
+            (push, [dst.buffer, rhs.0.buffer, lhs.0.buffer])
+        } else {
+            (push_all(), buffers)
+        };
+        let groups = (div_ceil(sn, cols_per_wg), div_ceil(bm, mr), lhs_b as u32);
+        dev.dispatch_labeled(&kernel, label(&kernel), &buffers, &push, groups)
+    };
+    let splittable = dst_cs == 1 && dst_rs == n;
+    let dispatch_tiled = |dev: &Device| -> Result<()> {
+        dispatch_tiled_gemm(dev, dst.buffer, buffers, &push_all(), label, m, n, k, lhs_b, splittable)
+    };
+
+    let tiles16 = m.div_ceil(16) * n.div_ceil(16) * lhs_b;
+    let dispatch_tiled16 = |dev: &Device| -> Result<()> {
+        let groups = (div_ceil(n, 16), div_ceil(m, 16), lhs_b as u32);
+        dev.dispatch_labeled("gemm_tiled16", label("gemm_tiled16"), &buffers, &push_all(), groups)
+    };
+    let dispatch_nn = |dev: &Device| -> Result<()> {
+        let (kernel, mr) = row_block_kernel("gemm_nn_rows", m, 16);
+        let kernel = if nn { kernel } else { format!("{kernel}s") };
+        let groups = (div_ceil(n, 32), div_ceil(m, mr), lhs_b as u32);
+        dev.dispatch_labeled(&kernel, label(&kernel), &buffers, &push_all(), groups)
+    };
+    let nn_any = lhs_cs == 1 && rhs_cs == 1;
+    // The order below follows measurements over Phonon's shapes
+    // (`examples/gemm_shapes_bench.rs`), which is also what the thresholds
+    // encode; `XN_VULKAN_GEMM` overrides it for re-measuring.
+
+    // A pure GEMV streams the long operand coalesced.
+    if nt && m.min(n) == 1 {
+        dispatch_nt(dev)?;
+        return Ok(true);
+    }
+    // A short k: every kernel is bound by moving the operands, and the 16-row
+    // tile wins on small outputs, the 32-row tile on larger ones.
+    if k <= SHORT_K {
+        if m * n * lhs_b <= SHORT_K_TILED16_MAX_OUTPUTS || m < 32 || n < 64 {
+            dispatch_tiled16(dev)?;
+        } else {
+            dispatch_tiled(dev)?;
+        }
+        return Ok(true);
+    }
+    // A row-major `matmul` rhs: the split-k column kernel up to 512 rows,
+    // when there are enough columns for it.
+    if nn_any && n >= ROW_BLOCK_NN_MIN_N && m <= ROW_BLOCK_NN_MAX_M {
+        dispatch_nn(dev)?;
+        return Ok(true);
+    }
+    // Both operands k-contiguous with one side short: stream the long one.
+    if nt && m.min(n) <= ROW_BLOCK_NT_MAX_SHORT_SIDE {
+        dispatch_nt(dev)?;
+        return Ok(true);
+    }
+    // Long in both dimensions: read each operand once, splitting k when the
+    // grid is short.
+    if m >= 32 && n >= 32 {
+        dispatch_tiled(dev)?;
+        return Ok(true);
+    }
+    if tiles16 >= TILED16_MIN_TILES {
+        dispatch_tiled16(dev)?;
+        return Ok(true);
+    }
+    Ok(false)
 }

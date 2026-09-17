@@ -24,7 +24,7 @@ use super::row_block_kernel;
 
 /// Largest `m` the dequantize-fused row-block kernels take, walking `m` in
 /// blocks of 16 and re-reading the weight once per block. Past it the weight
-/// is dequantized once and multiplied by the backend's f32 GEMM, as the CUDA
+/// is dequantized once and multiplied by the tiled f32 GEMM, as the CUDA
 /// backend does with cuBLAS.
 const ROW_BLOCK_MAX: usize = 64;
 
@@ -114,7 +114,7 @@ impl Q8Tensor {
         let m = lhs.shape().elem_count() / k;
         if m > ROW_BLOCK_MAX {
             let w = self.dequantize()?;
-            return lhs.matmul_t(&w);
+            return super::tiled_matmul_t(lhs, &w);
         }
 
         let mut out_dims = dims[..dims.len() - 1].to_vec();
