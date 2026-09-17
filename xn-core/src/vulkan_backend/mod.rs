@@ -58,6 +58,21 @@ fn kernel_def(name: &str) -> Option<(&'static [u8], u32)> {
         };
         return Some((bytes, 2));
     }
+    // q8_0 weight kernels: dst, lhs, quants, scales. Named without a dtype
+    // suffix -- the activation is always f32 and the weight always q8_0.
+    // The `_r<MR>` family is a row-block kernel built once per block height.
+    match name {
+        "gemv_q8" => return Some((GEMV_Q8_F32, 4)),
+        "gemm_q8" => return Some((GEMM_Q8_F32, 4)),
+        "gemv_q8_sg" => return Some((GEMV_Q8_SG_F32, 4)),
+        "gemm_q8_sg_r1" => return Some((GEMM_Q8_SG_R1, 4)),
+        "gemm_q8_sg_r2" => return Some((GEMM_Q8_SG_R2, 4)),
+        "gemm_q8_sg_r4" => return Some((GEMM_Q8_SG_R4, 4)),
+        "gemm_q8_sg_r8" => return Some((GEMM_Q8_SG_R8, 4)),
+        "gemm_q8_sg_r16" => return Some((GEMM_Q8_SG_R16, 4)),
+        "dequant_q8" => return Some((DEQUANT_Q8_F32, 3)),
+        _ => {}
+    }
     let (base, dt) = name.rsplit_once('_')?;
     // Pure data-movement kernels also exist as an i64 (uvec2) variant.
     let i64b: Option<&'static [u8]> = match base {
