@@ -33,6 +33,8 @@ mod shaders {
     include!(concat!(env!("OUT_DIR"), "/vulkan_shaders.rs"));
 }
 
+pub mod quantization;
+
 fn vkerr<E: std::fmt::Debug>(context: &str) -> impl Fn(E) -> crate::Error + '_ {
     move |e| crate::Error::msg(format!("vulkan: {context}: {e:?}"))
 }
@@ -125,6 +127,14 @@ fn kernel_def(name: &str) -> Option<(&'static [u8], u32)> {
 }
 
 const MAX_BINDINGS: usize = 4;
+
+/// Picks the row-block variant of `prefix` for `rows` rows: the smallest power
+/// of two that covers them, capped at `cap`, past which the grid walks the
+/// rows in blocks of `cap`. Returns the kernel name and the block height.
+pub(crate) fn row_block_kernel(prefix: &str, rows: usize, cap: usize) -> (String, u32) {
+    let mr = rows.clamp(1, cap).next_power_of_two() as u32;
+    (format!("{prefix}_r{mr}"), mr)
+}
 const PUSH_CONSTANT_SIZE: u32 = 128;
 const WORKGROUP_SIZE: u32 = 256;
 
