@@ -666,6 +666,20 @@ impl Device {
         push: &Pc,
         groups: (u32, u32, u32),
     ) -> Result<()> {
+        self.dispatch_labeled(kernel, None, buffers, push, groups)
+    }
+
+    /// [`Self::dispatch_nd`] with a profiler label in place of the kernel
+    /// name, so the profile can split a kernel by problem shape. Callers pass
+    /// `None` unless `profile_enabled` is set; the label is otherwise unused.
+    fn dispatch_labeled(
+        &self,
+        kernel: &str,
+        label: Option<String>,
+        buffers: &[vk::Buffer],
+        push: &Pc,
+        groups: (u32, u32, u32),
+    ) -> Result<()> {
         let (gx, gy, gz) = groups;
         if gx == 0 || gy == 0 || gz == 0 {
             return Ok(());
@@ -726,7 +740,7 @@ impl Device {
                     self.query_pool,
                     ctx.n_queries,
                 );
-                ctx.prof_names.push(kernel.to_string());
+                ctx.prof_names.push(label.unwrap_or_else(|| kernel.to_string()));
                 ctx.n_queries += 1;
             }
         }
@@ -892,13 +906,14 @@ impl DeviceInner {
         let mut rows: Vec<_> = stats.per_kernel.iter().collect();
         rows.sort_by_key(|r| std::cmp::Reverse(r.1.1));
         eprintln!("\n=== xn vulkan profile: {} ===", self.device_name);
+        let width = rows.iter().map(|r| r.0.len()).max().unwrap_or(22).max(22);
         eprintln!(
-            "{:<22} {:>9} {:>11} {:>9} {:>7}",
+            "{:<width$} {:>9} {:>11} {:>9} {:>7}",
             "kernel", "count", "total ms", "avg us", "%gpu"
         );
         for (name, (cnt, ns)) in rows {
             eprintln!(
-                "{:<22} {:>9} {:>11.2} {:>9.1} {:>6.1}%",
+                "{:<width$} {:>9} {:>11.2} {:>9.1} {:>6.1}%",
                 name,
                 cnt,
                 *ns as f64 / 1e6,

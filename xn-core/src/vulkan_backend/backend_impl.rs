@@ -482,18 +482,29 @@ impl crate::Backend for Device {
             .usize(dst_cs)
             .usize(lhs.1)
             .usize(rhs.1);
+        // Profile rows split by shape and layout: `l`/`r` are the (col, row)
+        // element strides of lhs and rhs, so `r1,k` is a row-major weight
+        // read as `matmul_t` and `rn,1` a row-major rhs read as `matmul`.
+        let label = |kernel: &str| {
+            dst.device.profile_enabled.then(|| {
+                format!("{kernel} m{m} n{n} k{k} b{lhs_b} l{lhs_cs},{lhs_rs} r{rhs_cs},{rhs_rs}")
+            })
+        };
         if m == 1 {
             // Decode path: one workgroup per output column, grid (n, batch, 1).
             // rhs is bound twice: once scalar, once as a vec4 view for the
             // shader's aligned-fast-path loads (see gemv.comp).
             let buffers = [dst.buffer, lhs.0.buffer, rhs.0.buffer, rhs.0.buffer];
-            dst.device.dispatch_nd(&format!("gemv_{dt}"), &buffers, &push, (n as u32, lhs_b as u32, 1))
+            let kernel = format!("gemv_{dt}");
+            let groups = (n as u32, lhs_b as u32, 1);
+            dst.device.dispatch_labeled(&kernel, label(&kernel), &buffers, &push, groups)
         } else {
             let buffers = [dst.buffer, lhs.0.buffer, rhs.0.buffer];
             // Tiled kernel: grid (ceil(n/16), ceil(m/16), batch), local (16, 16, 1).
             const TILE: u32 = 16;
             let groups = (div_ceil(n, TILE), div_ceil(m, TILE), lhs_b as u32);
-            dst.device.dispatch_nd(&format!("gemm_tiled_{dt}"), &buffers, &push, groups)
+            let kernel = format!("gemm_tiled_{dt}");
+            dst.device.dispatch_labeled(&kernel, label(&kernel), &buffers, &push, groups)
         }
     }
 

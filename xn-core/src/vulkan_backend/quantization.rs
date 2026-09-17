@@ -132,6 +132,8 @@ impl Q8Tensor {
             let qs_s = self.qs.storage()?;
             let sc_s = self.scales.storage()?;
             let buffers = [out_s.buffer, lhs_s.buffer, qs_s.buffer, sc_s.buffer];
+            let label =
+                |kernel: &str| dev.profile_enabled.then(|| format!("{kernel} m{m} n{n} k{k}"));
             // One subgroup per output column where subgroup arithmetic
             // exists: gemv_q8_sg.comp at m == 1, else gemm_q8_sg.comp with
             // the smallest row block that covers m (capped at 16, above which
@@ -140,20 +142,26 @@ impl Q8Tensor {
             match super::WORKGROUP_SIZE.checked_div(dev.subgroup_size()) {
                 Some(cols_per_wg) if m == 1 => {
                     let groups = (div_ceil(n, cols_per_wg), 1, 1);
-                    dev.dispatch_nd("gemv_q8_sg", &buffers, &push, groups)?;
+                    dev.dispatch_labeled(
+                        "gemv_q8_sg",
+                        label("gemv_q8_sg"),
+                        &buffers,
+                        &push,
+                        groups,
+                    )?;
                 }
                 Some(cols_per_wg) => {
                     let (kernel, mr) = row_block_kernel("gemm_q8_sg", m, 16);
                     let groups = (div_ceil(n, cols_per_wg), div_ceil(m, mr), 1);
-                    dev.dispatch_nd(&kernel, &buffers, &push, groups)?;
+                    dev.dispatch_labeled(&kernel, label(&kernel), &buffers, &push, groups)?;
                 }
                 None if m == 1 => {
                     let groups = (div_ceil(n, 4), 1, 1);
-                    dev.dispatch_nd("gemv_q8", &buffers, &push, groups)?;
+                    dev.dispatch_labeled("gemv_q8", label("gemv_q8"), &buffers, &push, groups)?;
                 }
                 None => {
                     let groups = (div_ceil(n, 4), div_ceil(m, 4), 1);
-                    dev.dispatch_nd("gemm_q8", &buffers, &push, groups)?;
+                    dev.dispatch_labeled("gemm_q8", label("gemm_q8"), &buffers, &push, groups)?;
                 }
             }
         }
