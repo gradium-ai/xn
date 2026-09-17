@@ -894,3 +894,89 @@ fn q8_linear_matches_dequantized() -> Result<()> {
     assert_close(&want, &got, 1e-4);
     Ok(())
 }
+
+// f32 row-block GEMMs (gemm_nt_sg / gemm_nn_rows): the shapes Phonon's Mimi
+// decoder and flow net issue, plus edges (partial row blocks, k not a
+// multiple of 4, batched with a broadcast 2D rhs), against the CPU backend.
+
+fn cmp_matmul_t_shape(m: usize, k: usize, n: usize, batch: usize) -> Result<()> {
+    let a: Vec<f32> = (0..batch * m * k).map(|i| ((i % 53) as f32 - 26.0) * 0.021).collect();
+    let b: Vec<f32> = (0..batch * n * k).map(|i| ((i % 71) as f32 - 35.0) * 0.013).collect();
+    let (as_, bs): (Vec<usize>, Vec<usize>) =
+        if batch == 1 { (vec![m, k], vec![n, k]) } else { (vec![batch, m, k], vec![batch, n, k]) };
+    let av: Tensor<f32, Vk> = Tensor::from_vec(a.clone(), as_.clone(), &dev())?;
+    let bv: Tensor<f32, Vk> = Tensor::from_vec(b.clone(), bs.clone(), &dev())?;
+    let ac: Tensor<f32, _> = Tensor::from_vec(a, as_, &CPU)?;
+    let bc: Tensor<f32, _> = Tensor::from_vec(b, bs, &CPU)?;
+    assert_close(&ac.matmul_t(&bc)?.to_vec()?, &av.matmul_t(&bv)?.to_vec()?, 1e-3);
+    Ok(())
+}
+
+#[test]
+fn matmul_t_row_block_shapes() -> Result<()> {
+    // (m, k, n, batch): streamed rhs with m blocked, then swapped (n small,
+    // m streamed), then partial blocks and the vec4-alignment fallbacks.
+    for (m, k, n, b) in [
+        (1, 512, 512, 1),
+        (1, 64, 176, 16),
+        (16, 2048, 512, 1),
+        (16, 64, 266, 8),
+        (96, 768, 128, 1),
+        (480, 384, 64, 1),
+        (1920, 192, 1, 1),
+        (1920, 32, 64, 1),
+        (33, 128, 40, 2),
+        (5, 36, 7, 3),
+        (7, 30, 200, 1),
+        (200, 30, 7, 1),
+        (16, 70, 64, 1),
+    ] {
+        cmp_matmul_t_shape(m, k, n, b)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn matmul_t_broadcast_rhs() -> Result<()> {
+    // A 2D weight against a batched lhs: rhs batch stride 0.
+    let (b, m, k, n) = (4usize, 6usize, 128usize, 40usize);
+    let a: Vec<f32> = (0..b * m * k).map(|i| ((i % 53) as f32 - 26.0) * 0.021).collect();
+    let w: Vec<f32> = (0..n * k).map(|i| ((i % 71) as f32 - 35.0) * 0.013).collect();
+    let av: Tensor<f32, Vk> = Tensor::from_vec(a.clone(), (b, m, k), &dev())?;
+    let wv: Tensor<f32, Vk> = Tensor::from_vec(w.clone(), (n, k), &dev())?;
+    let ac: Tensor<f32, _> = Tensor::from_vec(a, (b, m, k), &CPU)?;
+    let wc: Tensor<f32, _> = Tensor::from_vec(w, (n, k), &CPU)?;
+    assert_close(&ac.matmul_t(&wc)?.to_vec()?, &av.matmul_t(&wv)?.to_vec()?, 1e-3);
+    Ok(())
+}
+
+#[test]
+fn matmul_row_block_shapes() -> Result<()> {
+    // NN through gemm_nn_rows: (m, k, n, batch), including k % 4 != 0 and
+    // partial row blocks, and n < 64 which stays on the tiled kernel.
+    for (m, k, n, b) in [
+        (16, 512, 3072, 1),
+        (96, 256, 1280, 1),
+        (480, 128, 512, 1),
+        (16, 266, 64, 8),
+        (33, 45, 100, 2),
+        (3, 10, 64, 1),
+        (16, 64, 40, 1),
+    ] {
+        cmp_matmul(m, k, n, b)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn matmul_tiled64_shapes() -> Result<()> {
+    // Both dimensions past 64 with enough tiles: gemm_tiled64 in both
+    // layouts, with ragged edges in m, n and k.
+    for (m, k, n, b) in
+        [(125, 1024, 3072, 1), (480, 128, 512, 1), (200, 70, 130, 3), (64, 16, 3072, 1)]
+    {
+        cmp_matmul_t_shape(m, k, n, b)?;
+        cmp_matmul(m, k, n, b)?;
+    }
+    Ok(())
+}
