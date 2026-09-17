@@ -1,0 +1,186 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+// f32 tiled GEMM, general strides and batch, for problems large in both m
+// and n:
+//   dst[b, i, j] = sum_l lhs[b, i, l] * rhs[b, l, j]
+// Element offsets, as in gemm_tiled.comp:
+//   lhs: lhs_o + b*lhs_b_stride + i*lhs_rs + l*lhs_cs
+//   rhs: rhs_o + b*rhs_b_stride + l*rhs_rs + j*rhs_cs
+//   dst:              b*m*n     + i*dst_rs + j*dst_cs
+// Grid: (ceil(n/64), ceil(m/TM), batch * ksplit); local size TM * 4 (256
+// for the 64-row tile, 128 for the 32-row one built with -DTM=32 for small
+// grids).
+//
+// A TMx64 output tile per workgroup, staged 32 deep in k through shared
+// memory, each thread owning a 4x4 patch. A grid too small to fill the GPU
+// is split along k as well: each split computes a partial tile into its own
+// slice of a workspace and ksplit_reduce.comp sums the slices. Each operand is read from global
+// memory once per tile row/column, which is what the row-block kernels give
+// up: they stream one operand once per 16 rows of the other, which is right
+// for small problems and wrong once both sides are long.
+//
+// Tile loads map consecutive threads onto whichever dimension of the operand
+// is contiguous (k for a `matmul_t` weight, n for a `matmul` weight, either
+// for lhs), so the loads coalesce in both layouts. The staged tiles are
+// k-major with a row stride one past the tile edge, so that a warp storing
+// sixteen consecutive k of one row lands on sixteen banks rather than one,
+// and a thread's four rows and columns are interleaved (tx, tx + 16, ...)
+// so that the compute loop's reads from a row of threads are consecutive.
+#ifndef TM
+#define TM 64
+#endif
+// TM/4 rows of threads by 16 columns of threads.
+layout(local_size_x = TM * 4) in;
+
+layout(std430, set = 0, binding = 0) writeonly buffer D { float dst[]; };
+layout(std430, set = 0, binding = 1) readonly buffer L { float lhs[]; };
+layout(std430, set = 0, binding = 2) readonly buffer R { float rhs[]; };
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint n;
+    uint k;
+    uint batch;
+    uint lhs_b_stride;
+    uint rhs_b_stride;
+    uint lhs_cs;
+    uint lhs_rs;
+    uint rhs_cs;
+    uint rhs_rs;
+    uint dst_rs;
+    uint dst_cs;
+    uint lhs_o;
+    uint rhs_o;
+    // Ways k is split across workgroups (grid z = batch * ksplit). Past 1,
+    // each split writes its partial tile to dst + split * batch*m*n and the
+    // host sums them with ksplit_reduce.comp.
+    uint ksplit;
+} pc;
+
+const uint TN = 64u;
+const uint TK = 32u;
+const uint RT = 4u;
+const uint NT = uint(TM) * 4u;   // threads
+const uint TMP = uint(TM) + 1u;  // padded row strides
+const uint TNP = TN + 1u;
+const uint RSTEP = uint(TM) / RT;  // row interleave: thread ty owns ty + r*RSTEP
+const uint A_PER_THREAD = uint(TM) * TK / NT;  // 8
+const uint B_PER_THREAD = TN * TK / NT;        // 8 or 16
+
+shared float at[TK * TMP];  // [k][row]
+shared float bt[TK * TNP];  // [k][col]
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint tx = tid % 16u;
+    uint ty = tid / 16u;
+    uint row0 = gl_WorkGroupID.y * uint(TM);
+    uint col0 = gl_WorkGroupID.x * TN;
+    uint b = gl_WorkGroupID.z % pc.batch;
+    uint split = gl_WorkGroupID.z / pc.batch;
+    // This split's k range, a multiple of TK long except for the last.
+    uint kper = ((pc.k + pc.ksplit - 1u) / pc.ksplit + TK - 1u) / TK * TK;
+    uint kbeg = min(pc.k, split * kper);
+    uint kend = min(pc.k, kbeg + kper);
+
+    uint lbase = pc.lhs_o + b * pc.lhs_b_stride;
+    uint rbase = pc.rhs_o + b * pc.rhs_b_stride;
+    // Which tile dimension consecutive threads walk when loading.
+    bool lhs_k_fast = pc.lhs_cs == 1u;
+    bool rhs_n_fast = pc.rhs_cs == 1u;
+
+    float acc[RT * RT];
+    [[unroll]] for (uint i = 0u; i < RT * RT; i++) {
+        acc[i] = 0.0;
+    }
+
+    for (uint k0 = kbeg; k0 < kend; k0 += TK) {
+        // All of a thread's loads first, then the shared stores, so the
+        // loads overlap instead of each waiting behind the previous store.
+        float av[A_PER_THREAD];
+        [[unroll]] for (uint s = 0u; s < A_PER_THREAD; s++) {
+            uint idx = tid + s * NT;
+            uint ar, ak;
+            if (lhs_k_fast) {
+                ak = idx % TK;
+                ar = idx / TK;
+            } else {
+                ar = idx % uint(TM);
+                ak = idx / uint(TM);
+            }
+            uint gi = row0 + ar;
+            uint gk = k0 + ak;
+            av[s] = (gi < pc.m && gk < kend) ? lhs[lbase + gi * pc.lhs_rs + gk * pc.lhs_cs] : 0.0;
+        }
+        float bv[B_PER_THREAD];
+        [[unroll]] for (uint s = 0u; s < B_PER_THREAD; s++) {
+            uint idx = tid + s * NT;
+            uint bc, bk;
+            if (rhs_n_fast) {
+                bc = idx % TN;
+                bk = idx / TN;
+            } else {
+                bk = idx % TK;
+                bc = idx / TK;
+            }
+            uint gj = col0 + bc;
+            uint gk2 = k0 + bk;
+            bv[s] = (gj < pc.n && gk2 < kend) ? rhs[rbase + gk2 * pc.rhs_rs + gj * pc.rhs_cs] : 0.0;
+        }
+        [[unroll]] for (uint s = 0u; s < A_PER_THREAD; s++) {
+            uint idx = tid + s * NT;
+            uint ar, ak;
+            if (lhs_k_fast) {
+                ak = idx % TK;
+                ar = idx / TK;
+            } else {
+                ar = idx % uint(TM);
+                ak = idx / uint(TM);
+            }
+            at[ak * TMP + ar] = av[s];
+        }
+        [[unroll]] for (uint s = 0u; s < B_PER_THREAD; s++) {
+            uint idx = tid + s * NT;
+            uint bc, bk;
+            if (rhs_n_fast) {
+                bc = idx % TN;
+                bk = idx / TN;
+            } else {
+                bk = idx % TK;
+                bc = idx / TK;
+            }
+            bt[bk * TNP + bc] = bv[s];
+        }
+        barrier();
+
+        [[unroll]] for (uint kk = 0u; kk < TK; kk++) {
+            float a0 = at[kk * TMP + ty];
+            float a1 = at[kk * TMP + ty + RSTEP];
+            float a2 = at[kk * TMP + ty + 2u * RSTEP];
+            float a3 = at[kk * TMP + ty + 3u * RSTEP];
+            float b0 = bt[kk * TNP + tx];
+            float b1 = bt[kk * TNP + tx + 16u];
+            float b2 = bt[kk * TNP + tx + 32u];
+            float b3 = bt[kk * TNP + tx + 48u];
+            acc[0] = fma(a0, b0, acc[0]); acc[1] = fma(a0, b1, acc[1]); acc[2] = fma(a0, b2, acc[2]); acc[3] = fma(a0, b3, acc[3]);
+            acc[4] = fma(a1, b0, acc[4]); acc[5] = fma(a1, b1, acc[5]); acc[6] = fma(a1, b2, acc[6]); acc[7] = fma(a1, b3, acc[7]);
+            acc[8] = fma(a2, b0, acc[8]); acc[9] = fma(a2, b1, acc[9]); acc[10] = fma(a2, b2, acc[10]); acc[11] = fma(a2, b3, acc[11]);
+            acc[12] = fma(a3, b0, acc[12]); acc[13] = fma(a3, b1, acc[13]); acc[14] = fma(a3, b2, acc[14]); acc[15] = fma(a3, b3, acc[15]);
+        }
+        barrier();
+    }
+
+    uint dbase = (split * pc.batch + b) * pc.m * pc.n;
+    [[unroll]] for (uint r = 0u; r < RT; r++) {
+        uint gi = row0 + ty + r * RSTEP;
+        if (gi >= pc.m) {
+            continue;
+        }
+        [[unroll]] for (uint c = 0u; c < RT; c++) {
+            uint gj = col0 + tx + c * 16u;
+            if (gj < pc.n) {
+                dst[dbase + gi * pc.dst_rs + gj * pc.dst_cs] = acc[r * RT + c];
+            }
+        }
+    }
+}

@@ -1,0 +1,25 @@
+#version 450
+// Sums the `splits` partial results of a split-k GEMM (see gemm_tiled64.comp):
+//   dst[i] = sum_s ws[s * total + i]   for i < total
+// Grid: (ceil(total / 256), 1, 1); local size 256.
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) writeonly buffer D { float dst[]; };
+layout(std430, set = 0, binding = 1) readonly buffer W { float ws[]; };
+
+layout(push_constant) uniform PC {
+    uint total;
+    uint splits;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.total) {
+        return;
+    }
+    float s = 0.0;
+    for (uint sp = 0u; sp < pc.splits; sp++) {
+        s += ws[sp * pc.total + i];
+    }
+    dst[i] = s;
+}

@@ -1,0 +1,132 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+// f32 GEMM for a row-major rhs (`matmul`, rhs `(k, n)` with n contiguous):
+//   dst[b, i, j] = sum_l lhs[b, i, l] * rhs[b, l, j]
+// Grid: (ceil(n / 32), ceil(m / MR), batch); local size 256; built once per
+// MR in 1..=16, each in a vec4-lhs and a scalar-lhs (`-DLHS_SCALAR`) form.
+//
+// A workgroup owns 32 consecutive columns and MR rows. Its 256 threads are
+// eight groups of 32: within a group, lane = column, so a k step is one
+// coalesced 128-byte read of a row of rhs; the eight groups split k eight
+// ways and the partial sums meet in shared memory at the end. Splitting k
+// inside the workgroup is what gives a small-m problem enough threads: at
+// m = 16, n = 3072 a plain thread-per-column layout is 12 workgroups on a
+// GPU with 58 SMs, and latency-bound at that.
+//
+// Four k steps go together: the MR lhs values each needs are the same for
+// every thread of a group (a broadcast out of L1), read as one vec4 per row
+// when the rows are 4-aligned and k % 4 == 0, else as scalars. Each rhs
+// element is read once per row block. Rows past m and columns past n are
+// clamped and dropped at store time.
+//
+// Preconditions checked on the host: lhs_cs == 1 and rhs_cs == 1; for the
+// vec4 form also k % 4 == 0 and 4-aligned lhs row starts.
+#ifndef MR
+#define MR 4
+#endif
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) writeonly buffer D { float dst[]; };
+#ifdef LHS_SCALAR
+layout(std430, set = 0, binding = 1) readonly buffer L { float lhs[]; };
+#else
+layout(std430, set = 0, binding = 1) readonly buffer L { vec4 lhs4[]; };
+#endif
+layout(std430, set = 0, binding = 2) readonly buffer R { float rhs[]; };
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint n;
+    uint k;
+    uint batch;
+    uint lhs_b_stride;
+    uint rhs_b_stride;
+    uint lhs_cs;
+    uint lhs_rs;
+    uint rhs_cs;
+    uint rhs_rs;
+    uint dst_rs;
+    uint dst_cs;
+    uint lhs_o;
+    uint rhs_o;
+} pc;
+
+const uint COLS = 32u;
+const uint SPLITS = 8u;
+
+// [split][row][col] partial sums.
+shared float red[SPLITS * MR * COLS];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint col = tid % COLS;
+    uint split = tid / COLS;
+    uint j = gl_WorkGroupID.x * COLS + col;
+    uint i0 = gl_WorkGroupID.y * uint(MR);
+    uint b = gl_WorkGroupID.z;
+
+    uint jj = min(j, pc.n - 1u);
+    uint rcol = pc.rhs_o + b * pc.rhs_b_stride + jj;
+    uint lbase = pc.lhs_o + b * pc.lhs_b_stride;
+    uint lrow[MR];
+    [[unroll]] for (int r = 0; r < MR; r++) {
+        lrow[r] = lbase + min(i0 + uint(r), pc.m - 1u) * pc.lhs_rs;
+    }
+
+    // This group's k range, a multiple of 4 long except for the last.
+    uint ks = ((pc.k + SPLITS - 1u) / SPLITS + 3u) & ~3u;
+    uint l0 = min(pc.k, split * ks);
+    uint l1 = min(pc.k, l0 + ks);
+
+    float acc[MR];
+    [[unroll]] for (int r = 0; r < MR; r++) {
+        acc[r] = 0.0;
+    }
+    uint l = l0;
+    for (; l + 4u <= l1; l += 4u) {
+        float b0 = rhs[rcol + (l + 0u) * pc.rhs_rs];
+        float b1 = rhs[rcol + (l + 1u) * pc.rhs_rs];
+        float b2 = rhs[rcol + (l + 2u) * pc.rhs_rs];
+        float b3 = rhs[rcol + (l + 3u) * pc.rhs_rs];
+        [[unroll]] for (int r = 0; r < MR; r++) {
+#ifdef LHS_SCALAR
+            vec4 a = vec4(lhs[lrow[r] + l], lhs[lrow[r] + l + 1u], lhs[lrow[r] + l + 2u], lhs[lrow[r] + l + 3u]);
+#else
+            vec4 a = lhs4[(lrow[r] + l) >> 2u];
+#endif
+            acc[r] = fma(a.x, b0, acc[r]);
+            acc[r] = fma(a.y, b1, acc[r]);
+            acc[r] = fma(a.z, b2, acc[r]);
+            acc[r] = fma(a.w, b3, acc[r]);
+        }
+    }
+#ifdef LHS_SCALAR
+    for (; l < l1; l++) {
+        float bv = rhs[rcol + l * pc.rhs_rs];
+        [[unroll]] for (int r = 0; r < MR; r++) {
+            acc[r] = fma(lhs[lrow[r] + l], bv, acc[r]);
+        }
+    }
+#endif
+    [[unroll]] for (int r = 0; r < MR; r++) {
+        red[(split * uint(MR) + uint(r)) * COLS + col] = acc[r];
+    }
+    barrier();
+
+    // MR * 32 outputs, reduced over the eight splits; each thread takes
+    // every 256th.
+    uint dbase = b * pc.m * pc.n;
+    for (uint o = tid; o < uint(MR) * COLS; o += 256u) {
+        uint r = o / COLS;
+        uint c = o % COLS;
+        float s = 0.0;
+        [[unroll]] for (uint sp = 0u; sp < SPLITS; sp++) {
+            s += red[(sp * uint(MR) + r) * COLS + c];
+        }
+        uint ii = i0 + r;
+        uint jo = gl_WorkGroupID.x * COLS + c;
+        if (ii < pc.m && jo < pc.n) {
+            dst[dbase + ii * pc.dst_rs + jo * pc.dst_cs] = s;
+        }
+    }
+}

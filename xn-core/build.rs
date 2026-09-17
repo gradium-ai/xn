@@ -83,10 +83,30 @@ fn build_vulkan_shaders() {
             ("R8", "vulkan1.1", Some("MR=8")),
             ("R16", "vulkan1.1", Some("MR=16")),
         ];
+        // The NN split-k kernel also comes with scalar lhs loads, for rows
+        // that are not 4-aligned.
+        let row_blocks_scalar: Vec<(&str, &str, Option<&str>)> = [
+            ("R1S", "MR=1 -DLHS_SCALAR"),
+            ("R2S", "MR=2 -DLHS_SCALAR"),
+            ("R4S", "MR=4 -DLHS_SCALAR"),
+            ("R8S", "MR=8 -DLHS_SCALAR"),
+            ("R16S", "MR=16 -DLHS_SCALAR"),
+        ]
+        .iter()
+        .map(|(s, d)| (*s, "vulkan1.1", Some(*d)))
+        .collect();
         let shader_variants: Vec<_> = match stem {
-            "gemv_q8" | "gemm_q8" | "dequant_q8" => f32_only.to_vec(),
+            "gemv_q8" | "gemm_q8" | "gemm_tiled16" | "dequant_q8" | "ksplit_reduce" => {
+                f32_only.to_vec()
+            }
+            // 64- and 32-row output tiles.
+            "gemm_tiled64" => {
+                vec![("F32", "vulkan1.0", None), ("TM32", "vulkan1.0", Some("TM=32"))]
+            }
             "gemv_q8_sg" => f32_subgroup.to_vec(),
-            "gemm_q8_sg" => row_blocks.to_vec(),
+            // Row-block kernels stage or broadcast MR rows and stop at 16.
+            "gemm_q8_sg" | "gemm_nt_sg" => row_blocks.to_vec(),
+            "gemm_nn_rows" => row_blocks.iter().copied().chain(row_blocks_scalar).collect(),
             _ => variants.iter().chain(i64_variant).copied().collect(),
         };
         for (suffix, target, define) in shader_variants {
@@ -94,7 +114,10 @@ fn build_vulkan_shaders() {
             let mut cmd = std::process::Command::new("glslc");
             cmd.arg(format!("--target-env={target}")).arg("-O");
             if let Some(d) = define {
-                cmd.arg(format!("-D{d}"));
+                // "A=1 -DB" style entries carry more than one define.
+                for part in d.split(" -D") {
+                    cmd.arg(format!("-D{part}"));
+                }
             }
             let status = cmd
                 .arg("-o")

@@ -1,0 +1,126 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+// f32 GEMM with 16x16 output tiles, one output per thread, k staged 128 at a
+// time through shared memory:
+//   dst[b, i, j] = sum_l lhs[b, i, l] * rhs[b, l, j]
+// General strides (offsets as in gemm_tiled.comp). Grid: (ceil(n/16),
+// ceil(m/16), batch); local size 256.
+//
+// The kernel for problems too small for the 64- and 32-row tiles to fill the
+// GPU and too big in m for a row-block kernel to be anything but fixed cost:
+// a 16x16 tile makes a 1920 x 32 problem 240 workgroups, and a workgroup's
+// only per-chunk overhead is two barriers. Each operand tile is read from
+// global memory once per 16 rows or columns of the other, with consecutive
+// threads walking whichever dimension of the operand is contiguous so the
+// loads coalesce in both layouts. The stride-(KC + 1) padding keeps the 16
+// columns a row of threads reads on distinct banks.
+//
+// Staging loads all of a thread's elements into registers before storing
+// any: with a fixed trip count the compiler issues the eight loads back to
+// back, where a loop that stores each value as it arrives would pay eight
+// memory latencies in a row.
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) writeonly buffer D { float dst[]; };
+layout(std430, set = 0, binding = 1) readonly buffer L { float lhs[]; };
+layout(std430, set = 0, binding = 2) readonly buffer R { float rhs[]; };
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint n;
+    uint k;
+    uint batch;
+    uint lhs_b_stride;
+    uint rhs_b_stride;
+    uint lhs_cs;
+    uint lhs_rs;
+    uint rhs_cs;
+    uint rhs_rs;
+    uint dst_rs;
+    uint dst_cs;
+    uint lhs_o;
+    uint rhs_o;
+} pc;
+
+const uint T = 16u;
+const uint KC = 128u;
+const uint KP = KC + 1u;
+const uint PER_THREAD = T * KC / 256u;  // 8 elements of each operand tile
+
+shared float at[T * KP];  // [row][k]
+shared float bt[T * KP];  // [col][k]
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint tj = tid % T;
+    uint ti = tid / T;
+    uint row0 = gl_WorkGroupID.y * T;
+    uint col0 = gl_WorkGroupID.x * T;
+    uint b = gl_WorkGroupID.z;
+
+    uint lbase = pc.lhs_o + b * pc.lhs_b_stride;
+    uint rbase = pc.rhs_o + b * pc.rhs_b_stride;
+    bool lhs_k_fast = pc.lhs_cs == 1u;
+    bool rhs_k_fast = pc.rhs_rs == 1u;
+
+    float acc = 0.0;
+    for (uint k0 = 0u; k0 < pc.k; k0 += KC) {
+        uint kc = min(KC, pc.k - k0);
+        float av[PER_THREAD];
+        float bv[PER_THREAD];
+        [[unroll]] for (uint s = 0u; s < PER_THREAD; s++) {
+            uint e = tid + s * 256u;
+            uint r, l;
+            if (lhs_k_fast) {
+                l = e % KC;
+                r = e / KC;
+            } else {
+                r = e % T;
+                l = e / T;
+            }
+            uint gi = row0 + r;
+            av[s] = (gi < pc.m && l < kc) ? lhs[lbase + gi * pc.lhs_rs + (k0 + l) * pc.lhs_cs] : 0.0;
+            uint c, l2;
+            if (rhs_k_fast) {
+                l2 = e % KC;
+                c = e / KC;
+            } else {
+                c = e % T;
+                l2 = e / T;
+            }
+            uint gj = col0 + c;
+            bv[s] = (gj < pc.n && l2 < kc) ? rhs[rbase + (k0 + l2) * pc.rhs_rs + gj * pc.rhs_cs] : 0.0;
+        }
+        [[unroll]] for (uint s = 0u; s < PER_THREAD; s++) {
+            uint e = tid + s * 256u;
+            uint r, l;
+            if (lhs_k_fast) {
+                l = e % KC;
+                r = e / KC;
+            } else {
+                r = e % T;
+                l = e / T;
+            }
+            at[r * KP + l] = av[s];
+            uint c, l2;
+            if (rhs_k_fast) {
+                l2 = e % KC;
+                c = e / KC;
+            } else {
+                c = e % T;
+                l2 = e / T;
+            }
+            bt[c * KP + l2] = bv[s];
+        }
+        barrier();
+        for (uint l = 0u; l < kc; l++) {
+            acc = fma(at[ti * KP + l], bt[tj * KP + l], acc);
+        }
+        barrier();
+    }
+    uint gi = row0 + ti;
+    uint gj = col0 + tj;
+    if (gi < pc.m && gj < pc.n) {
+        dst[b * pc.m * pc.n + gi * pc.dst_rs + gj * pc.dst_cs] = acc;
+    }
+}

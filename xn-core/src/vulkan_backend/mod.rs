@@ -73,6 +73,26 @@ fn kernel_def(name: &str) -> Option<(&'static [u8], u32)> {
         "gemm_q8_sg_r8" => return Some((GEMM_Q8_SG_R8, 4)),
         "gemm_q8_sg_r16" => return Some((GEMM_Q8_SG_R16, 4)),
         "dequant_q8" => return Some((DEQUANT_Q8_F32, 3)),
+        // f32 GEMMs: dst, lhs, rhs.
+        "gemm_tiled64" => return Some((GEMM_TILED64_F32, 3)),
+        "gemm_tiled32" => return Some((GEMM_TILED64_TM32, 3)),
+        "gemm_tiled16" => return Some((GEMM_TILED16_F32, 3)),
+        "ksplit_reduce" => return Some((KSPLIT_REDUCE_F32, 2)),
+        "gemm_nt_sg_r1" => return Some((GEMM_NT_SG_R1, 3)),
+        "gemm_nt_sg_r2" => return Some((GEMM_NT_SG_R2, 3)),
+        "gemm_nt_sg_r4" => return Some((GEMM_NT_SG_R4, 3)),
+        "gemm_nt_sg_r8" => return Some((GEMM_NT_SG_R8, 3)),
+        "gemm_nt_sg_r16" => return Some((GEMM_NT_SG_R16, 3)),
+        "gemm_nn_rows_r1" => return Some((GEMM_NN_ROWS_R1, 3)),
+        "gemm_nn_rows_r2" => return Some((GEMM_NN_ROWS_R2, 3)),
+        "gemm_nn_rows_r4" => return Some((GEMM_NN_ROWS_R4, 3)),
+        "gemm_nn_rows_r8" => return Some((GEMM_NN_ROWS_R8, 3)),
+        "gemm_nn_rows_r16" => return Some((GEMM_NN_ROWS_R16, 3)),
+        "gemm_nn_rows_r1s" => return Some((GEMM_NN_ROWS_R1S, 3)),
+        "gemm_nn_rows_r2s" => return Some((GEMM_NN_ROWS_R2S, 3)),
+        "gemm_nn_rows_r4s" => return Some((GEMM_NN_ROWS_R4S, 3)),
+        "gemm_nn_rows_r8s" => return Some((GEMM_NN_ROWS_R8S, 3)),
+        "gemm_nn_rows_r16s" => return Some((GEMM_NN_ROWS_R16S, 3)),
         _ => {}
     }
     let (base, dt) = name.rsplit_once('_')?;
@@ -139,7 +159,7 @@ const PUSH_CONSTANT_SIZE: u32 = 128;
 const WORKGROUP_SIZE: u32 = 256;
 
 /// Little-endian push-constant byte builder.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Pc {
     bytes: Vec<u8>,
 }

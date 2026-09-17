@@ -1,0 +1,127 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+// f32 GEMM for the "both operands k-contiguous" layout, subgroup-per-row:
+//   dst[b, i, j] = sum_l lhs[b, i, l] * rhs[b, j, l]
+// i.e. `matmul_t` against a row-major weight, or any product where the inner
+// dimension is contiguous on both sides. Grid: (ceil(n / (256 / sg)),
+// ceil(m / MR), batch); local size 256; built once per MR in 1..=16.
+//
+// One subgroup owns one rhs row j; the workgroup's eight subgroups share a
+// block of MR lhs rows, staged through shared memory 256 k at a time so the
+// block is read from L2 once per workgroup rather than once per subgroup (at
+// MR = 16 and k = 2048 that difference is 8 MB against 64 MB of traffic for
+// a 4 MB weight). Within a chunk each lane takes two vec4 of the rhs row,
+// issued before the staging barrier so the two global-load latencies
+// overlap, and the MR partial sums are reduced with `subgroupAdd` once at
+// the end. For m == 1 this is the GEMV. Lanes past 32 (a 64-wide subgroup)
+// idle in the compute step.
+//
+// The host decides which operand is "rhs" here: whichever of the two matrices
+// is longer is streamed and the shorter one is blocked, so m x n x k and
+// n x m x k are the same kernel with the operands and the dst strides
+// swapped. A blocked dimension past MR is walked by the grid, re-reading the
+// streamed operand once per block. Rows past m or n are clamped and dropped
+// at store time, as Vulkan storage reads are not bounds-checked.
+//
+// Preconditions checked on the host: lhs_cs == rhs_rs == 1, k % 4 == 0, and
+// every row start (offset, batch stride, row stride) a multiple of 4 so the
+// vec4 views are aligned.
+#ifndef MR
+#define MR 4
+#endif
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) writeonly buffer D { float dst[]; };
+layout(std430, set = 0, binding = 1) readonly buffer L { vec4 lhs4[]; };
+layout(std430, set = 0, binding = 2) readonly buffer R { vec4 rhs4[]; };
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint n;
+    uint k;
+    uint batch;
+    uint lhs_b_stride;
+    uint rhs_b_stride;
+    uint lhs_cs;
+    uint lhs_rs;
+    uint rhs_cs;
+    uint rhs_rs;
+    uint dst_rs;
+    uint dst_cs;
+    uint lhs_o;
+    uint rhs_o;
+} pc;
+
+// k chunk staged per step, in vec4 units (256 floats): two per lane.
+const uint KC4 = 64u;
+const uint LANES = 32u;
+const uint NSTAGE = (uint(MR) * KC4 + 255u) / 256u;  // staging loads per thread
+
+shared vec4 lsh[MR * KC4];  // [row][vec4 within chunk]
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint j = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+    uint i0 = gl_WorkGroupID.y * uint(MR);
+    uint b = gl_WorkGroupID.z;
+    uint lane = gl_SubgroupInvocationID;
+
+    uint k4 = pc.k >> 2u;
+    uint jj = min(j, pc.n - 1u);
+    // Element offsets divided by 4: everything is 4-aligned by precondition.
+    uint rrow = (pc.rhs_o + b * pc.rhs_b_stride + jj * pc.rhs_cs) >> 2u;
+    uint lbase = (pc.lhs_o + b * pc.lhs_b_stride) >> 2u;
+    uint lrs4 = pc.lhs_rs >> 2u;
+
+    float acc[MR];
+    [[unroll]] for (int r = 0; r < MR; r++) {
+        acc[r] = 0.0;
+    }
+    for (uint c0 = 0u; c0 < k4; c0 += KC4) {
+        // This lane's two vec4 of the streamed row, in flight while the
+        // block is staged.
+        uint qa = c0 + lane;
+        uint qb = qa + LANES;
+        bool ha = lane < LANES && qa < k4;
+        bool hb = lane < LANES && qb < k4;
+        vec4 wa = ha ? rhs4[rrow + qa] : vec4(0.0);
+        vec4 wb = hb ? rhs4[rrow + qb] : vec4(0.0);
+        // Stage the block's chunk: loads into registers first, then the
+        // shared stores, so the loads overlap.
+        vec4 stage[NSTAGE];
+        [[unroll]] for (uint s = 0u; s < NSTAGE; s++) {
+            uint e = tid + s * 256u;
+            uint r = e / KC4;
+            uint q = e % KC4;
+            uint row = min(i0 + r, pc.m - 1u);
+            stage[s] = (e < uint(MR) * KC4 && c0 + q < k4) ? lhs4[lbase + row * lrs4 + c0 + q] : vec4(0.0);
+        }
+        [[unroll]] for (uint s = 0u; s < NSTAGE; s++) {
+            uint e = tid + s * 256u;
+            if (e < uint(MR) * KC4) {
+                lsh[e] = stage[s];
+            }
+        }
+        barrier();
+        if (ha) {
+            [[unroll]] for (int r = 0; r < MR; r++) {
+                acc[r] += dot(wa, lsh[uint(r) * KC4 + lane]);
+            }
+        }
+        if (hb) {
+            [[unroll]] for (int r = 0; r < MR; r++) {
+                acc[r] += dot(wb, lsh[uint(r) * KC4 + lane + LANES]);
+            }
+        }
+        barrier();
+    }
+    uint dbase = b * pc.m * pc.n;
+    [[unroll]] for (int r = 0; r < MR; r++) {
+        float s = subgroupAdd(acc[r]);
+        uint ii = i0 + uint(r);
+        if (lane == 0u && ii < pc.m && j < pc.n) {
+            dst[dbase + ii * pc.dst_rs + j * pc.dst_cs] = s;
+        }
+    }
+}
