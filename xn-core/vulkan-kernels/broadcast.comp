@@ -1,19 +1,24 @@
 #version 450
 #include "dtype.glsl"
-// General strided broadcast binary op. `info` packs, per dimension:
-//   [dims (num_dims), lhs_strides (num_dims), rhs_strides (num_dims)]
-// A broadcast dimension has stride 0. Destination is contiguous row-major.
+// General strided broadcast binary op. The push constants carry, per
+// dimension, [dims (num_dims), lhs_strides (num_dims), rhs_strides
+// (num_dims)] for up to MAXD dims, so no side buffer has to be allocated and
+// uploaded per call and the per-element index walk reads uniforms rather
+// than global memory. A broadcast dimension has stride 0. Destination is
+// contiguous row-major.
 layout(local_size_x = 256) in;
+
+#define MAXD 8
 
 layout(std430, set = 0, binding = 0) buffer L { SCALAR lhs[]; };
 layout(std430, set = 0, binding = 1) buffer R { SCALAR rhs[]; };
 layout(std430, set = 0, binding = 2) buffer D { SCALAR dst[]; };
-layout(std430, set = 0, binding = 3) readonly buffer I { uint info[]; };
 
 layout(push_constant) uniform PC {
     uint numel;
     uint num_dims;
     uint op;
+    uint info[3 * MAXD];
 } pc;
 
 void main() {
@@ -25,11 +30,11 @@ void main() {
     uint rem = idx;
     for (uint d = 0u; d < nd; d++) {
         uint di = nd - 1u - d;
-        uint dimv = info[di];
+        uint dimv = pc.info[di];
         uint coord = rem % dimv;
         rem /= dimv;
-        li += coord * info[nd + di];
-        ri += coord * info[2u * nd + di];
+        li += coord * pc.info[nd + di];
+        ri += coord * pc.info[2u * nd + di];
     }
     float a = LOAD(lhs[li]);
     float b = LOAD(rhs[ri]);

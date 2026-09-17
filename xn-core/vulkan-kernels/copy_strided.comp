@@ -1,17 +1,21 @@
 #version 450
 #include "dtype.glsl"
 // Copy from a strided source to a contiguous destination.
-// `info` packs [dims (num_dims), src_strides (num_dims)].
+// The push constants carry [dims (num_dims), src_strides (num_dims)] for up
+// to MAXD dims, so no side buffer has to be allocated and uploaded per call
+// and the per-element index walk reads uniforms rather than global memory.
 layout(local_size_x = 256) in;
+
+#define MAXD 8
 
 layout(std430, set = 0, binding = 0) buffer S { SCALAR src[]; };
 layout(std430, set = 0, binding = 1) buffer D { SCALAR dst[]; };
-layout(std430, set = 0, binding = 2) readonly buffer I { uint info[]; };
 
 layout(push_constant) uniform PC {
     uint numel;
     uint num_dims;
     uint src_offset;
+    uint info[2 * MAXD];
 } pc;
 
 void main() {
@@ -22,8 +26,8 @@ void main() {
     uint rem = idx;
     for (uint d = 0u; d < nd; d++) {
         uint di = nd - 1u - d;
-        uint dimv = info[di];
-        si += (rem % dimv) * info[nd + di];
+        uint dimv = pc.info[di];
+        si += (rem % dimv) * pc.info[nd + di];
         rem /= dimv;
     }
     dst[idx] = src[pc.src_offset + si];

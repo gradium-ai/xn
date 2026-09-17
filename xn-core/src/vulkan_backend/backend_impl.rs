@@ -702,20 +702,20 @@ impl crate::Backend for Device {
         if numel == 0 {
             return Ok(());
         }
-        if let Some(dt) = movement_suffix::<T>(&dst.device) {
-            let info: Vec<u32> =
-                dims.iter().chain(src_strides.iter()).map(|&v| v as u32).collect();
-            let scratch = dst.device.scratch_from_slice(&info)?;
-            let push = Pc::new().usize(numel).usize(dims.len()).usize(src_offset);
-            let res = dst.device.dispatch(
+        if let Some(dt) =
+            movement_suffix::<T>(&dst.device).filter(|_| dims.len() <= INDEX_MAX_DIMS)
+        {
+            // Dims and strides ride in the push constants (see the shader).
+            let mut push = Pc::new().usize(numel).usize(dims.len()).usize(src_offset);
+            for &v in dims.iter().chain(src_strides.iter()) {
+                push = push.usize(v);
+            }
+            dst.device.dispatch(
                 &format!("copy_strided_{dt}"),
-                &[src.buffer, dst.buffer, scratch.buffer],
+                &[src.buffer, dst.buffer],
                 &push,
                 div_ceil(numel, WORKGROUP_SIZE),
-            );
-            // Only defer after the dispatch is recorded (see defer_free).
-            dst.device.defer_free(scratch);
-            res
+            )
         } else {
             let n = dims.len();
             let s = src.host_read(src.len)?;
@@ -784,24 +784,18 @@ impl crate::Backend for Device {
         if numel == 0 {
             return Ok(());
         }
-        if let Some(dt) = float_suffix::<T>(&dst.device) {
-            let info: Vec<u32> = dst_shape
-                .iter()
-                .chain(lhs_strides.iter())
-                .chain(rhs_strides.iter())
-                .map(|&v| v as u32)
-                .collect();
-            let scratch = dst.device.scratch_from_slice(&info)?;
-            let push = Pc::new().usize(numel).usize(dst_shape.len()).u32(binary_op_code(op));
-            let res = dst.device.dispatch(
+        if let Some(dt) = float_suffix::<T>(&dst.device).filter(|_| dst_shape.len() <= INDEX_MAX_DIMS) {
+            // Dims and strides ride in the push constants (see the shader).
+            let mut push = Pc::new().usize(numel).usize(dst_shape.len()).u32(binary_op_code(op));
+            for &v in dst_shape.iter().chain(lhs_strides.iter()).chain(rhs_strides.iter()) {
+                push = push.usize(v);
+            }
+            dst.device.dispatch(
                 &format!("broadcast_{dt}"),
-                &[lhs.buffer, rhs.buffer, dst.buffer, scratch.buffer],
+                &[lhs.buffer, rhs.buffer, dst.buffer],
                 &push,
                 div_ceil(numel, WORKGROUP_SIZE),
-            );
-            // Only defer after the dispatch is recorded (see defer_free).
-            dst.device.defer_free(scratch);
-            res
+            )
         } else {
             let n = dst_shape.len();
             let l = lhs.host_read(lhs.len)?;
@@ -1404,3 +1398,7 @@ fn row_block_gemm<T: WithDType>(
     }
     Ok(false)
 }
+
+/// Most dims the strided copy and broadcast shaders take in their push
+/// constants (`MAXD` there); deeper tensors go to the host fallback.
+const INDEX_MAX_DIMS: usize = 8;

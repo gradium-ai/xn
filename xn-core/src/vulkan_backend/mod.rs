@@ -124,7 +124,7 @@ fn kernel_def(name: &str) -> Option<(&'static [u8], u32)> {
         "unary" => (UNARY_F32, Some(UNARY_F16), Some(UNARY_BF16), 2),
         "binary" => (BINARY_F32, Some(BINARY_F16), Some(BINARY_BF16), 3),
         "scale_add" => (SCALE_ADD_F32, Some(SCALE_ADD_F16), Some(SCALE_ADD_BF16), 2),
-        "broadcast" => (BROADCAST_F32, Some(BROADCAST_F16), Some(BROADCAST_BF16), 4),
+        "broadcast" => (BROADCAST_F32, Some(BROADCAST_F16), Some(BROADCAST_BF16), 3),
         "softmax" => (SOFTMAX_F32, Some(SOFTMAX_F16), Some(SOFTMAX_BF16), 2),
         "rmsnorm" => (RMSNORM_F32, Some(RMSNORM_F16), Some(RMSNORM_BF16), 3),
         "layernorm" => (LAYERNORM_F32, Some(LAYERNORM_F16), Some(LAYERNORM_BF16), 4),
@@ -134,7 +134,7 @@ fn kernel_def(name: &str) -> Option<(&'static [u8], u32)> {
         "reduce_arg" => (REDUCE_ARG_F32, Some(REDUCE_ARG_F16), Some(REDUCE_ARG_BF16), 2),
         "transpose" => (TRANSPOSE_F32, Some(TRANSPOSE_F16), Some(TRANSPOSE_BF16), 2),
         "copy2d" => (COPY2D_F32, Some(COPY2D_F16), Some(COPY2D_BF16), 2),
-        "copy_strided" => (COPY_STRIDED_F32, Some(COPY_STRIDED_F16), Some(COPY_STRIDED_BF16), 3),
+        "copy_strided" => (COPY_STRIDED_F32, Some(COPY_STRIDED_F16), Some(COPY_STRIDED_BF16), 2),
         "index_select" => (INDEX_SELECT_F32, Some(INDEX_SELECT_F16), Some(INDEX_SELECT_BF16), 3),
         "causality_mask" => {
             (CAUSALITY_MASK_F32, Some(CAUSALITY_MASK_F16), Some(CAUSALITY_MASK_BF16), 1)
