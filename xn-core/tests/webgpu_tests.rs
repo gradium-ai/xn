@@ -273,6 +273,24 @@ fn matmul_t_gemv_vec4_remainder() -> Result<()> {
 }
 
 #[test]
+fn matmul_skinny_m() -> Result<()> {
+    // 1 < m <= 16 with a narrow output goes to gemm_skinny, which splits k
+    // across the workgroup and reduces. The shapes Mimi issues, then the edges:
+    // m, n and k each not a multiple of the tile, and a batch.
+    cmp_matmul(16, 512, 2048, 1)?;
+    cmp_matmul(16, 512, 512, 1)?;
+    cmp_matmul(16, 64, 266, 8)?; // batched attention shape
+    cmp_matmul(13, 500, 999, 1)?; // ragged in every dimension
+    cmp_matmul(2, 17, 33, 1)?;
+    cmp_matmul(16, 3, 5, 1)?; // narrower than one workgroup's patch
+    cmp_matmul(5, 128, 7, 2)?; // k shorter than the thread count
+    // Either side of the gate, to keep both kernels covered as it moves.
+    cmp_matmul(16, 1536, 512, 1)?; // tiled: grid is wide enough
+    cmp_matmul(16, 512, 3584, 1)?; // skinny: grid is not
+    Ok(())
+}
+
+#[test]
 fn matmul_t_and_transposed_view() -> Result<()> {
     // matmul_t exercises a non-contiguous rhs stride pattern.
     let a = iota(6 * 4);
