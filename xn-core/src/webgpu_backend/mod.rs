@@ -79,6 +79,18 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
 type MapResult = std::result::Result<(), wgpu::BufferAsyncError>;
 
 const MAX_BINDINGS: usize = 4;
+/// Entries kept in the bind-group cache before it is dropped wholesale.
+///
+/// The per-step working set is small, but the set of reachable tuples is not
+/// bounded -- a decode loop with a growing KV cache accumulates about one new
+/// tuple per step indefinitely -- so the cap exists to stop a long session
+/// retaining all of them, not to protect the hit rate. It only has to sit far
+/// enough above the working set that clears stay rare: measured over 1000
+/// decode steps, dropping the cap to 1/64th of this (a clear every few hundred
+/// steps) moved reuse 94.0% -> 93.8%. 2^14 keeps that margin without holding
+/// 131k live bind groups, each pinning up to `MAX_BINDINGS` buffers -- on the
+/// wasm target, that many JS-side objects of retained GPU state.
+const BIND_GROUP_CACHE_CAP: usize = 1 << 14;
 const PUSH_CONSTANT_SIZE: u32 = 128;
 const WORKGROUP_SIZE: u32 = 256;
 /// The two matmul kernels, kept as named constants because the dispatch
@@ -326,6 +338,9 @@ struct ProfStats {
     /// CPU time in submit + draining the queue. The GPU is busy here, but the
     /// CPU is not idle: `wait_for_queue` spins for the first `spin_budget`.
     submit_wait_ns: u128,
+    /// Bind-group cache hits / misses.
+    bg_hits: u64,
+    bg_misses: u64,
     /// CPU time in the readback staging copy + map. Excludes the flush that
     /// carries the copy, which is counted as a submit in `submit_wait_ns`.
     readback_ns: u128,
@@ -378,6 +393,10 @@ pub struct DeviceInner {
     bind_group_layouts: Vec<wgpu::BindGroupLayout>,
     pipeline_layouts: Vec<wgpu::PipelineLayout>,
     pipelines: Mutex<HashMap<String, CachedPipeline>>,
+    /// Bind groups keyed by (pipeline index, buffer ids). Which pooled buffer
+    /// an intermediate lands in shifts between steps, so this is not a perfect
+    /// cache: ~74% hits on a decode step (`XN_WEBGPU_PROFILE=1` reports it).
+    bind_groups: Mutex<HashMap<(usize, [u64; MAX_BINDINGS]), wgpu::BindGroup>>,
     pool: Mutex<BufferPool>,
     ctx: Mutex<OpCtx>,
     device_name: String,
@@ -507,6 +526,7 @@ impl Device {
             bind_group_layouts,
             pipeline_layouts,
             pipelines: Mutex::new(HashMap::new()),
+            bind_groups: Mutex::new(HashMap::new()),
             pool: Mutex::new(BufferPool::default()),
             ctx: Mutex::new(OpCtx {
                 pass: None,
@@ -608,19 +628,42 @@ impl Device {
         let t0 = self.profile.then(std::time::Instant::now);
         let (pipeline, bindings, pidx) = self.get_pipeline(kernel)?;
         assert_eq!(bindings as usize, buffers.len(), "kernel {kernel} binding count mismatch");
-        let entries: Vec<wgpu::BindGroupEntry> = buffers
-            .iter()
-            .enumerate()
-            .map(|(i, b)| wgpu::BindGroupEntry {
-                binding: i as u32,
-                resource: b.as_entire_binding(),
-            })
-            .collect();
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some(kernel),
-            layout: &self.bind_group_layouts[bindings as usize],
-            entries: &entries,
-        });
+        let mut key = [0u64; MAX_BINDINGS];
+        for (i, b) in buffers.iter().enumerate() {
+            key[i] = b.id;
+        }
+        let mut bgs = self.bind_groups.lock().unwrap();
+        let cached = bgs.get(&(pidx, key)).cloned();
+        let bg_hit = cached.is_some();
+        let bind_group = match cached {
+            Some(bg) => bg,
+            None => {
+                let entries: Vec<wgpu::BindGroupEntry> = buffers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| wgpu::BindGroupEntry {
+                        binding: i as u32,
+                        resource: b.as_entire_binding(),
+                    })
+                    .collect();
+                let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    // Accurate for the entry's whole life because `pidx` is in
+                    // the key and is unique per kernel name, so an entry is only
+                    // ever handed back to the kernel that minted it. Widening
+                    // the key to drop `pidx` would silently invalidate this.
+                    label: Some(kernel),
+                    layout: &self.bind_group_layouts[bindings as usize],
+                    entries: &entries,
+                });
+                // Distinct tuples are not bounded a priori, so cap the cache.
+                if bgs.len() >= BIND_GROUP_CACHE_CAP {
+                    bgs.clear();
+                }
+                bgs.insert((pidx, key), bg.clone());
+                bg
+            }
+        };
+        drop(bgs);
         let mut ctx = self.ctx.lock().unwrap();
         self.ensure_pass(&mut ctx);
         let switch_pipeline = ctx.last_pipeline != pidx;
@@ -636,6 +679,11 @@ impl Device {
         if let Some(t0) = t0 {
             let mut p = self.pstats.lock().unwrap();
             p.dispatches += 1;
+            if bg_hit {
+                p.bg_hits += 1
+            } else {
+                p.bg_misses += 1
+            }
             p.record_ns += t0.elapsed().as_nanos();
             *p.per_kernel.entry(kernel.to_string()).or_insert(0) += 1;
         }
@@ -919,6 +967,15 @@ impl Drop for DeviceInner {
         let kernels: Vec<String> = rows.iter().take(8).map(|(k, c)| format!("{k}:{c}")).collect();
         if !kernels.is_empty() {
             eprintln!("top kernels (count): {}", kernels.join(", "));
+        }
+        let bg_total = p.bg_hits + p.bg_misses;
+        if bg_total > 0 {
+            eprintln!(
+                "bind groups: {} hits / {} built ({:.1}% reuse)",
+                p.bg_hits,
+                p.bg_misses,
+                100.0 * p.bg_hits as f64 / bg_total as f64,
+            );
         }
         let pool = self.pool.lock().unwrap();
         let allocs = pool.hits + pool.misses;
