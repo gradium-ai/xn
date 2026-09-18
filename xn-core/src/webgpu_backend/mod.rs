@@ -260,14 +260,16 @@ struct CachedPipeline {
     idx: usize,
 }
 
-/// A wgpu buffer plus the size class it was allocated at.
+/// A wgpu buffer plus its size class and a stable identity.
 ///
-/// The class travels with the buffer so `Storage` does not have to keep its own
-/// copy to return it to the pool on drop. Derefs to `wgpu::Buffer`, so call
-/// sites read the same as they did when this was a bare buffer.
+/// `wgpu::Buffer` is only `Clone + Debug` -- no equality, no hash -- so the
+/// bind-group cache needs an id of our own. Ids are handed out once per created
+/// buffer and travel with it through the recycling pool, so a cached bind group
+/// stays valid for as long as the buffers exist. Derefs to `wgpu::Buffer`.
 struct Buf {
     buffer: wgpu::Buffer,
     class: u64,
+    id: u64,
 }
 
 impl std::ops::Deref for Buf {
@@ -278,9 +280,9 @@ impl std::ops::Deref for Buf {
 }
 
 impl Buf {
-    /// Another handle to the same GPU buffer and size class.
+    /// Another handle to the same GPU buffer, carrying the same identity.
     fn dup(&self) -> Buf {
-        Buf { buffer: self.buffer.clone(), class: self.class }
+        Buf { buffer: self.buffer.clone(), class: self.class, id: self.id }
     }
 }
 
@@ -291,6 +293,8 @@ impl Buf {
 #[derive(Default)]
 struct BufferPool {
     free: HashMap<u64, Vec<Buf>>,
+    /// Monotonic source of buffer identities.
+    next_id: u64,
     hits: u64,
     misses: u64,
 }
@@ -532,15 +536,18 @@ impl Device {
     /// the same size class when one is available.
     fn alloc_buffer(&self, size_bytes: usize) -> Buf {
         let class = size_class(size_bytes);
-        {
+        let id = {
             let mut pool = self.pool.lock().unwrap();
             if let Some(b) = pool.free.get_mut(&class).and_then(|v| v.pop()) {
                 pool.hits += 1;
                 return b;
             }
             pool.misses += 1;
-        }
-        // Created at full class size so any same-class request can reuse it.
+            pool.next_id += 1;
+            pool.next_id
+        };
+        // Created at full class size so any same-class request can reuse it,
+        // and so `as_entire_binding` is stable for the bind-group cache.
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("xn-storage"),
             size: class,
@@ -549,7 +556,7 @@ impl Device {
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Buf { buffer, class }
+        Buf { buffer, class, id }
     }
 
     fn get_pipeline(&self, name: &str) -> Result<(wgpu::ComputePipeline, u32, usize)> {
