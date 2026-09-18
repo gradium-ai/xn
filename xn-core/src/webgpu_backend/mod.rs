@@ -79,17 +79,8 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
 type MapResult = std::result::Result<(), wgpu::BufferAsyncError>;
 
 const MAX_BINDINGS: usize = 4;
-/// Entries kept in the bind-group cache before it is dropped wholesale.
-///
-/// The per-step working set is small, but the set of reachable tuples is not
-/// bounded -- a decode loop with a growing KV cache accumulates about one new
-/// tuple per step indefinitely -- so the cap exists to stop a long session
-/// retaining all of them, not to protect the hit rate. It only has to sit far
-/// enough above the working set that clears stay rare: measured over 1000
-/// decode steps, dropping the cap to 1/64th of this (a clear every few hundred
-/// steps) moved reuse 94.0% -> 93.8%. 2^14 keeps that margin without holding
-/// 131k live bind groups, each pinning up to `MAX_BINDINGS` buffers -- on the
-/// wasm target, that many JS-side objects of retained GPU state.
+/// Entries kept before the least recently used quarter is evicted.
+/// Each entry pins up to `MAX_BINDINGS` buffers.
 const BIND_GROUP_CACHE_CAP: usize = 1 << 14;
 const PUSH_CONSTANT_SIZE: u32 = 128;
 const WORKGROUP_SIZE: u32 = 256;
@@ -298,6 +289,54 @@ impl Buf {
     }
 }
 
+/// Identifies a bind group: which pipeline, and the buffers in its bindings.
+/// Unused bindings are left zero, which no live buffer id ever takes.
+type BindGroupKey = (usize, [u64; MAX_BINDINGS]);
+
+/// Bind groups with a recency tick, so a full cache drops its least recently
+/// used entries rather than all of them: a deep model mints more tuples than
+/// the cap holds, and clearing wholesale discards the live working set with it.
+///
+/// The tick sits beside the bind group so a hit is one lookup under the lock
+/// the caller already holds; keeping recency in a second map costs more in the
+/// record path than the bind groups it saves.
+#[derive(Default)]
+struct BindGroupCache {
+    entries: HashMap<BindGroupKey, (wgpu::BindGroup, u64)>,
+    /// Monotonic; the highest value is the most recent touch. Ticks are unique,
+    /// which is what lets `evict_quarter` split the map at an exact quantile.
+    tick: u64,
+}
+
+impl BindGroupCache {
+    /// Look `key` up, marking it most recently used on a hit.
+    fn get(&mut self, key: &BindGroupKey) -> Option<wgpu::BindGroup> {
+        self.tick += 1;
+        let now = self.tick;
+        let (bg, last_used) = self.entries.get_mut(key)?;
+        *last_used = now;
+        Some(bg.clone())
+    }
+
+    fn insert(&mut self, key: BindGroupKey, bg: wgpu::BindGroup) {
+        if self.entries.len() >= BIND_GROUP_CACHE_CAP {
+            self.evict_quarter();
+        }
+        self.tick += 1;
+        self.entries.insert(key, (bg, self.tick));
+    }
+
+    /// Drop the least recently used quarter, amortizing the scan over the next
+    /// `BIND_GROUP_CACHE_CAP / 4` inserts. Evicting one at a time would need an
+    /// intrusive list for no gain: the working set should sit far below the cap.
+    fn evict_quarter(&mut self) {
+        let mut ticks: Vec<u64> = self.entries.values().map(|(_, t)| *t).collect();
+        let nth = ticks.len() / 4;
+        let (_, &mut cutoff, _) = ticks.select_nth_unstable(nth);
+        self.entries.retain(|_, (_, last_used)| *last_used > cutoff);
+    }
+}
+
 /// Recycling pool for buffer allocations, keyed by size class. Decoding
 /// allocates hundreds of intermediate tensors per token, so freed buffers are
 /// returned here (after the batch referencing them has completed on the GPU)
@@ -393,10 +432,9 @@ pub struct DeviceInner {
     bind_group_layouts: Vec<wgpu::BindGroupLayout>,
     pipeline_layouts: Vec<wgpu::PipelineLayout>,
     pipelines: Mutex<HashMap<String, CachedPipeline>>,
-    /// Bind groups keyed by (pipeline index, buffer ids). Which pooled buffer
-    /// an intermediate lands in shifts between steps, so this is not a perfect
-    /// cache: ~74% hits on a decode step (`XN_WEBGPU_PROFILE=1` reports it).
-    bind_groups: Mutex<HashMap<(usize, [u64; MAX_BINDINGS]), wgpu::BindGroup>>,
+    /// Not a perfect cache, since operand identity shifts between steps
+    /// (`XN_WEBGPU_PROFILE=1` reports the hit rate).
+    bind_groups: Mutex<BindGroupCache>,
     pool: Mutex<BufferPool>,
     ctx: Mutex<OpCtx>,
     device_name: String,
@@ -526,7 +564,7 @@ impl Device {
             bind_group_layouts,
             pipeline_layouts,
             pipelines: Mutex::new(HashMap::new()),
-            bind_groups: Mutex::new(HashMap::new()),
+            bind_groups: Mutex::new(BindGroupCache::default()),
             pool: Mutex::new(BufferPool::default()),
             ctx: Mutex::new(OpCtx {
                 pass: None,
@@ -633,7 +671,7 @@ impl Device {
             key[i] = b.id;
         }
         let mut bgs = self.bind_groups.lock().unwrap();
-        let cached = bgs.get(&(pidx, key)).cloned();
+        let cached = bgs.get(&(pidx, key));
         let bg_hit = cached.is_some();
         let bind_group = match cached {
             Some(bg) => bg,
@@ -655,10 +693,6 @@ impl Device {
                     layout: &self.bind_group_layouts[bindings as usize],
                     entries: &entries,
                 });
-                // Distinct tuples are not bounded a priori, so cap the cache.
-                if bgs.len() >= BIND_GROUP_CACHE_CAP {
-                    bgs.clear();
-                }
                 bgs.insert((pidx, key), bg.clone());
                 bg
             }
