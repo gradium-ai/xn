@@ -116,10 +116,28 @@ struct CachedPipeline {
     bindings: u32,
 }
 
-/// A pooled buffer plus its size class.
-struct PooledBuf {
+/// A wgpu buffer plus the size class it was allocated at.
+///
+/// The class travels with the buffer so `Storage` does not have to keep its own
+/// copy to return it to the pool on drop. Derefs to `wgpu::Buffer`, so call
+/// sites read the same as they did when this was a bare buffer.
+struct Buf {
     buffer: wgpu::Buffer,
     class: u64,
+}
+
+impl std::ops::Deref for Buf {
+    type Target = wgpu::Buffer;
+    fn deref(&self) -> &wgpu::Buffer {
+        &self.buffer
+    }
+}
+
+impl Buf {
+    /// Another handle to the same GPU buffer and size class.
+    fn dup(&self) -> Buf {
+        Buf { buffer: self.buffer.clone(), class: self.class }
+    }
 }
 
 /// Recycling pool for buffer allocations, keyed by size class. Decoding
@@ -128,7 +146,7 @@ struct PooledBuf {
 /// and reused instead of being re-created.
 #[derive(Default)]
 struct BufferPool {
-    free: HashMap<u64, Vec<PooledBuf>>,
+    free: HashMap<u64, Vec<Buf>>,
     hits: u64,
     misses: u64,
 }
@@ -175,7 +193,7 @@ struct OpCtx {
     open: bool,
     /// Buffers (dropped tensors + scratch) to recycle into the pool on the next
     /// flush, once the batch referencing them has finished executing.
-    free_bufs: Vec<PooledBuf>,
+    free_bufs: Vec<Buf>,
 }
 
 pub struct DeviceInner {
@@ -335,25 +353,26 @@ impl Device {
 
     /// Allocate a buffer of at least `size_bytes`, reusing a pooled buffer of
     /// the same size class when one is available.
-    fn alloc_buffer(&self, size_bytes: usize) -> wgpu::Buffer {
+    fn alloc_buffer(&self, size_bytes: usize) -> Buf {
         let class = size_class(size_bytes);
         {
             let mut pool = self.pool.lock().unwrap();
             if let Some(b) = pool.free.get_mut(&class).and_then(|v| v.pop()) {
                 pool.hits += 1;
-                return b.buffer;
+                return b;
             }
             pool.misses += 1;
         }
         // Created at full class size so any same-class request can reuse it.
-        self.device.create_buffer(&wgpu::BufferDescriptor {
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("xn-storage"),
             size: class,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        })
+        });
+        Buf { buffer, class }
     }
 
     fn get_pipeline(&self, name: &str) -> Result<(wgpu::ComputePipeline, u32)> {
@@ -384,13 +403,7 @@ impl Device {
     }
 
     /// Record a single dispatch of `kernel` (1D workgroup count).
-    fn dispatch(
-        &self,
-        kernel: &str,
-        buffers: &[&wgpu::Buffer],
-        push: &Pc,
-        groups_x: u32,
-    ) -> Result<()> {
+    fn dispatch(&self, kernel: &str, buffers: &[&Buf], push: &Pc, groups_x: u32) -> Result<()> {
         self.dispatch_nd(kernel, buffers, push, (groups_x, 1, 1))
     }
 
@@ -399,7 +412,7 @@ impl Device {
     fn dispatch_nd(
         &self,
         kernel: &str,
-        buffers: &[&wgpu::Buffer],
+        buffers: &[&Buf],
         push: &Pc,
         groups: (u32, u32, u32),
     ) -> Result<()> {
@@ -511,7 +524,7 @@ impl Device {
     /// Schedule a buffer to be recycled into the pool on the next flush. Called
     /// from `Storage::drop`; the current (unsubmitted) batch may still reference
     /// the buffer, so recycling waits until the next flush completes.
-    fn defer_free(&self, buf: PooledBuf) {
+    fn defer_free(&self, buf: Buf) {
         self.ctx.lock().unwrap().free_bufs.push(buf);
     }
 
@@ -704,10 +717,8 @@ impl Drop for DeviceInner {
 /// WebGPU tensor storage: an `f32`-capable storage buffer. Host access goes
 /// through readback/upload rather than a mapped pointer.
 pub struct Storage<T: WithDType> {
-    buffer: wgpu::Buffer,
+    buffer: Buf,
     len: usize,
-    /// Allocation size class; used to return the buffer to the pool on drop.
-    class: u64,
     device: Device,
     _t: PhantomData<T>,
 }
@@ -729,7 +740,7 @@ impl<T: WithDType> Drop for Storage<T> {
     fn drop(&mut self) {
         // The current (unsubmitted) batch may still reference this buffer, so
         // defer recycling it until the next flush completes on the GPU.
-        self.device.defer_free(PooledBuf { buffer: self.buffer.clone(), class: self.class });
+        self.device.defer_free(self.buffer.dup());
     }
 }
 
