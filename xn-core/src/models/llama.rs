@@ -149,6 +149,7 @@ impl<T: WithDTypeF, B: Backend> Attention<T, B> {
         sin: &Tensor<T, B>,
         pos: usize,
         kv_cache: Option<(&Tensor<T, B>, &Tensor<T, B>)>,
+        fixed_cache: bool,
     ) -> Result<(Tensor<T, B>, Tensor<T, B>, Tensor<T, B>)> {
         let (b, seq_len, _hidden) = x.dims3()?;
 
@@ -173,6 +174,15 @@ impl<T: WithDTypeF, B: Backend> Attention<T, B> {
 
         // Handle KV cache - cache BEFORE repeat_kv to save memory
         let (k_cache, v_cache, k, v) = match kv_cache {
+            Some((prev_k, prev_v)) if fixed_cache => {
+                // Preallocated cache: write the new keys/values in place at
+                // `pos` and attend over the whole (fixed-size) cache. The
+                // causality mask hides both future and not-yet-written
+                // positions, and shapes stay identical across decoding steps.
+                prev_k.slice_set(&k, 2, pos)?;
+                prev_v.slice_set(&v, 2, pos)?;
+                (prev_k.clone(), prev_v.clone(), prev_k.clone(), prev_v.clone())
+            }
             Some((prev_k, prev_v)) => {
                 let k_cat = Tensor::cat(&[prev_k, &k], 2)?;
                 let v_cat = Tensor::cat(&[prev_v, &v], 2)?;
@@ -304,11 +314,13 @@ impl<T: WithDTypeF, B: Backend> TransformerBlock<T, B> {
         sin: &Tensor<T, B>,
         pos: usize,
         kv_cache: Option<(&Tensor<T, B>, &Tensor<T, B>)>,
+        fixed_cache: bool,
     ) -> Result<(Tensor<T, B>, Tensor<T, B>, Tensor<T, B>)> {
         // Pre-norm architecture
         let residual = x;
         let x = self.input_layernorm.forward(x)?;
-        let (attn_out, k_cache, v_cache) = self.attn.forward(&x, cos, sin, pos, kv_cache)?;
+        let (attn_out, k_cache, v_cache) =
+            self.attn.forward(&x, cos, sin, pos, kv_cache, fixed_cache)?;
         let x = residual.add(&attn_out)?;
 
         let residual = &x;
@@ -331,6 +343,30 @@ pub struct Llama<T: WithDTypeF, B: Backend> {
 
 pub struct KvCache<T: WithDTypeF, B: Backend> {
     kvs: Vec<(Tensor<T, B>, Tensor<T, B>)>,
+    /// Sequence capacity when the cache is preallocated, `None` for a cache
+    /// growing by concatenation.
+    max_seq_len: Option<usize>,
+}
+
+impl<T: WithDTypeF, B: Backend> KvCache<T, B> {
+    /// Preallocate a fixed-capacity cache: keys and values are written in
+    /// place and attention always runs over `max_seq_len` positions, so the
+    /// tensor shapes are identical for every decoding step. This costs
+    /// compute proportional to the capacity but keeps shape-specialized
+    /// backends (e.g. xla) from recompiling at each step.
+    ///
+    /// Pass the cache to [`Llama::forward`] from the very first call on, and
+    /// keep `pos + tokens.len() <= max_seq_len`.
+    pub fn fixed(config: &Config, batch: usize, max_seq_len: usize, dev: &B) -> Result<Self> {
+        let shape = (batch, config.num_key_value_heads, max_seq_len, config.head_dim);
+        let mut kvs = Vec::with_capacity(config.num_hidden_layers);
+        for _ in 0..config.num_hidden_layers {
+            let k = Tensor::zeros(shape, dev)?;
+            let v = Tensor::zeros(shape, dev)?;
+            kvs.push((k, v));
+        }
+        Ok(Self { kvs, max_seq_len: Some(max_seq_len) })
+    }
 }
 
 impl<T: WithDTypeF, B: Backend> Llama<T, B> {
@@ -391,11 +427,18 @@ impl<T: WithDTypeF, B: Backend> Llama<T, B> {
         x = x.reshape((1, tokens.len(), ()))?;
 
         // Run through transformer layers
+        let max_seq_len = kv_caches.and_then(|c| c.max_seq_len);
         let mut kvs = Vec::with_capacity(self.layers.len());
         for (i, layer) in self.layers.iter().enumerate() {
             let kv_cache = kv_caches.map(|c| (&c.kvs[i].0, &c.kvs[i].1));
-            let (new_x, k_cache, v_cache) =
-                layer.forward(&x, &self.cos_cache, &self.sin_cache, pos, kv_cache)?;
+            let (new_x, k_cache, v_cache) = layer.forward(
+                &x,
+                &self.cos_cache,
+                &self.sin_cache,
+                pos,
+                kv_cache,
+                max_seq_len.is_some(),
+            )?;
             x = new_x;
             kvs.push((k_cache, v_cache));
         }
@@ -406,7 +449,7 @@ impl<T: WithDTypeF, B: Backend> Llama<T, B> {
         // LM head: (1, seq_len, hidden_size) -> (1, seq_len, vocab_size)
         let logits = self.lm_head.forward(&x)?;
 
-        Ok((logits, KvCache { kvs }))
+        Ok((logits, KvCache { kvs, max_seq_len }))
     }
 }
 

@@ -30,6 +30,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 wgpu = { workspace = true, optional = true }
+xla = { git = "https://github.com/LaurentMazare/xla-rs", optional = true }
 yoke = { workspace = true }
 
 [dev-dependencies]
@@ -57,6 +58,7 @@ cuda = ["dep:cudarc", "dep:bindgen_cuda"]
 metal = ["dep:metal"]
 vulkan = ["dep:ash"]
 webgpu = ["dep:wgpu", "dep:pollster"]
+xla = ["dep:xla"]
 
 [[example]]
 name = "mimi"
@@ -69,6 +71,10 @@ required-features = ["audio"]
 [[example]]
 name = "basic_cuda"
 required-features = ["cuda"]
+
+[[example]]
+name = "backend_bench"
+required-features = ["cuda", "xla"]
 
 [[example]]
 name = "basic_vulkan"
