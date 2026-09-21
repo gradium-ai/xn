@@ -88,9 +88,15 @@ fn gemm_<T: WithDType>(
     // batch sizes decode uses.
     let nth = crate::threadpool::size();
     // One stripe per participant. Measured against 0.25x, 0.5x, 2x and 4x that count: 1x and
-    // 2x tie, everything else is worse. Splitting the rows instead when the output is too
-    // narrow to stripe was also tried and nets nothing, so narrow outputs stay serial.
-    let stripes = if nth > 1 && n >= nth * 4 && m * n * k >= 1 << 14 { nth } else { 1 };
+    // 2x tie, everything else is worse.
+    let big = m * n * k >= 1 << 14;
+    let stripes = if nth > 1 && n >= nth * 4 && big { nth } else { 1 };
+    // An output too narrow to stripe splits by row band instead, which is the only way it gets
+    // any threads at all now that `gemm` is always called with `Parallelism::None`. Both gates
+    // want at least four of the split dimension per participant, below which the bands are too
+    // short to amortize repacking the panel. Measured at 8 participants: m=4096 k=2048 n=1 goes
+    // 1289 -> 344 us, n=8 2492 -> 671, and a 24000-long 64->8 conv1d 2712 -> 1658.
+    let rows = if stripes == 1 && nth > 1 && m >= nth * 4 && big { nth } else { 1 };
 
     for b_idx in 0..lhs_b {
         let dst = &mut dst[b_idx * m * n..(b_idx + 1) * m * n];
@@ -122,6 +128,45 @@ fn gemm_<T: WithDType>(
                         lhs_cs as isize,
                         lhs_rs as isize,
                         (rhs_p as *const T).add(n0 * rhs_cs),
+                        rhs_cs as isize,
+                        rhs_rs as isize,
+                        T::zero(),
+                        T::one(),
+                        false,
+                        false,
+                        false,
+                        gemm::Parallelism::None,
+                    )
+                }
+            });
+            continue;
+        }
+        if rows > 1 {
+            let dst_p = dst.as_mut_ptr() as usize;
+            let lhs_p = lhs.as_ptr() as usize;
+            let rhs_p = rhs.as_ptr() as usize;
+            crate::threadpool::par_units(rows, |s| {
+                let per = m.div_ceil(rows);
+                let m0 = (s * per).min(m);
+                let m1 = (m0 + per).min(m);
+                if m0 == m1 {
+                    return;
+                }
+                // SAFETY: row bands own disjoint output rows, and every offset stays inside the
+                // slices borrowed above, which outlive the dispatch.
+                unsafe {
+                    gemm::gemm(
+                        m1 - m0,
+                        n,
+                        k,
+                        (dst_p as *mut T).add(m0 * dst_rs),
+                        dst_cs as isize,
+                        dst_rs as isize,
+                        false,
+                        (lhs_p as *const T).add(m0 * lhs_rs),
+                        lhs_cs as isize,
+                        lhs_rs as isize,
+                        rhs_p as *const T,
                         rhs_cs as isize,
                         rhs_rs as isize,
                         T::zero(),
@@ -602,25 +647,34 @@ impl crate::Backend for crate::CpuDevice {
         }
         let cos = &cos[pos * d / 2..];
         let sin = &sin[pos * d / 2..];
-        src.par_chunks(t * d).zip(dst.par_chunks_mut(t * d)).enumerate().for_each(
-            |(bh_i, (src, dst))| {
-                for i_t in 0..t {
-                    for i_d in 0..d / 2 {
-                        let i1 = i_t * d + i_d;
-                        let i2 = i1 + d / 2;
-                        let i_cs = i_t * (d / 2) + i_d;
-                        let i_cs = if unbatched_rope {
-                            let b_i = bh_i / h;
-                            i_cs + b_i * t * d / 2
-                        } else {
-                            i_cs
-                        };
-                        dst[i1] = src[i1] * cos[i_cs] - src[i2] * sin[i_cs];
-                        dst[i2] = src[i1] * sin[i_cs] + src[i2] * cos[i_cs];
-                    }
+        let head = |bh_i: usize, dst: &mut [T], src: &[T]| {
+            for i_t in 0..t {
+                for i_d in 0..d / 2 {
+                    let i1 = i_t * d + i_d;
+                    let i2 = i1 + d / 2;
+                    let i_cs = i_t * (d / 2) + i_d;
+                    let i_cs = if unbatched_rope {
+                        let b_i = bh_i / h;
+                        i_cs + b_i * t * d / 2
+                    } else {
+                        i_cs
+                    };
+                    dst[i1] = src[i1] * cos[i_cs] - src[i2] * sin[i_cs];
+                    dst[i2] = src[i1] * sin[i_cs] + src[i2] * cos[i_cs];
                 }
-            },
-        );
+            }
+        };
+        // One head is a few hundred elements at decode, where fanning out costs an order of
+        // magnitude more than the work: measured at b=1 h=16 t=1 d=64, 0.2 us serial against
+        // 1.8 us over four participants. Prefill is the other way round and clears the
+        // threshold comfortably.
+        if use_parallelism(dst.len()) {
+            crate::threadpool::par_chunks_zip(dst, t * d, src, t * d, head);
+        } else {
+            for (bh_i, (dst, src)) in dst.chunks_mut(t * d).zip(src.chunks(t * d)).enumerate() {
+                head(bh_i, dst, src);
+            }
+        }
         Ok(())
     }
 
@@ -644,21 +698,27 @@ impl crate::Backend for crate::CpuDevice {
         }
         let cos = &cos[pos * d / 2..];
         let sin = &sin[pos * d / 2..];
-        src.par_chunks(t * d).zip(dst.par_chunks_mut(t * d)).enumerate().for_each(
-            |(bh_i, (src, dst))| {
-                for i_over_2 in 0..t * d / 2 {
-                    let i = 2 * i_over_2;
-                    let rope_i = if unbatched_rope {
-                        let b_i = bh_i / h;
-                        i_over_2 + b_i * t * d / 2
-                    } else {
-                        i_over_2
-                    };
-                    dst[i] = src[i] * cos[rope_i] - src[i + 1] * sin[rope_i];
-                    dst[i + 1] = src[i] * sin[rope_i] + src[i + 1] * cos[rope_i];
-                }
-            },
-        );
+        let head = |bh_i: usize, dst: &mut [T], src: &[T]| {
+            for i_over_2 in 0..t * d / 2 {
+                let i = 2 * i_over_2;
+                let rope_i = if unbatched_rope {
+                    let b_i = bh_i / h;
+                    i_over_2 + b_i * t * d / 2
+                } else {
+                    i_over_2
+                };
+                dst[i] = src[i] * cos[rope_i] - src[i + 1] * sin[rope_i];
+                dst[i + 1] = src[i] * sin[rope_i] + src[i + 1] * cos[rope_i];
+            }
+        };
+        // See `rope`: a decode-sized head is far cheaper to rotate in place than to hand out.
+        if use_parallelism(dst.len()) {
+            crate::threadpool::par_chunks_zip(dst, t * d, src, t * d, head);
+        } else {
+            for (bh_i, (dst, src)) in dst.chunks_mut(t * d).zip(src.chunks(t * d)).enumerate() {
+                head(bh_i, dst, src);
+            }
+        }
         Ok(())
     }
 
