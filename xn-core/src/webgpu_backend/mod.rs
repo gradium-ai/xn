@@ -34,6 +34,8 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
+pub mod quantization;
+
 fn wgpuerr<E: std::fmt::Debug>(context: &str) -> impl Fn(E) -> crate::Error + '_ {
     move |e| crate::Error::msg(format!("webgpu: {context}: {e:?}"))
 }
@@ -66,6 +68,11 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
         "gemm_tiled" => (GEMM_SRC, 3),
         // rhs is bound twice: scalar + a vec4 view for the aligned fast path.
         "gemv" => (GEMV_SRC, 4),
+        // q8_0 weights: dst, lhs, quants, scales. Named without a dtype
+        // suffix -- the activation is always f32 and the weight always q8_0.
+        "gemv_q8" => (GEMV_Q8_SRC, 4),
+        "gemm_q8" => (GEMM_Q8_SRC, 4),
+        "gemm_q8_tiled" => (GEMM_Q8_TILED_SRC, 4),
         "conv1d" => (include_str!("../../webgpu-kernels/conv1d.wgsl"), 3),
         "conv_transpose1d" => (include_str!("../../webgpu-kernels/conv_transpose1d.wgsl"), 3),
         "im2col1d" => (include_str!("../../webgpu-kernels/im2col1d.wgsl"), 2),
@@ -85,6 +92,9 @@ const WORKGROUP_SIZE: u32 = 256;
 /// geometry below is parsed back out of them.
 const GEMM_SRC: &str = include_str!("../../webgpu-kernels/gemm_tiled.wgsl");
 const GEMV_SRC: &str = include_str!("../../webgpu-kernels/gemv.wgsl");
+const GEMV_Q8_SRC: &str = include_str!("../../webgpu-kernels/gemv_q8.wgsl");
+const GEMM_Q8_SRC: &str = include_str!("../../webgpu-kernels/gemm_q8.wgsl");
+const GEMM_Q8_TILED_SRC: &str = include_str!("../../webgpu-kernels/gemm_q8_tiled.wgsl");
 
 /// How many times `pat` occurs in `src`. Const context only.
 const fn count(src: &str, pat: &str) -> u32 {
@@ -118,35 +128,41 @@ const fn contains(src: &str, pat: &str) -> bool {
 /// above the real one -- quietly decide the dispatch geometry, which is the
 /// silent failure this whole mechanism exists to prevent.
 const fn u32_after(src: &str, pat: &str) -> u32 {
-    assert!(
-        count(src, pat) != 0,
-        "WGSL: pattern not found -- the shader no longer declares what Rust reads from it"
-    );
-    assert!(
-        count(src, pat) == 1,
-        "WGSL: pattern occurs more than once -- which one sets the constant is ambiguous"
-    );
+    // One pass, counting matches and remembering the first: this runs at
+    // compile time for every constant below, and rescanning each shader once
+    // per assertion is enough const-eval work to trip `long_running_const_eval`.
     let (s, p) = (src.as_bytes(), pat.as_bytes());
-    let mut i = 0;
+    let (mut i, mut n, mut at) = (0, 0, 0);
     while i + p.len() <= s.len() {
         let mut j = 0;
         while j < p.len() && s[i + j] == p[j] {
             j += 1;
         }
         if j == p.len() {
-            let mut k = i + p.len();
-            let (mut v, mut digits) = (0u32, 0u32);
-            while k < s.len() && s[k].is_ascii_digit() {
-                v = v * 10 + (s[k] - b'0') as u32;
-                k += 1;
-                digits += 1;
+            if n == 0 {
+                at = i;
             }
-            assert!(digits > 0, "WGSL: pattern is not followed by a number");
-            return v;
+            n += 1;
         }
         i += 1;
     }
-    unreachable!()
+    assert!(
+        n != 0,
+        "WGSL: pattern not found -- the shader no longer declares what Rust reads from it"
+    );
+    assert!(
+        n == 1,
+        "WGSL: pattern occurs more than once -- which one sets the constant is ambiguous"
+    );
+    let mut k = at + p.len();
+    let (mut v, mut digits) = (0u32, 0u32);
+    while k < s.len() && s[k].is_ascii_digit() {
+        v = v * 10 + (s[k] - b'0') as u32;
+        k += 1;
+        digits += 1;
+    }
+    assert!(digits > 0, "WGSL: pattern is not followed by a number");
+    v
 }
 
 /// GEMM output-tile edge: the grid is `ceil(n/TILE) x ceil(m/TILE) x batch`.
@@ -158,6 +174,14 @@ const TILE: u32 = u32_after(GEMM_SRC, "const TILE: u32 = ");
 /// Output columns one GEMV workgroup produces: grid is `ceil(n/GEMV_TN)`. Same
 /// reasoning as `TILE`.
 const GEMV_TN: u32 = u32_after(GEMV_SRC, "const TN: u32 = ");
+/// Dispatch geometry of the three q8_0 kernels, read out of the shaders for
+/// the same reason as `TILE`: the grids are `ceil(n/GEMV_Q8_TN)`,
+/// `ceil(n/GEMM_Q8_TN) x ceil(m/GEMM_Q8_MR)` and
+/// `ceil(n/GEMM_Q8_TILE) x ceil(m/GEMM_Q8_TILE)`.
+const GEMV_Q8_TN: u32 = u32_after(GEMV_Q8_SRC, "const TN: u32 = ");
+const GEMM_Q8_TN: u32 = u32_after(GEMM_Q8_SRC, "const TN: u32 = ");
+const GEMM_Q8_MR: u32 = u32_after(GEMM_Q8_SRC, "const MR: u32 = ");
+const GEMM_Q8_TILE: u32 = u32_after(GEMM_Q8_TILED_SRC, "const TILE: u32 = ");
 
 /// The sizes each kernel hardcodes, checked against the constants they were
 /// derived from. Both kernels fully unroll their inner tile into named scalars
@@ -221,6 +245,81 @@ const _: () = {
     assert!(
         gtpb * GEMV_TN == u32_after(GEMV_SRC, "var<workgroup> sh: array<f32, "),
         "gemv.wgsl: `sh` must hold one slot per (thread, column)"
+    );
+
+    // gemv_q8.wgsl: the f32 gemv's shape over a q8_0 weight -- TPB threads
+    // each accumulating TN columns, reduced in log2(TPB) halving steps.
+    let vtpb = u32_after(GEMV_Q8_SRC, "const TPB: u32 = ");
+    assert!(
+        vtpb.is_power_of_two(),
+        "gemv_q8.wgsl: the reduction halves the active thread count each step"
+    );
+    assert!(vtpb == 64, "gemv_q8.wgsl: TPB must be the thread count of the @workgroup_size");
+    // Matched literally, so a reformat trips this rather than going unnoticed.
+    assert!(
+        contains(GEMV_Q8_SRC, "@workgroup_size(64)"),
+        "gemv_q8.wgsl: @workgroup_size must be spelled exactly `@workgroup_size(64)`"
+    );
+    assert!(GEMV_Q8_TN == 4, "gemv_q8.wgsl: the acc0..acc3 accumulators are unrolled for TN == 4");
+    assert!(
+        vtpb * GEMV_Q8_TN == u32_after(GEMV_Q8_SRC, "var<workgroup> sh: array<f32, "),
+        "gemv_q8.wgsl: `sh` must hold one slot per (thread, column)"
+    );
+
+    // gemm_q8.wgsl: the same reduction widened to MR rows, so one pass over
+    // the weight stream serves MR * TN outputs.
+    let qtpb = u32_after(GEMM_Q8_SRC, "const TPB: u32 = ");
+    let qacc = u32_after(GEMM_Q8_SRC, "const ACC: u32 = ");
+    assert!(
+        qtpb.is_power_of_two(),
+        "gemm_q8.wgsl: the reduction halves the active thread count each step"
+    );
+    assert!(qtpb == 64, "gemm_q8.wgsl: TPB must be the thread count of the @workgroup_size");
+    // Matched literally, so a reformat trips this rather than going unnoticed.
+    assert!(
+        contains(GEMM_Q8_SRC, "@workgroup_size(64)"),
+        "gemm_q8.wgsl: @workgroup_size must be spelled exactly `@workgroup_size(64)`"
+    );
+    assert!(
+        GEMM_Q8_MR == 4 && GEMM_Q8_TN == 4,
+        "gemm_q8.wgsl: the a00..a33 accumulators are unrolled for MR == 4, TN == 4"
+    );
+    assert!(
+        qacc == GEMM_Q8_MR * GEMM_Q8_TN,
+        "gemm_q8.wgsl: ACC must be the MR x TN accumulator count"
+    );
+    assert!(
+        qtpb * qacc == u32_after(GEMM_Q8_SRC, "var<workgroup> sh: array<f32, "),
+        "gemm_q8.wgsl: `sh` must hold one slot per (thread, accumulator)"
+    );
+
+    // gemm_q8_tiled.wgsl: gemm_tiled's staged TILE x TILE shape, dequantizing
+    // the weight into the `bt` stage so it is read once regardless of m.
+    let ttpb = u32_after(GEMM_Q8_TILED_SRC, "const TPB: u32 = ");
+    let tkstep = u32_after(GEMM_Q8_TILED_SRC, "const KSTEP: u32 = ");
+    let trt = u32_after(GEMM_Q8_TILED_SRC, "const RT: u32 = ");
+    assert!(
+        ttpb == 64,
+        "gemm_q8_tiled.wgsl: TPB must be the thread count of the 8x8 @workgroup_size"
+    );
+    // Matched literally, so a reformat trips this rather than going unnoticed.
+    assert!(
+        contains(GEMM_Q8_TILED_SRC, "@workgroup_size(8, 8, 1)"),
+        "gemm_q8_tiled.wgsl: @workgroup_size must be spelled exactly `@workgroup_size(8, 8, 1)`"
+    );
+    assert!(trt == 4, "gemm_q8_tiled.wgsl: the c00..c33 accumulators are unrolled for RT == 4");
+    assert!(
+        GEMM_Q8_TILE == 8 * trt,
+        "gemm_q8_tiled.wgsl: TILE must be 8 threads x the RT-wide patch each one owns"
+    );
+    let tstage = GEMM_Q8_TILE * tkstep;
+    assert!(
+        tstage == u32_after(GEMM_Q8_TILED_SRC, "var<workgroup> at: array<f32, "),
+        "gemm_q8_tiled.wgsl: `at` must hold TILE*KSTEP elements"
+    );
+    assert!(
+        tstage == u32_after(GEMM_Q8_TILED_SRC, "var<workgroup> bt: array<f32, "),
+        "gemm_q8_tiled.wgsl: `bt` must hold KSTEP*TILE elements"
     );
 };
 /// Busy-poll budget for `Device::wait_for_queue` (see there), overridable with
