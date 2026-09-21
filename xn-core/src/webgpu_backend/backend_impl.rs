@@ -21,7 +21,7 @@ impl crate::Backend for Device {
     unsafe fn alloc_uninit<T: WithDType>(len: usize, dev: &Self) -> Result<Self::Storage<T>> {
         let bytes = len * T::BYTE_SIZE;
         let buffer = dev.alloc_buffer(bytes);
-        Ok(Storage { buffer, len, class: size_class(bytes), device: dev.clone(), _t: PhantomData })
+        Ok(Storage { buffer, len, device: dev.clone(), _t: PhantomData })
     }
 
     fn from_vec<T: WithDType>(v: Vec<T>, dev: &Self) -> Result<Self::Storage<T>> {
@@ -421,15 +421,16 @@ impl crate::Backend for Device {
             .usize(lhs.1)
             .usize(rhs.1);
         if m == 1 {
-            // Decode path: one workgroup per output column, grid (n, batch, 1).
-            // rhs is bound twice: once scalar, once as a vec4 view for the
-            // shader's aligned fast-path loads (see gemv.wgsl).
+            // Decode path: one 64-thread workgroup per GEMV_TN output columns,
+            // grid (ceil(n/GEMV_TN), batch, 1). rhs is bound twice: once
+            // scalar, once as a vec4 view for the shader's aligned fast-path
+            // loads (see gemv.wgsl).
             let buffers = [&dst.buffer, &lhs.0.buffer, &rhs.0.buffer, &rhs.0.buffer];
             dst.device.dispatch_nd(
                 &format!("gemv_{dt}"),
                 &buffers,
                 &push,
-                (n as u32, lhs_b as u32, 1),
+                (div_ceil(n, GEMV_TN), lhs_b as u32, 1),
             )
         } else {
             // Tiled kernel: grid (ceil(n/TILE), ceil(m/TILE), batch).
@@ -623,7 +624,7 @@ impl crate::Backend for Device {
                 &push,
                 div_ceil(numel, WORKGROUP_SIZE),
             );
-            dst.device.defer_free(PooledBuf { buffer: scratch, class: size_class(info.len() * 4) });
+            dst.device.defer_free(scratch);
             res
         } else {
             let n = dims.len();
@@ -712,7 +713,7 @@ impl crate::Backend for Device {
                 &push,
                 div_ceil(numel, WORKGROUP_SIZE),
             );
-            dst.device.defer_free(PooledBuf { buffer: scratch, class: size_class(info.len() * 4) });
+            dst.device.defer_free(scratch);
             res
         } else {
             let n = dst_shape.len();
