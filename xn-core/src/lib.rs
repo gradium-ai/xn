@@ -56,6 +56,11 @@ pub mod webgpu_backend;
 #[cfg(feature = "webgpu")]
 pub use webgpu_backend::Device as WebGpuDevice;
 
+#[cfg(feature = "xla")]
+pub mod xla_backend;
+#[cfg(feature = "xla")]
+pub use xla_backend::Device as XlaDevice;
+
 pub fn with_avx() -> bool {
     cfg!(target_feature = "avx")
 }
