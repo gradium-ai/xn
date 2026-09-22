@@ -10,7 +10,7 @@ categories = ["science"]
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-xn = { path = "../xn-core", features = ["cuda"], version = "0.2.4" }
+xn = { path = "../xn-core", features = ["cuda"], version = "0.2.5" }
 cudarc = { version = "0.19.4", features = ["driver"], default-features = false }
 half = { version = "2.7.1", features = ["num-traits"] }
 

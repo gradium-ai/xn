@@ -3538,7 +3538,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xn"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "ash",
