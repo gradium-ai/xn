@@ -21,7 +21,7 @@ bindgen_cuda = "0.1.6"
 byteorder = "1"
 clap = { version = "4", features = ["derive"] }
 cudarc = { version = "0.19.9", features = ["std", "cublas", "cublaslt", "curand", "driver", "nvrtc", "f16", "cuda-version-from-build-system", "dynamic-linking"] }
-gemm = { git = "https://github.com/gradium-ai/gemm", tag = "v0.20.0", version = "0.20.0", features = ["wasm-simd128-enable"] }
+gemm = { package = "xn-gemm", version = "0.20.1", features = ["wasm-simd128-enable"] }
 half = { version = "2.7.1", features = ["num-traits"] }
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 kaudio = "0.2.1"

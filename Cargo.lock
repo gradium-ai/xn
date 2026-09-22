@@ -82,7 +82,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -93,7 +93,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -577,7 +577,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -662,7 +662,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -797,118 +797,6 @@ dependencies = [
  "pin-project-lite",
  "pin-utils",
  "slab",
-]
-
-[[package]]
-name = "gemm"
-version = "0.20.0"
-source = "git+https://github.com/gradium-ai/gemm?tag=v0.20.0#b09c3d2d6fbf317ae6a8a1e4156aa6f5cee08138"
-dependencies = [
- "dyn-stack",
- "gemm-c32",
- "gemm-c64",
- "gemm-common",
- "gemm-f16",
- "gemm-f32",
- "gemm-f64",
- "num-complex",
- "num-traits",
- "paste",
- "raw-cpuid",
- "seq-macro",
-]
-
-[[package]]
-name = "gemm-c32"
-version = "0.20.0"
-source = "git+https://github.com/gradium-ai/gemm?tag=v0.20.0#b09c3d2d6fbf317ae6a8a1e4156aa6f5cee08138"
-dependencies = [
- "dyn-stack",
- "gemm-common",
- "num-complex",
- "num-traits",
- "paste",
- "raw-cpuid",
- "seq-macro",
-]
-
-[[package]]
-name = "gemm-c64"
-version = "0.20.0"
-source = "git+https://github.com/gradium-ai/gemm?tag=v0.20.0#b09c3d2d6fbf317ae6a8a1e4156aa6f5cee08138"
-dependencies = [
- "dyn-stack",
- "gemm-common",
- "num-complex",
- "num-traits",
- "paste",
- "raw-cpuid",
- "seq-macro",
-]
-
-[[package]]
-name = "gemm-common"
-version = "0.20.0"
-source = "git+https://github.com/gradium-ai/gemm?tag=v0.20.0#b09c3d2d6fbf317ae6a8a1e4156aa6f5cee08138"
-dependencies = [
- "bytemuck",
- "dyn-stack",
- "half",
- "libm",
- "num-complex",
- "num-traits",
- "once_cell",
- "paste",
- "pulp",
- "raw-cpuid",
- "rayon",
- "seq-macro",
- "sysctl",
-]
-
-[[package]]
-name = "gemm-f16"
-version = "0.20.0"
-source = "git+https://github.com/gradium-ai/gemm?tag=v0.20.0#b09c3d2d6fbf317ae6a8a1e4156aa6f5cee08138"
-dependencies = [
- "dyn-stack",
- "gemm-common",
- "gemm-f32",
- "half",
- "num-complex",
- "num-traits",
- "paste",
- "raw-cpuid",
- "rayon",
- "seq-macro",
-]
-
-[[package]]
-name = "gemm-f32"
-version = "0.20.0"
-source = "git+https://github.com/gradium-ai/gemm?tag=v0.20.0#b09c3d2d6fbf317ae6a8a1e4156aa6f5cee08138"
-dependencies = [
- "dyn-stack",
- "gemm-common",
- "num-complex",
- "num-traits",
- "paste",
- "raw-cpuid",
- "seq-macro",
-]
-
-[[package]]
-name = "gemm-f64"
-version = "0.20.0"
-source = "git+https://github.com/gradium-ai/gemm?tag=v0.20.0#b09c3d2d6fbf317ae6a8a1e4156aa6f5cee08138"
-dependencies = [
- "dyn-stack",
- "gemm-common",
- "num-complex",
- "num-traits",
- "paste",
- "raw-cpuid",
- "seq-macro",
 ]
 
 [[package]]
@@ -1606,7 +1494,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3274,7 +3162,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3546,7 +3434,6 @@ dependencies = [
  "byteorder",
  "clap",
  "cudarc",
- "gemm",
  "half",
  "hf-hub",
  "kaudio",
@@ -3569,7 +3456,127 @@ dependencies = [
  "tracing-chrome",
  "tracing-subscriber",
  "wgpu",
+ "xn-gemm",
  "yoke",
+]
+
+[[package]]
+name = "xn-gemm"
+version = "0.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42f9870e23208b830b4776ad5fa1d75fc53a59cfdad9e9e92a79d31d14613512"
+dependencies = [
+ "dyn-stack",
+ "num-complex",
+ "num-traits",
+ "paste",
+ "raw-cpuid",
+ "seq-macro",
+ "xn-gemm-c32",
+ "xn-gemm-c64",
+ "xn-gemm-common",
+ "xn-gemm-f16",
+ "xn-gemm-f32",
+ "xn-gemm-f64",
+]
+
+[[package]]
+name = "xn-gemm-c32"
+version = "0.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c397f4ceb91ecd9847579d27ea8cec7dedc9a7b0b0f1e69aae636ce1da43feb"
+dependencies = [
+ "dyn-stack",
+ "num-complex",
+ "num-traits",
+ "paste",
+ "raw-cpuid",
+ "seq-macro",
+ "xn-gemm-common",
+]
+
+[[package]]
+name = "xn-gemm-c64"
+version = "0.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d4dc98f425aa3c1047099d5d0407d4efb3e5e7aa6e85bd4343b0c7eaa1e57cc"
+dependencies = [
+ "dyn-stack",
+ "num-complex",
+ "num-traits",
+ "paste",
+ "raw-cpuid",
+ "seq-macro",
+ "xn-gemm-common",
+]
+
+[[package]]
+name = "xn-gemm-common"
+version = "0.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48c99ef04320b4dc583814dd67b10dff68cc2db60d927770ddee590ac31f4577"
+dependencies = [
+ "bytemuck",
+ "dyn-stack",
+ "half",
+ "libm",
+ "num-complex",
+ "num-traits",
+ "once_cell",
+ "paste",
+ "pulp",
+ "raw-cpuid",
+ "rayon",
+ "seq-macro",
+ "sysctl",
+]
+
+[[package]]
+name = "xn-gemm-f16"
+version = "0.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33b73379c0fe9c9986dcc1ab7a579a0f9b67f08964b44f08acb5956adfd94002"
+dependencies = [
+ "dyn-stack",
+ "half",
+ "num-complex",
+ "num-traits",
+ "paste",
+ "raw-cpuid",
+ "rayon",
+ "seq-macro",
+ "xn-gemm-common",
+ "xn-gemm-f32",
+]
+
+[[package]]
+name = "xn-gemm-f32"
+version = "0.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b629f3b55e84af9b98faff68bdb2a596c6a39a75356d639e89a803e4b8da9a6e"
+dependencies = [
+ "dyn-stack",
+ "num-complex",
+ "num-traits",
+ "paste",
+ "raw-cpuid",
+ "seq-macro",
+ "xn-gemm-common",
+]
+
+[[package]]
+name = "xn-gemm-f64"
+version = "0.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e266576fc0829ea63da4fe795bf79b2f959591a8cdea3bbb64cb673452674a3a"
+dependencies = [
+ "dyn-stack",
+ "num-complex",
+ "num-traits",
+ "paste",
+ "raw-cpuid",
+ "seq-macro",
+ "xn-gemm-common",
 ]
 
 [[package]]
