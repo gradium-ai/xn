@@ -1,7 +1,6 @@
 [workspace]
 members = [
   "xn-core",
-  "xn-moshi",
 ]
 exclude = ["xn-flash-attn"]
 resolver = "3"
@@ -38,8 +37,6 @@ rand = { version = "0.9.0", default-features = false }
 rand_distr = "0.5.0"
 rayon = "1.11.0"
 safetensors = "0.7"
-sentencepiece = "0.13.1"
-serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 thiserror = "2.0.17"
 tokenizers = "0.21"
