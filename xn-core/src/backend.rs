@@ -347,8 +347,11 @@ pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
     ///   `k[k_off + bi * kv_batch_stride + j * h * d + hh * d + i]` (same for `v`)
     /// `dst` is contiguous `(b, h * d)`.
     ///
-    /// `mask`, when given, is `kv` contiguous additive terms applied to every head and batch
-    /// (`0` to keep a position, `-inf` to drop it).
+    /// `mask`, when given, is `(storage, offset, batch stride)`: `kv` contiguous additive
+    /// terms per batch entry (`0` to keep a position, `-inf` to drop it), applied to every
+    /// head, with entry `bi` reading `mask[offset + bi * batch_stride + j]`. A batch stride of
+    /// `0` shares one row of terms across the batch; `kv` gives every entry its own row, which
+    /// is how a batch of sequences padded to a common length hides each one's padding.
     ///
     /// Fusing matters here because the composed form is a batch of `h` tiny matmuls per
     /// projection plus a separate softmax pass, which is dominated by per-call overhead rather
@@ -359,7 +362,7 @@ pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
         _q: (&Self::Storage<T>, usize),
         _k: (&Self::Storage<T>, usize),
         _v: (&Self::Storage<T>, usize),
-        _mask: Option<(&Self::Storage<T>, usize)>,
+        _mask: Option<(&Self::Storage<T>, usize, usize)>,
         _kv_batch_stride: usize,
         _b: usize,
         _h: usize,

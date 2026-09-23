@@ -279,6 +279,12 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
     /// values, shape `(b, kv, h, d)` — the layout an attention cache is written in, so callers
     /// need no transposes. Returns `(b, 1, h * d)`, ready for the output projection.
     ///
+    /// `mask`, when given, holds additive terms per key position (`0` to keep it, `-inf` to
+    /// drop it), applied to every head. It is either `kv` values, shared by the whole batch,
+    /// or `b * kv` values with `b` as its first dimension and `kv` as its last, one row per
+    /// batch entry — which is how a batch of sequences padded to a common length hides each
+    /// one's padding.
+    ///
     /// Backends advertising [`Backend::FUSED_SDPA_DECODE`] run this as one pass; otherwise it
     /// is composed from transpose/matmul/softmax, which is what the caller would have written
     /// by hand.
@@ -323,15 +329,14 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         let k_ok = laid_out(k.strides(), kv_batch_stride);
         let v_ok = laid_out(v.strides(), kv_batch_stride);
 
-        // A mask is applied per key position, broadcast over heads and batch, so it has to be
-        // exactly `kv` values with every leading dimension 1.
+        // A mask is `kv` terms shared by the batch, or one row of `kv` terms per batch entry.
+        let mask_rows = match mask {
+            None => 1,
+            Some(m) => Self::sdpa_mask_rows(m, b, kv)?,
+        };
         let mask_ok = match mask {
             None => true,
-            Some(m) => {
-                m.shape.elem_count() == kv
-                    && *m.shape.dims().last().unwrap_or(&0) == kv
-                    && m.shape.is_contiguous(&m.shape.stride_contiguous())
-            }
+            Some(m) => m.shape.is_contiguous(&m.shape.stride_contiguous()),
         };
         if B::FUSED_SDPA_DECODE
             && d <= B::SDPA_MAX_HEAD_DIM
@@ -352,12 +357,13 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
                     Some(m) => Some(m.storage()?),
                     None => None,
                 };
+                let mask_batch_stride = if mask_rows == b { kv } else { 0 };
                 B::sdpa_decode(
                     &mut os,
                     (&qs, 0),
                     (&ks, k_off),
                     (&vs, v_off),
-                    ms.as_deref().map(|m| (m, 0)),
+                    ms.as_deref().map(|m| (m, 0, mask_batch_stride)),
                     kv_batch_stride,
                     b,
                     h,
@@ -369,16 +375,37 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
             return Ok(out);
         }
 
-        self.sdpa_composed(k, v, mask, scale, b, hd)
+        self.sdpa_composed(k, v, mask, mask_rows, scale, b, hd)
+    }
+
+    /// How many rows of `kv` terms `mask` holds: 1 when shared by the batch, `b` when there is
+    /// one per entry. Anything else is a shape error.
+    fn sdpa_mask_rows(mask: &Self, b: usize, kv: usize) -> Result<usize> {
+        let dims = mask.shape.dims();
+        let last = dims.last().copied().unwrap_or(0);
+        let n = mask.shape.elem_count();
+        if last == kv && n == kv {
+            Ok(1)
+        } else if last == kv && n == b * kv && dims[0] == b {
+            Ok(b)
+        } else {
+            crate::bail!(
+                "sdpa_decode: mask {:?} must be {kv} terms, or {b} rows of {kv} with the batch \
+                 as its first dimension",
+                mask.shape
+            )
+        }
     }
 
     /// The transpose/matmul/softmax sequence a caller would otherwise write by hand. Used when
     /// the backend has no fused kernel, or when the operands do not match the layout it needs.
+    #[allow(clippy::too_many_arguments)]
     fn sdpa_composed(
         &self,
         k: &crate::TensorView<T, B>,
         v: &crate::TensorView<T, B>,
         mask: Option<&Self>,
+        mask_rows: usize,
         scale: f32,
         b: usize,
         hd: usize,
@@ -388,7 +415,9 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         let vt = v.transpose(1, 2)?;
         let attn = q.matmul_t(&kt)?.scale(T::from_f32(scale))?;
         let attn = match mask {
-            Some(m) => attn.broadcast_add(m)?,
+            // Scores are (b, h, 1, kv); a mask row broadcasts over the heads, and a shared
+            // mask over the batch as well.
+            Some(m) => attn.broadcast_add(&m.reshape((mask_rows, 1, 1, kt.dims()[2]))?)?,
             None => attn,
         };
         let attn = attn.softmax()?;

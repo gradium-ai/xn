@@ -1252,6 +1252,88 @@ fn test_sdpa_decode_rejects_bad_shapes_cpu() -> Result<()> {
     Ok(())
 }
 
+/// A batch of sequences padded to a common length: each row hides its own padding through
+/// its own row of the mask, and comes out exactly as it would have alone with a shared mask.
+#[test]
+fn test_sdpa_decode_per_row_mask_cpu() -> Result<()> {
+    let dev = &xn::CPU;
+    let (b, h, d, kv) = (3usize, 4usize, 16usize, 9usize);
+    let mut seed = 0x9e37_79b9u32;
+    let mut rnd = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        (seed as f32 / u32::MAX as f32) - 0.5
+    };
+    let q: Tensor<f32, _> =
+        Tensor::from_vec((0..b * h * d).map(|_| rnd()).collect(), (b, 1, h, d), dev)?;
+    let kc: Tensor<f32, _> =
+        Tensor::from_vec((0..b * kv * h * d).map(|_| rnd()).collect(), (b, kv, h, d), dev)?;
+    let vc: Tensor<f32, _> =
+        Tensor::from_vec((0..b * kv * h * d).map(|_| rnd()).collect(), (b, kv, h, d), dev)?;
+    let scale = 1.0 / (d as f32).sqrt();
+    // Row r hides its first `pads[r]` positions, as left padding to a common length would.
+    let pads = [0usize, 4, 7];
+    let row_mask = |p: usize| -> Vec<f32> {
+        (0..kv).map(|j| if j < p { f32::NEG_INFINITY } else { 0.0 }).collect()
+    };
+    let mask: Tensor<f32, _> =
+        Tensor::from_vec(pads.iter().flat_map(|&p| row_mask(p)).collect(), (b, kv), dev)?;
+
+    let got = q.sdpa_decode(&kc.narrow(1, 0..kv)?, &vc.narrow(1, 0..kv)?, Some(&mask), scale)?;
+    assert_eq!(got.dims(), &[b, 1, h * d]);
+    let got = got.to_vec()?;
+
+    // Each row alone, with its own mask shared by its batch of one.
+    for (r, &p) in pads.iter().enumerate() {
+        let qr = q.narrow(0, r..r + 1)?.contiguous()?;
+        let kr = kc.narrow(0, r..r + 1)?.contiguous()?;
+        let vr = vc.narrow(0, r..r + 1)?.contiguous()?;
+        let mr: Tensor<f32, _> = Tensor::from_vec(row_mask(p), (1, 1, 1, kv), dev)?;
+        let want = qr
+            .sdpa_decode(&kr.narrow(1, 0..kv)?, &vr.narrow(1, 0..kv)?, Some(&mr), scale)?
+            .to_vec()?;
+        for (i, (g, w)) in got[r * h * d..(r + 1) * h * d].iter().zip(want.iter()).enumerate() {
+            assert!(
+                (g - w).abs() <= 1e-5 * w.abs().max(1.0),
+                "row {r} index {i}: got {g}, want {w}"
+            );
+        }
+    }
+
+    // The composed form with the same per-row mask, which the non-fused backends run.
+    let want = sdpa_reference(
+        &q,
+        &kc.narrow(1, 0..kv)?,
+        &vc.narrow(1, 0..kv)?,
+        Some(&mask.reshape((b, 1, 1, kv))?),
+        scale,
+    )?;
+    for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+        assert!((g - w).abs() <= 1e-5 * w.abs().max(1.0), "composed index {i}: got {g}, want {w}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_sdpa_decode_rejects_bad_masks_cpu() -> Result<()> {
+    let dev = &xn::CPU;
+    let (b, h, d, kv) = (2usize, 2usize, 8usize, 5usize);
+    let q: Tensor<f32, _> = Tensor::full(0.5, (b, 1, h, d), dev)?;
+    let kc: Tensor<f32, _> = Tensor::full(0.25, (b, kv, h, d), dev)?;
+    let k = kc.narrow(1, 0..kv)?;
+    for shape in [vec![kv + 1], vec![b + 1, kv], vec![kv, b], vec![b, kv - 1]] {
+        let mask: Tensor<f32, _> = Tensor::zeros(shape.clone(), dev)?;
+        assert!(q.sdpa_decode(&k, &k, Some(&mask), 1.0).is_err(), "mask {shape:?} was accepted");
+    }
+    // Both accepted spellings.
+    for shape in [vec![kv], vec![1, 1, 1, kv], vec![b, kv], vec![b, 1, 1, kv]] {
+        let mask: Tensor<f32, _> = Tensor::zeros(shape.clone(), dev)?;
+        assert!(q.sdpa_decode(&k, &k, Some(&mask), 1.0).is_ok(), "mask {shape:?} was refused");
+    }
+    Ok(())
+}
+
 // =============================================================================
 // Pad with same tests
 // =============================================================================
