@@ -1315,6 +1315,54 @@ fn test_sdpa_decode_per_row_mask_cpu() -> Result<()> {
     Ok(())
 }
 
+/// The composed form, which every backend without a fused kernel runs, with a shared and a
+/// per-row mask. A cache with a spare head, narrowed to `h`, has a position stride the fused
+/// kernel's layout check refuses, so `sdpa_decode` takes the composed path here.
+#[test]
+fn test_sdpa_decode_composed_path_masks_cpu() -> Result<()> {
+    let dev = &xn::CPU;
+    let (b, h, d, kv) = (3usize, 4usize, 16usize, 9usize);
+    let mut seed = 0x1234_5678u32;
+    let mut rnd = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        (seed as f32 / u32::MAX as f32) - 0.5
+    };
+    let q: Tensor<f32, _> =
+        Tensor::from_vec((0..b * h * d).map(|_| rnd()).collect(), (b, 1, h, d), dev)?;
+    let spare = h + 1;
+    let kc: Tensor<f32, _> =
+        Tensor::from_vec((0..b * kv * spare * d).map(|_| rnd()).collect(), (b, kv, spare, d), dev)?;
+    let vc: Tensor<f32, _> =
+        Tensor::from_vec((0..b * kv * spare * d).map(|_| rnd()).collect(), (b, kv, spare, d), dev)?;
+    let k = kc.narrow(1, 0..kv)?.narrow(2, 0..h)?;
+    let v = vc.narrow(1, 0..kv)?.narrow(2, 0..h)?;
+    assert_ne!(k.strides()[1], h * d, "the operands must not fit the fused layout");
+    let scale = 1.0 / (d as f32).sqrt();
+
+    let pads = [1usize, 4, 7];
+    let row_mask = |p: usize| -> Vec<f32> {
+        (0..kv).map(|j| if j < p { f32::NEG_INFINITY } else { 0.0 }).collect()
+    };
+    let shared: Tensor<f32, _> = Tensor::from_vec(row_mask(3), (1, 1, 1, kv), dev)?;
+    let per_row: Tensor<f32, _> =
+        Tensor::from_vec(pads.iter().flat_map(|&p| row_mask(p)).collect(), (b, kv), dev)?;
+    for (name, mask, rows) in [("shared", &shared, 1), ("per-row", &per_row, b)] {
+        let got = q.sdpa_decode(&k, &v, Some(mask), scale)?;
+        assert_eq!(got.dims(), &[b, 1, h * d]);
+        let got = got.to_vec()?;
+        let want = sdpa_reference(&q, &k, &v, Some(&mask.reshape((rows, 1, 1, kv))?), scale)?;
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (g - w).abs() <= 1e-5 * w.abs().max(1.0),
+                "{name} mask, index {i}: got {g}, want {w}"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn test_sdpa_decode_rejects_bad_masks_cpu() -> Result<()> {
     let dev = &xn::CPU;
@@ -1322,10 +1370,13 @@ fn test_sdpa_decode_rejects_bad_masks_cpu() -> Result<()> {
     let q: Tensor<f32, _> = Tensor::full(0.5, (b, 1, h, d), dev)?;
     let kc: Tensor<f32, _> = Tensor::full(0.25, (b, kv, h, d), dev)?;
     let k = kc.narrow(1, 0..kv)?;
-    for shape in [vec![kv + 1], vec![b + 1, kv], vec![kv, b], vec![b, kv - 1]] {
+    for shape in [vec![kv + 1], vec![b + 1, kv], vec![kv, b], vec![b, kv - 1], vec![b, h, 1, kv]] {
         let mask: Tensor<f32, _> = Tensor::zeros(shape.clone(), dev)?;
         assert!(q.sdpa_decode(&k, &k, Some(&mask), 1.0).is_err(), "mask {shape:?} was accepted");
     }
+    let per_head: Tensor<f32, _> = Tensor::zeros((b, h, 1, kv), dev)?;
+    let err = q.sdpa_decode(&k, &k, Some(&per_head), 1.0).unwrap_err().to_string();
+    assert!(err.contains("per head"), "{err}");
     // Both accepted spellings.
     for shape in [vec![kv], vec![1, 1, 1, kv], vec![b, kv], vec![b, 1, 1, kv]] {
         let mask: Tensor<f32, _> = Tensor::zeros(shape.clone(), dev)?;

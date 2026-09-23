@@ -283,7 +283,8 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
     /// drop it), applied to every head. It is either `kv` values, shared by the whole batch,
     /// or `b * kv` values with `b` as its first dimension and `kv` as its last, one row per
     /// batch entry — which is how a batch of sequences padded to a common length hides each
-    /// one's padding.
+    /// one's padding. The per-row form spells `kv` out even when it is 1, so `(b, 1)` rather
+    /// than `(b,)`. A mask per head is not supported on either path.
     ///
     /// Backends advertising [`Backend::FUSED_SDPA_DECODE`] run this as one pass; otherwise it
     /// is composed from transpose/matmul/softmax, which is what the caller would have written
@@ -334,18 +335,8 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
             None => 1,
             Some(m) => Self::sdpa_mask_rows(m, b, kv)?,
         };
-        let mask_ok = match mask {
-            None => true,
-            Some(m) => m.shape.is_contiguous(&m.shape.stride_contiguous()),
-        };
-        if B::FUSED_SDPA_DECODE
-            && d <= B::SDPA_MAX_HEAD_DIM
-            && kv > 0
-            && q_ok
-            && k_ok
-            && v_ok
-            && mask_ok
-        {
+        // A `Tensor` is always contiguous, so a mask needs no layout check of its own.
+        if B::FUSED_SDPA_DECODE && d <= B::SDPA_MAX_HEAD_DIM && kv > 0 && q_ok && k_ok && v_ok {
             let out: Tensor<T, B> =
                 unsafe { Tensor::alloc_uninit(crate::Shape::from((b, 1, hd)), self.device()) }?;
             {
@@ -357,7 +348,7 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
                     Some(m) => Some(m.storage()?),
                     None => None,
                 };
-                let mask_batch_stride = if mask_rows == b { kv } else { 0 };
+                let mask_batch_stride = if mask_rows == 1 { 0 } else { kv };
                 B::sdpa_decode(
                     &mut os,
                     (&qs, 0),
@@ -386,12 +377,12 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         let n = mask.shape.elem_count();
         if last == kv && n == kv {
             Ok(1)
-        } else if last == kv && n == b * kv && dims[0] == b {
+        } else if last == kv && n == b * kv && dims.first() == Some(&b) {
             Ok(b)
         } else {
             crate::bail!(
                 "sdpa_decode: mask {:?} must be {kv} terms, or {b} rows of {kv} with the batch \
-                 as its first dimension",
+                 as its first dimension; a mask per head is not supported",
                 mask.shape
             )
         }
