@@ -49,7 +49,9 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
     let def = match base {
         "fill" => (include_str!("../../webgpu-kernels/fill.wgsl"), 1),
         "unary" => (include_str!("../../webgpu-kernels/unary.wgsl"), 2),
+        "unary_inplace" => (include_str!("../../webgpu-kernels/unary_inplace.wgsl"), 1),
         "binary" => (include_str!("../../webgpu-kernels/binary.wgsl"), 3),
+        "binary_inplace" => (include_str!("../../webgpu-kernels/binary_inplace.wgsl"), 2),
         "scale_add" => (include_str!("../../webgpu-kernels/scale_add.wgsl"), 2),
         "broadcast" => (include_str!("../../webgpu-kernels/broadcast.wgsl"), 4),
         "softmax" => (include_str!("../../webgpu-kernels/softmax.wgsl"), 2),

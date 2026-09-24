@@ -1,12 +1,15 @@
-// Elementwise unary ops. The in-place form is `unary_inplace.wgsl`: binding one
-// buffer as both src and dst is a buffer aliasing itself, which a browser rejects.
+// Elementwise unary ops, in place.
+//
+// Separate from `unary.wgsl` because the in-place form cannot bind the same
+// buffer to src and dst: a buffer used as writable storage may not appear
+// again in the same dispatch, whatever the second binding declares. Native
+// drivers tolerate it; a browser drops the whole command buffer.
 // `op` matches the `UnaryOp` order used by the CPU/CUDA backends.
 struct Params { n: u32, op: u32, alpha: f32 };
 // WebGPU has no push constants; parameters arrive in a uniform windowed
 // to this dispatch's slot by a dynamic offset.
 @group(0) @binding(8) var<uniform> pc: Params;
-@group(0) @binding(0) var<storage, read> src: array<f32>;
-@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(0) var<storage, read_write> dst: array<f32>;
 
 // Abramowitz & Stegun 7.1.26 approximation of erf, max abs error ~1.5e-7.
 fn erf_approx(x0: f32) -> f32 {
@@ -22,7 +25,7 @@ fn erf_approx(x0: f32) -> f32 {
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if i >= pc.n { return; }
-    let x = src[i];
+    let x = dst[i];
     var r: f32;
     switch pc.op {
         case 0u: { r = cos(x); }

@@ -150,9 +150,11 @@ impl crate::Backend for Device {
         let dt = dtype_suffix::<T>("inplace_unary")?;
         let (code, alpha) = unary_op_code(op);
         let push = Pc::new().usize(len).u32(code).f32(alpha);
+        // `unary_inplace`, not `unary`: one buffer, read and written. See
+        // `bin_assign` for why binding it twice is not an option.
         dst.device.dispatch(
-            &format!("unary_{dt}"),
-            &[&dst.buffer, &dst.buffer],
+            &format!("unary_inplace_{dt}"),
+            &[&dst.buffer],
             &push,
             div_ceil(len, WORKGROUP_SIZE),
         )
@@ -183,9 +185,12 @@ impl crate::Backend for Device {
     ) -> Result<()> {
         if let Some(dt) = float_suffix::<T>() {
             let push = Pc::new().usize(len).u32(binary_op_code(op));
+            // `binary_inplace`, not `binary`: dst is both operand and result, and
+            // a buffer used as writable storage may not be bound again in the
+            // same dispatch -- a browser drops the whole command buffer.
             dst.device.dispatch(
-                &format!("binary_{dt}"),
-                &[&dst.buffer, &s.buffer, &dst.buffer],
+                &format!("binary_inplace_{dt}"),
+                &[&dst.buffer, &s.buffer],
                 &push,
                 div_ceil(len, WORKGROUP_SIZE),
             )
