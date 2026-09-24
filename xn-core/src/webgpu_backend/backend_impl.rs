@@ -3,6 +3,23 @@
 // host loops that read their inputs back, compute on the CPU and upload the
 // result (WebGPU compute is f32-only here).
 
+/// Whether `strides` describe a contiguous row-major layout over `dims`.
+/// Size-1 dimensions carry no information and are skipped: their stride is
+/// arbitrary and never used to reconstruct an index.
+fn is_contiguous(dims: &[usize], strides: &[usize]) -> bool {
+    let mut expected = 1usize;
+    for (&d, &s) in dims.iter().zip(strides.iter()).rev() {
+        if d == 1 {
+            continue;
+        }
+        if s != expected {
+            return false;
+        }
+        expected *= d;
+    }
+    true
+}
+
 impl crate::Backend for Device {
     type Storage<T: WithDType> = Storage<T>;
 
@@ -33,10 +50,10 @@ impl crate::Backend for Device {
     }
 
     fn fill<T: WithDType>(dst: &mut Self::Storage<T>, elem: T, len: usize) -> Result<()> {
-        if float_suffix::<T>().is_some() {
+        if let Some(dt) = dst.device.float_suffix::<T>() {
             let push = Pc::new().usize(len).f32(scalar_to_f32(elem));
             return dst.device.dispatch(
-                "fill_f32",
+                &format!("fill_{dt}"),
                 &[&dst.buffer],
                 &push,
                 div_ceil(len, WORKGROUP_SIZE),
@@ -90,8 +107,23 @@ impl crate::Backend for Device {
             dev.record_copy(&dst.buffer, &src.buffer, len * T::BYTE_SIZE);
             return Ok(());
         }
-        // Casts run on the host (rare, off the hot path). Read the source back,
-        // convert, and upload the destination.
+        // Float-to-float casts run on the GPU. They are not rare: loading f32
+        // weights into an f16 model converts every tensor, and the model
+        // converts the latent between f16 and f32 once per frame, which on the
+        // host costs a readback and the pipeline flush it forces.
+        if let (Some(s_dt), Some(d_dt)) =
+            (dev.float_suffix::<T>(), dev.float_suffix::<U>())
+        {
+            let push = Pc::new().usize(len);
+            return dev.dispatch(
+                &format!("cast_{s_dt}_{d_dt}"),
+                &[&dst.buffer, &src.buffer],
+                &push,
+                div_ceil(len, WORKGROUP_SIZE),
+            );
+        }
+        // Anything involving an integer dtype stays on the host: WGSL has no
+        // i64, and u8 storage is not addressable as a scalar array.
         let s_vec = src.to_host()?;
         let mut out_bytes = vec![0u8; len * U::BYTE_SIZE];
         macro_rules! cast {
@@ -147,12 +179,14 @@ impl crate::Backend for Device {
         len: usize,
         op: UnaryOp,
     ) -> Result<()> {
-        let dt = dtype_suffix::<T>("inplace_unary")?;
+        let dt = dst.device.dtype_suffix::<T>("inplace_unary")?;
         let (code, alpha) = unary_op_code(op);
         let push = Pc::new().usize(len).u32(code).f32(alpha);
+        // A single read_write binding rather than the same buffer bound twice:
+        // WebGPU forbids aliasing a buffer across bindings when one is writable.
         dst.device.dispatch(
-            &format!("unary_{dt}"),
-            &[&dst.buffer, &dst.buffer],
+            &format!("unary_inplace_{dt}"),
+            &[&dst.buffer],
             &push,
             div_ceil(len, WORKGROUP_SIZE),
         )
@@ -164,7 +198,7 @@ impl crate::Backend for Device {
         len: usize,
         op: UnaryOp,
     ) -> Result<()> {
-        let dt = dtype_suffix::<T>("unary")?;
+        let dt = dst.device.dtype_suffix::<T>("unary")?;
         let (code, alpha) = unary_op_code(op);
         let push = Pc::new().usize(len).u32(code).f32(alpha);
         dst.device.dispatch(
@@ -181,11 +215,12 @@ impl crate::Backend for Device {
         len: usize,
         op: BinaryOp,
     ) -> Result<()> {
-        if let Some(dt) = float_suffix::<T>() {
+        if let Some(dt) = dst.device.float_suffix::<T>() {
             let push = Pc::new().usize(len).u32(binary_op_code(op));
+            // dst is read and written through one binding; see `inplace_unary`.
             dst.device.dispatch(
-                &format!("binary_{dt}"),
-                &[&dst.buffer, &s.buffer, &dst.buffer],
+                &format!("binary_inplace_{dt}"),
+                &[&dst.buffer, &s.buffer],
                 &push,
                 div_ceil(len, WORKGROUP_SIZE),
             )
@@ -207,7 +242,7 @@ impl crate::Backend for Device {
         len: usize,
         op: BinaryOp,
     ) -> Result<()> {
-        if let Some(dt) = float_suffix::<T>() {
+        if let Some(dt) = dst.device.float_suffix::<T>() {
             let push = Pc::new().usize(len).u32(binary_op_code(op));
             dst.device.dispatch(
                 &format!("binary_{dt}"),
@@ -234,7 +269,7 @@ impl crate::Backend for Device {
         if add == T::zero() && scale == T::one() {
             return Self::copy(dst, src, len);
         }
-        if let Some(dt) = float_suffix::<T>() {
+        if let Some(dt) = dst.device.float_suffix::<T>() {
             let push = Pc::new().usize(len).f32(scalar_to_f32(scale)).f32(scalar_to_f32(add));
             dst.device.dispatch(
                 &format!("scale_add_{dt}"),
@@ -267,7 +302,7 @@ impl crate::Backend for Device {
         let d_k: usize = dims[(dim2 + 1)..].iter().product();
         let d1 = dims[dim1];
         let d2 = dims[dim2];
-        if let Some(dt) = float_suffix::<T>() {
+        if let Some(dt) = dst.device.float_suffix::<T>() {
             let push = Pc::new().usize(numel).usize(d1).usize(d2).usize(d_i).usize(d_j).usize(d_k);
             dst.device.dispatch(
                 &format!("transpose_{dt}"),
@@ -311,7 +346,7 @@ impl crate::Backend for Device {
         if d1 == 0 || d2 == 0 {
             return Ok(());
         }
-        if let Some(dt) = float_suffix::<T>() {
+        if let Some(dt) = dst.device.float_suffix::<T>() {
             let push =
                 Pc::new().usize(d1).usize(d2).usize(src_s).usize(dst_s).usize(src_o).usize(dst_o);
             dst.device.dispatch(
@@ -346,7 +381,7 @@ impl crate::Backend for Device {
         pos: usize,
         unbatched_rope: bool,
     ) -> Result<()> {
-        let dt = dtype_suffix::<T>("rope")?;
+        let dt = dst.device.dtype_suffix::<T>("rope")?;
         let bh = b * h;
         let td = t * d;
         let cs_stride_b = if unbatched_rope { t * d / 2 } else { 0 };
@@ -373,7 +408,7 @@ impl crate::Backend for Device {
         pos: usize,
         unbatched_rope: bool,
     ) -> Result<()> {
-        let dt = dtype_suffix::<T>("rope_i")?;
+        let dt = dst.device.dtype_suffix::<T>("rope_i")?;
         let bh = b * h;
         let td = t * d;
         let cs_stride_b = if unbatched_rope { t * d / 2 } else { 0 };
@@ -401,7 +436,7 @@ impl crate::Backend for Device {
         lhs_strides: (usize, usize),
         rhs_strides: (usize, usize),
     ) -> Result<()> {
-        let dt = dtype_suffix::<T>("gemm")?;
+        let dt = dst.device.dtype_suffix::<T>("gemm")?;
         let (dst_cs, dst_rs) = dst_strides;
         let (lhs_cs, lhs_rs) = lhs_strides;
         let (rhs_cs, rhs_rs) = rhs_strides;
@@ -421,16 +456,25 @@ impl crate::Backend for Device {
             .usize(lhs.1)
             .usize(rhs.1);
         if m == 1 {
-            // Decode path: one workgroup per output column, grid (n, batch, 1).
-            // rhs is bound twice: once scalar, once as a vec4 view for the
-            // shader's aligned fast-path loads (see gemv.wgsl).
+            // Decode path. rhs is bound twice: once scalar, once as a vec4 view
+            // for the shaders' aligned fast-path loads.
             let buffers = [&dst.buffer, &lhs.0.buffer, &rhs.0.buffer, &rhs.0.buffer];
-            dst.device.dispatch_nd(
-                &format!("gemv_{dt}"),
-                &buffers,
-                &push,
-                (n as u32, lhs_b as u32, 1),
-            )
+            // `matmul_t` leaves each weight row contiguous (rhs_rs == 1), which
+            // is what lets one thread own a whole column. Short reductions go to
+            // the thread-per-column kernel (64 columns per workgroup, no
+            // barrier tree); long ones stay cooperative, where splitting k
+            // across a workgroup keeps the row reads local.
+            if rhs_rs == 1 && k < GEMV_TPC_MAX_K {
+                let groups = (div_ceil(n, GEMV_TPC_COLS), lhs_b as u32, 1);
+                dst.device.dispatch_nd(&format!("gemv_tpc_{dt}"), &buffers, &push, groups)
+            } else {
+                dst.device.dispatch_nd(
+                    &format!("gemv_{dt}"),
+                    &buffers,
+                    &push,
+                    (n as u32, lhs_b as u32, 1),
+                )
+            }
         } else {
             // Tiled kernel: grid (ceil(n/TILE), ceil(m/TILE), batch).
             let buffers = [&dst.buffer, &lhs.0.buffer, &rhs.0.buffer];
@@ -451,7 +495,7 @@ impl crate::Backend for Device {
         let right_size: usize = dims[dim + 1..].iter().product::<usize>().max(1);
         let src_dim_size = dims[dim];
         let total = left_size * num_ids * right_size;
-        if let Some(dt) = float_suffix::<T>() {
+        if let Some(dt) = dst.device.float_suffix::<T>() {
             let push =
                 Pc::new().usize(left_size).usize(num_ids).usize(right_size).usize(src_dim_size);
             dst.device.dispatch(
@@ -490,7 +534,7 @@ impl crate::Backend for Device {
         t2: usize,
         offset: usize,
     ) -> Result<()> {
-        let dt = dtype_suffix::<T>("apply_causality_mask")?;
+        let dt = dst.device.dtype_suffix::<T>("apply_causality_mask")?;
         let total = bh * t1 * t2;
         let push = Pc::new().usize(bh).usize(t1).usize(t2).usize(offset);
         dst.device.dispatch(
@@ -507,7 +551,7 @@ impl crate::Backend for Device {
         dim_m1: usize,
         d: usize,
     ) -> Result<()> {
-        let dt = dtype_suffix::<T>("softmax")?;
+        let dt = dst.device.dtype_suffix::<T>("softmax")?;
         let push = Pc::new().usize(dim_m1);
         dst.device.dispatch(&format!("softmax_{dt}"), &[&src.buffer, &dst.buffer], &push, d as u32)
     }
@@ -520,7 +564,7 @@ impl crate::Backend for Device {
         d: usize,
         eps: f32,
     ) -> Result<()> {
-        let dt = dtype_suffix::<T>("rms_norm")?;
+        let dt = dst.device.dtype_suffix::<T>("rms_norm")?;
         let push = Pc::new().usize(dim_m1).f32(eps);
         dst.device.dispatch(
             &format!("rmsnorm_{dt}"),
@@ -540,7 +584,7 @@ impl crate::Backend for Device {
         eps: f32,
         remove_mean: bool,
     ) -> Result<()> {
-        let dt = dtype_suffix::<T>("layer_norm")?;
+        let dt = dst.device.dtype_suffix::<T>("layer_norm")?;
         let push = Pc::new().usize(dim_m1).f32(eps).u32(if remove_mean { 1 } else { 0 });
         dst.device.dispatch(
             &format!("layernorm_{dt}"),
@@ -611,7 +655,14 @@ impl crate::Backend for Device {
         if numel == 0 {
             return Ok(());
         }
-        if let Some(dt) = float_suffix::<T>() {
+        // A contiguous source is a flat run of `numel` elements, so the general
+        // path's per-element index reconstruction -- and the dims/strides
+        // scratch buffer it needs uploading for -- buy nothing. `copy2d` with a
+        // single row is the same copy with push constants and no scratch.
+        if is_contiguous(dims, src_strides) {
+            return Self::copy2d(dst, src, 1, numel, numel, numel, 0, src_offset);
+        }
+        if let Some(dt) = dst.device.float_suffix::<T>() {
             let info: Vec<u32> =
                 dims.iter().chain(src_strides.iter()).map(|&v| v as u32).collect();
             let scratch = dst.device.alloc_buffer(info.len() * 4);
@@ -658,7 +709,7 @@ impl crate::Backend for Device {
         if numel == 0 {
             return Ok(());
         }
-        if let Some(dt) = float_suffix::<T>() {
+        if let Some(dt) = dst.device.float_suffix::<T>() {
             let push =
                 Pc::new().usize(numel).usize(right_size).usize(src_dim_size).usize(dst_dim_size);
             dst.device.dispatch(
@@ -696,7 +747,7 @@ impl crate::Backend for Device {
         if numel == 0 {
             return Ok(());
         }
-        if let Some(dt) = float_suffix::<T>() {
+        if let Some(dt) = dst.device.float_suffix::<T>() {
             let info: Vec<u32> = dst_shape
                 .iter()
                 .chain(lhs_strides.iter())
@@ -751,8 +802,19 @@ impl crate::Backend for Device {
         dilation: usize,
         groups: usize,
     ) -> Result<()> {
-        check_f32::<T>("conv1d")?;
-        if groups == 1 {
+        let dt = dst.device.dtype_suffix::<T>("conv1d")?;
+        // im2col materializes `out_length * in_channels * kernel_size` values and
+        // then streams them back through the GEMM, so it only pays when the
+        // weights it feeds are the larger stream. In the late SEANet decoder
+        // stages -- few channels, long output -- the column buffer is orders of
+        // magnitude bigger than the weights (the final 64->1 k=3 conv writes
+        // ~370k values to multiply by 192), and the direct kernel, which re-reads
+        // the input from cache instead, wins. It also avoids the tiled GEMM's
+        // small-n pathology: n = out_channels = 1 leaves 15 of every 16 lanes in
+        // a tile idle.
+        let col_elems = batch * out_length * in_channels * kernel_size;
+        let weight_elems = out_channels * (in_channels / groups) * kernel_size;
+        if groups == 1 && col_elems <= weight_elems {
             return conv1d_im2col(
                 dst,
                 src,
@@ -780,8 +842,9 @@ impl crate::Backend for Device {
             .usize(padding)
             .usize(dilation)
             .usize(groups);
+        // `conv1d.wgsl` handles groups == 1 as the single-group case.
         dst.device.dispatch(
-            "conv1d_f32",
+            &format!("conv1d_{dt}"),
             &[&dst.buffer, &src.buffer, &kernel.buffer],
             &push,
             div_ceil(total, WORKGROUP_SIZE),
@@ -803,7 +866,7 @@ impl crate::Backend for Device {
         output_padding: usize,
         groups: usize,
     ) -> Result<()> {
-        check_f32::<T>("conv_transpose1d")?;
+        let dt = dst.device.dtype_suffix::<T>("conv_transpose1d")?;
         if groups == 1 && padding == 0 && output_padding == 0 {
             return conv_transpose1d_col2im(
                 dst,
@@ -830,7 +893,7 @@ impl crate::Backend for Device {
             .usize(padding)
             .usize(groups);
         dst.device.dispatch(
-            "conv_transpose1d_f32",
+            &format!("conv_transpose1d_{dt}"),
             &[&dst.buffer, &src.buffer, &kernel.buffer],
             &push,
             div_ceil(total, WORKGROUP_SIZE),
@@ -869,8 +932,9 @@ fn conv1d_im2col<T: WithDTypeF>(
         .usize(stride)
         .usize(padding)
         .usize(dilation);
+    let dt = dev.dtype_suffix::<T>("im2col1d")?;
     dev.dispatch(
-        "im2col1d_f32",
+        &format!("im2col1d_{dt}"),
         &[&col.buffer, &src.buffer],
         &push,
         div_ceil(batch * out_length * k, WORKGROUP_SIZE),
@@ -947,7 +1011,8 @@ fn conv_transpose1d_col2im<T: WithDTypeF>(
         .usize(kernel_size)
         .usize(stride);
     let total = batch * out_channels * out_length;
-    dev.dispatch("col2im1d_f32", &[&dst.buffer, &col.buffer], &push, div_ceil(total, WORKGROUP_SIZE))
+    let dt = dev.dtype_suffix::<T>("col2im1d")?;
+    dev.dispatch(&format!("col2im1d_{dt}"), &[&dst.buffer, &col.buffer], &push, div_ceil(total, WORKGROUP_SIZE))
 }
 
 impl Device {
@@ -960,7 +1025,7 @@ impl Device {
         inner_size: usize,
         op: u32,
     ) -> Result<()> {
-        let dt = dtype_suffix::<T>("reduce")?;
+        let dt = self.dtype_suffix::<T>("reduce")?;
         let num_outputs = outer_size * inner_size;
         if num_outputs == 0 {
             return Ok(());
@@ -983,7 +1048,7 @@ impl Device {
         inner_size: usize,
         op: u32,
     ) -> Result<()> {
-        let dt = dtype_suffix::<T>("reduce_arg")?;
+        let dt = self.dtype_suffix::<T>("reduce_arg")?;
         let num_outputs = outer_size * inner_size;
         if num_outputs == 0 {
             return Ok(());

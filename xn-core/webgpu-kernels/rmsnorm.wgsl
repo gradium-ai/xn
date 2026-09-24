@@ -1,10 +1,12 @@
 // Row-wise RMSNorm, f32 accumulation. One workgroup per row.
 // dst = x * rsqrt(mean(x^2) + eps) * alpha
 struct Params { ncols: u32, eps: f32 };
-var<push_constant> pc: Params;
-@group(0) @binding(0) var<storage, read_write> src: array<f32>;
-@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
-@group(0) @binding(2) var<storage, read_write> alpha: array<f32>;
+// WebGPU has no push constants; parameters arrive in a uniform windowed to
+// this dispatch's slot by a dynamic offset.
+@group(0) @binding(8) var<uniform> pc: Params;
+@group(0) @binding(0) var<storage, read> src: array<S>;
+@group(0) @binding(1) var<storage, read_write> dst: array<S>;
+@group(0) @binding(2) var<storage, read> alpha: array<S>;
 
 var<workgroup> sh: array<f32, 256>;
 
@@ -19,7 +21,7 @@ fn main(
 
     var acc = 0.0;
     for (var c = tid; c < pc.ncols; c = c + 256u) {
-        let x = src[base + c];
+        let x = f32(src[base + c]);
         acc = acc + x * x;
     }
     sh[tid] = acc;
@@ -33,6 +35,6 @@ fn main(
     workgroupBarrier();
 
     for (var c = tid; c < pc.ncols; c = c + 256u) {
-        dst[base + c] = scale * src[base + c] * alpha[c];
+        dst[base + c] = S(scale * f32(src[base + c]) * f32(alpha[c]));
     }
 }

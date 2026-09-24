@@ -46,6 +46,12 @@ hf-hub = { workspace = true }
 tokenizers = { workspace = true }
 tracing-chrome = { workspace = true }
 
+# On wasm `getrandom` has no OS entropy source and needs an explicit backend.
+# Also requires `--cfg getrandom_backend="wasm_js"`, which .cargo/config.toml
+# sets for the wasm target.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
 [build-dependencies]
 bindgen_cuda = { workspace = true, optional = true }
 

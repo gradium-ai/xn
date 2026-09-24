@@ -20,7 +20,7 @@ pub mod tensor_view;
 pub mod threadpool;
 pub mod utils;
 
-pub use backend::Backend;
+pub use backend::{Backend, ThreadSafe};
 pub use dtype::{DType, DTypeQ, WithDType, WithDTypeF};
 pub use error::{Context, Error, Result};
 pub use shape::{D, Dim, Shape};
@@ -110,7 +110,7 @@ impl<M: ModuleT> ModuleT for Option<&M> {
 pub trait BackendQ: Clone + 'static {
     type T: WithDTypeF;
     type B: Backend;
-    type LinearQ: ModuleT<T = Self::T, B = Self::B> + Send + Sync;
+    type LinearQ: ModuleT<T = Self::T, B = Self::B> + crate::backend::ThreadSafe;
 
     fn from_linear(l: nn::Linear<Self::T, Self::B>) -> Result<Self::LinearQ>;
 
@@ -173,7 +173,13 @@ pub fn run_with_device<W: WithQ>(w: W, _cpu_only: bool, _device_id: usize) -> Re
         w.run::<Unquantized<f32, _>>(CpuDevice)
     } else {
         let dev = webgpu_backend::Device::new(_device_id)?;
-        w.run::<Unquantized<f32, _>>(dev)
+        // f16 halves weight traffic, which is what bounds decode here, so prefer
+        // it when the adapter can compute on it.
+        if dev.supports_f16() {
+            w.run::<Unquantized<half::f16, _>>(dev)
+        } else {
+            w.run::<Unquantized<f32, _>>(dev)
+        }
     };
     #[cfg(not(any(feature = "cuda", feature = "vulkan", feature = "metal", feature = "webgpu")))]
     let res = w.run::<Unquantized<f32, _>>(CpuDevice);
@@ -312,12 +318,38 @@ impl Runner {
             feature = "webgpu",
             not(any(feature = "cuda", feature = "vulkan", feature = "metal"))
         ))]
-        let res = if !self.cpu_only && self.dtype == DTypeQ::F32 {
-            // The WebGPU backend computes in f32; other formats stay on CPU.
-            let dev = webgpu_backend::Device::new(_device_id)?;
-            w.run::<Unquantized<f32, _>>(dev)
-        } else {
+        let res = if self.cpu_only {
             self.run_cpu(w)
+        } else {
+            // The WebGPU backend computes in f32, and in f16 when the adapter
+            // advertises WGSL `shader-f16`. WGSL has no bf16 type, and quantized
+            // formats stay on CPU.
+            match self.dtype {
+                DTypeQ::F32 => {
+                    let dev = webgpu_backend::Device::new(_device_id)?;
+                    w.run::<Unquantized<f32, _>>(dev)
+                }
+                DTypeQ::F16 => {
+                    let dev = webgpu_backend::Device::new(_device_id)?;
+                    if !dev.supports_f16() {
+                        Err(Error::msg("webgpu adapter does not support shader-f16"))
+                    } else {
+                        w.run::<Unquantized<half::f16, _>>(dev)
+                    }
+                }
+                // q8_0 covers the layers routed through `BackendQ::LinearQ`;
+                // the rest keep dtype T, so prefer f16 there when the adapter
+                // can compute on it.
+                DTypeQ::Q8_0 => {
+                    let dev = webgpu_backend::Device::new(_device_id)?;
+                    if dev.supports_f16() {
+                        w.run::<webgpu_backend::quantization::Q80F16>(dev)
+                    } else {
+                        w.run::<webgpu_backend::quantization::Q80F32>(dev)
+                    }
+                }
+                _ => self.run_cpu(w),
+            }
         };
         #[cfg(not(any(
             feature = "cuda",

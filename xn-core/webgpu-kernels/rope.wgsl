@@ -1,10 +1,12 @@
 // Rotary position embedding, non-interleaved (GPT-NeoX style).
 struct Params { bh: u32, td: u32, d: u32, h: u32, cs_stride_b: u32, cos_off: u32, sin_off: u32 };
-var<push_constant> pc: Params;
-@group(0) @binding(0) var<storage, read_write> cosb: array<f32>;
-@group(0) @binding(1) var<storage, read_write> sinb: array<f32>;
-@group(0) @binding(2) var<storage, read_write> src: array<f32>;
-@group(0) @binding(3) var<storage, read_write> dst: array<f32>;
+// WebGPU has no push constants; parameters arrive in a uniform windowed to
+// this dispatch's slot by a dynamic offset.
+@group(0) @binding(8) var<uniform> pc: Params;
+@group(0) @binding(0) var<storage, read> cosb: array<S>;
+@group(0) @binding(1) var<storage, read> sinb: array<S>;
+@group(0) @binding(2) var<storage, read> src: array<S>;
+@group(0) @binding(3) var<storage, read_write> dst: array<S>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -22,10 +24,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var i_cs = i_t * half_d + i_d;
     if pc.cs_stride_b > 0u { i_cs = i_cs + (i_bh / pc.h) * pc.cs_stride_b; }
 
-    let c = cosb[pc.cos_off + i_cs];
-    let s = sinb[pc.sin_off + i_cs];
-    let a = src[i1];
-    let b = src[i2];
-    dst[i1] = a * c - b * s;
-    dst[i2] = a * s + b * c;
+    let c = f32(cosb[pc.cos_off + i_cs]);
+    let s = f32(sinb[pc.sin_off + i_cs]);
+    let a = f32(src[i1]);
+    let b = f32(src[i2]);
+    dst[i1] = S(a * c - b * s);
+    dst[i2] = S(a * s + b * c);
 }

@@ -18,11 +18,13 @@ struct Params {
     lhs_cs: u32, lhs_rs: u32, rhs_cs: u32, rhs_rs: u32,
     dst_rs: u32, dst_cs: u32, lhs_o: u32, rhs_o: u32,
 };
-var<push_constant> pc: Params;
-@group(0) @binding(0) var<storage, read_write> dst: array<f32>;
-@group(0) @binding(1) var<storage, read_write> lhs: array<f32>;
-@group(0) @binding(2) var<storage, read_write> rhs: array<f32>;
-@group(0) @binding(3) var<storage, read_write> rhs4: array<vec4<f32>>;
+// WebGPU has no push constants; parameters arrive in a uniform windowed to
+// this dispatch's slot by a dynamic offset.
+@group(0) @binding(8) var<uniform> pc: Params;
+@group(0) @binding(0) var<storage, read_write> dst: array<S>;
+@group(0) @binding(1) var<storage, read> lhs: array<S>;
+@group(0) @binding(2) var<storage, read> rhs: array<S>;
+@group(0) @binding(3) var<storage, read> rhs4: array<S4>;
 
 var<workgroup> sh: array<f32, 256>;
 
@@ -45,20 +47,20 @@ fn main(
         let kbulk = k4 << 2u;
         let base4 = rbase >> 2u;
         for (var g = tid; g < k4; g = g + 256u) {
-            let rv = rhs4[base4 + g];
+            let rv = vec4<f32>(rhs4[base4 + g]);
             let l = g * 4u;
-            acc = acc + rv.x * lhs[lbase + (l + 0u) * pc.lhs_cs];
-            acc = acc + rv.y * lhs[lbase + (l + 1u) * pc.lhs_cs];
-            acc = acc + rv.z * lhs[lbase + (l + 2u) * pc.lhs_cs];
-            acc = acc + rv.w * lhs[lbase + (l + 3u) * pc.lhs_cs];
+            acc = acc + rv.x * f32(lhs[lbase + (l + 0u) * pc.lhs_cs]);
+            acc = acc + rv.y * f32(lhs[lbase + (l + 1u) * pc.lhs_cs]);
+            acc = acc + rv.z * f32(lhs[lbase + (l + 2u) * pc.lhs_cs]);
+            acc = acc + rv.w * f32(lhs[lbase + (l + 3u) * pc.lhs_cs]);
         }
         // k % 4 remainder, scalar.
         for (var l = kbulk + tid; l < pc.k; l = l + 256u) {
-            acc = acc + lhs[lbase + l * pc.lhs_cs] * rhs[rbase + l];
+            acc = acc + f32(lhs[lbase + l * pc.lhs_cs]) * f32(rhs[rbase + l]);
         }
     } else {
         for (var l = tid; l < pc.k; l = l + 256u) {
-            acc = acc + lhs[lbase + l * pc.lhs_cs] * rhs[rbase + l * pc.rhs_rs];
+            acc = acc + f32(lhs[lbase + l * pc.lhs_cs]) * f32(rhs[rbase + l * pc.rhs_rs]);
         }
     }
     sh[tid] = acc;
@@ -68,6 +70,6 @@ fn main(
         workgroupBarrier();
     }
     if tid == 0u {
-        dst[b * pc.n + j * pc.dst_cs] = sh[0];
+        dst[b * pc.n + j * pc.dst_cs] = S(sh[0]);
     }
 }

@@ -1,9 +1,11 @@
 // Transpose two dims of a tensor whose shape factors as
 // (d_i, d1, d_j, d2, d_k), swapping d1 and d2. Mirrors layout.cu.
 struct Params { numel: u32, d1: u32, d2: u32, d_i: u32, d_j: u32, d_k: u32 };
-var<push_constant> pc: Params;
-@group(0) @binding(0) var<storage, read_write> src: array<f32>;
-@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+// WebGPU has no push constants; parameters arrive in a uniform windowed to
+// this dispatch's slot by a dynamic offset.
+@group(0) @binding(8) var<uniform> pc: Params;
+@group(0) @binding(0) var<storage, read> src: array<S>;
+@group(0) @binding(1) var<storage, read_write> dst: array<S>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {

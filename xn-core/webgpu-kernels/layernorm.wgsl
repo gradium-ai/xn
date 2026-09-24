@@ -2,11 +2,13 @@
 // remove_mean == 1: y = (x - mean) / sqrt(var + eps) * weight + bias
 // remove_mean == 0: y =  x        / sqrt(var + eps) * weight + bias
 struct Params { ncols: u32, eps: f32, remove_mean: u32 };
-var<push_constant> pc: Params;
-@group(0) @binding(0) var<storage, read_write> src: array<f32>;
-@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
-@group(0) @binding(2) var<storage, read_write> weight: array<f32>;
-@group(0) @binding(3) var<storage, read_write> bias: array<f32>;
+// WebGPU has no push constants; parameters arrive in a uniform windowed to
+// this dispatch's slot by a dynamic offset.
+@group(0) @binding(8) var<uniform> pc: Params;
+@group(0) @binding(0) var<storage, read> src: array<S>;
+@group(0) @binding(1) var<storage, read_write> dst: array<S>;
+@group(0) @binding(2) var<storage, read> weight: array<S>;
+@group(0) @binding(3) var<storage, read> bias: array<S>;
 
 var<workgroup> sh_sum: array<f32, 256>;
 var<workgroup> sh_sq: array<f32, 256>;
@@ -23,7 +25,7 @@ fn main(
     var s1 = 0.0;
     var s2 = 0.0;
     for (var c = tid; c < pc.ncols; c = c + 256u) {
-        let x = src[base + c];
+        let x = f32(src[base + c]);
         s1 = s1 + x;
         s2 = s2 + x * x;
     }
@@ -45,7 +47,7 @@ fn main(
     workgroupBarrier();
 
     for (var c = tid; c < pc.ncols; c = c + 256u) {
-        let l = (src[base + c] - mean_off) * inv_std;
-        dst[base + c] = l * weight[c] + bias[c];
+        let l = (f32(src[base + c]) - mean_off) * inv_std;
+        dst[base + c] = S(l * f32(weight[c]) + f32(bias[c]));
     }
 }
