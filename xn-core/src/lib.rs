@@ -20,7 +20,7 @@ pub mod tensor_view;
 pub mod threadpool;
 pub mod utils;
 
-pub use backend::Backend;
+pub use backend::{Backend, ThreadSafe};
 pub use dtype::{DType, DTypeQ, WithDType, WithDTypeF};
 pub use error::{Context, Error, Result};
 pub use shape::{D, Dim, Shape};
@@ -110,7 +110,7 @@ impl<M: ModuleT> ModuleT for Option<&M> {
 pub trait BackendQ: Clone + 'static {
     type T: WithDTypeF;
     type B: Backend;
-    type LinearQ: ModuleT<T = Self::T, B = Self::B> + Send + Sync;
+    type LinearQ: ModuleT<T = Self::T, B = Self::B> + crate::backend::ThreadSafe;
 
     fn from_linear(l: nn::Linear<Self::T, Self::B>) -> Result<Self::LinearQ>;
 
