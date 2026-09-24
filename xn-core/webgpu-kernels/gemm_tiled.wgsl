@@ -27,8 +27,8 @@ struct Params {
 // to this dispatch's slot by a dynamic offset.
 @group(0) @binding(8) var<uniform> pc: Params;
 @group(0) @binding(0) var<storage, read_write> dst: array<f32>;
-@group(0) @binding(1) var<storage, read_write> lhs: array<f32>;
-@group(0) @binding(2) var<storage, read_write> rhs: array<f32>;
+@group(0) @binding(1) var<storage, read> lhs: array<f32>;
+@group(0) @binding(2) var<storage, read> rhs: array<f32>;
 
 // 32x32 output tile, 8-deep k stage, 4x4 outputs per thread (dlight's shape).
 const TILE: u32 = 32u;

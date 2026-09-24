@@ -85,7 +85,6 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
 /// What `map_async` reports back through the readback channel.
 type MapResult = std::result::Result<(), wgpu::BufferAsyncError>;
 
-const MAX_BINDINGS: usize = 4;
 /// Binding index the kernels read their parameters from. Above every storage
 /// binding any kernel declares, so it never collides with one.
 const PARAMS_BINDING: u32 = 8;
@@ -358,9 +357,47 @@ impl Pc {
     }
 }
 
+/// The uniform binding every kernel takes its parameters through.
+fn params_layout_entry() -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding: PARAMS_BINDING,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            // One ring buffer, windowed to this dispatch's slot.
+            has_dynamic_offset: true,
+            min_binding_size: std::num::NonZeroU64::new(PARAMS_SLOT_SIZE),
+        },
+        count: None,
+    }
+}
+
+/// Which storage bindings a kernel only reads, as a bitmask over binding index.
+///
+/// Read from the shader's own declarations rather than a table beside them: a
+/// table would drift, and being wrong here is not a compile error but a
+/// validation failure in the browser.
+fn read_only_mask(src: &str) -> u32 {
+    let mut mask = 0u32;
+    for decl in src.split("@group(0) @binding(").skip(1) {
+        let Some((idx, rest)) = decl.split_once(')') else { continue };
+        let Ok(i) = idx.trim().parse::<u32>() else { continue };
+        // `var<storage, read>` is read-only; `read_write` is not. The uniform
+        // binding is not a storage buffer and never appears here.
+        let head: String = rest.chars().take(40).collect();
+        if head.contains("var<storage, read>") {
+            mask |= 1 << i;
+        }
+    }
+    mask
+}
+
 struct CachedPipeline {
     pipeline: wgpu::ComputePipeline,
     bindings: u32,
+    /// Built from this kernel's read-only mask, so it is per-kernel rather than
+    /// shared across every kernel with the same binding count.
+    bgl: wgpu::BindGroupLayout,
     /// Stable index, used to skip a redundant `set_pipeline` when consecutive
     /// dispatches in the same pass use the same kernel.
     idx: usize,
@@ -483,9 +520,6 @@ pub struct DeviceInner {
     /// per dispatch, addressed by a dynamic offset.
     params_ring: wgpu::Buffer,
     queue: wgpu::Queue,
-    // bind_group_layouts[n] / pipeline_layouts[n] describe `n` storage bindings.
-    bind_group_layouts: Vec<wgpu::BindGroupLayout>,
-    pipeline_layouts: Vec<wgpu::PipelineLayout>,
     pipelines: Mutex<HashMap<String, CachedPipeline>>,
     pool: Mutex<BufferPool>,
     ctx: Mutex<OpCtx>,
@@ -567,49 +601,6 @@ impl Device {
             .await
             .map_err(wgpuerr("request_device"))?;
 
-        // A storage-buffer bind group layout + pipeline layout for each binding
-        // count. Every binding is a read_write storage buffer (info/ids buffers
-        // are declared read_write in WGSL too), so a single layout per count
-        // serves every kernel with that many bindings.
-        let mut bind_group_layouts = Vec::with_capacity(MAX_BINDINGS + 1);
-        let mut pipeline_layouts = Vec::with_capacity(MAX_BINDINGS + 1);
-        for n in 0..=MAX_BINDINGS {
-            let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..n)
-                .map(|i| wgpu::BindGroupLayoutEntry {
-                    binding: i as u32,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                })
-                .chain(std::iter::once(wgpu::BindGroupLayoutEntry {
-                    binding: PARAMS_BINDING,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        // One ring buffer, windowed to this dispatch's slot.
-                        has_dynamic_offset: true,
-                        min_binding_size: std::num::NonZeroU64::new(PARAMS_SLOT_SIZE),
-                    },
-                    count: None,
-                }))
-                .collect();
-            let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some(&format!("xn-bgl-{n}")),
-                entries: &entries,
-            });
-            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some(&format!("xn-pl-{n}")),
-                bind_group_layouts: &[&bgl],
-                push_constant_ranges: &[],
-            });
-            bind_group_layouts.push(bgl);
-            pipeline_layouts.push(pl);
-        }
-
         // A dynamic offset must be a multiple of this, and the slot size is what
         // every offset is a multiple of. 256 satisfies every adapter seen so far;
         // failing here beats miscomputing offsets on one that wants more.
@@ -638,8 +629,6 @@ impl Device {
             device,
             params_ring,
             queue,
-            bind_group_layouts,
-            pipeline_layouts,
             pipelines: Mutex::new(HashMap::new()),
             pool: Mutex::new(BufferPool::default()),
             ctx: Mutex::new(OpCtx {
@@ -691,11 +680,14 @@ impl Device {
         Buf { buffer, class }
     }
 
-    fn get_pipeline(&self, name: &str) -> Result<(wgpu::ComputePipeline, u32, usize)> {
+    fn get_pipeline(
+        &self,
+        name: &str,
+    ) -> Result<(wgpu::ComputePipeline, u32, wgpu::BindGroupLayout, usize)> {
         {
             let pipelines = self.pipelines.lock().unwrap();
             if let Some(p) = pipelines.get(name) {
-                return Ok((p.pipeline.clone(), p.bindings, p.idx));
+                return Ok((p.pipeline.clone(), p.bindings, p.bgl.clone(), p.idx));
             }
         }
         let (src, bindings) = kernel_src(name)
@@ -704,9 +696,32 @@ impl Device {
             label: Some(name),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(src)),
         });
+        let read_only = read_only_mask(src);
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..bindings)
+            .map(|i| wgpu::BindGroupLayoutEntry {
+                binding: i,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: read_only & (1 << i) != 0 },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            })
+            .chain(std::iter::once(params_layout_entry()))
+            .collect();
+        let bgl = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(name),
+            entries: &entries,
+        });
+        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(name),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
         let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(name),
-            layout: Some(&self.pipeline_layouts[bindings as usize]),
+            layout: Some(&layout),
             module: &module,
             entry_point: Some("main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -714,9 +729,13 @@ impl Device {
         });
         let mut pipelines = self.pipelines.lock().unwrap();
         let idx = pipelines.len();
-        let entry =
-            pipelines.entry(name.to_string()).or_insert(CachedPipeline { pipeline, bindings, idx });
-        Ok((entry.pipeline.clone(), entry.bindings, entry.idx))
+        let entry = pipelines.entry(name.to_string()).or_insert(CachedPipeline {
+            pipeline,
+            bindings,
+            bgl,
+            idx,
+        });
+        Ok((entry.pipeline.clone(), entry.bindings, entry.bgl.clone(), entry.idx))
     }
 
     /// Record a single dispatch of `kernel` (1D workgroup count).
@@ -738,7 +757,7 @@ impl Device {
             return Ok(());
         }
         let t0 = self.profile.then(std::time::Instant::now);
-        let (pipeline, bindings, pidx) = self.get_pipeline(kernel)?;
+        let (pipeline, bindings, bgl, pidx) = self.get_pipeline(kernel)?;
         assert_eq!(bindings as usize, buffers.len(), "kernel {kernel} binding count mismatch");
         let entries: Vec<wgpu::BindGroupEntry> = buffers
             .iter()
@@ -758,7 +777,7 @@ impl Device {
             .collect();
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(kernel),
-            layout: &self.bind_group_layouts[bindings as usize],
+            layout: &bgl,
             entries: &entries,
         });
         if push.bytes.len() as u64 > PARAMS_SLOT_SIZE {
