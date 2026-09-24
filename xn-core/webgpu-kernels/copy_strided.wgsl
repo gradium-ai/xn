@@ -1,7 +1,9 @@
 // Copy from a strided source to a contiguous destination.
 // `info` packs [dims (num_dims), src_strides (num_dims)].
 struct Params { numel: u32, num_dims: u32, src_offset: u32 };
-var<push_constant> pc: Params;
+// WebGPU has no push constants; parameters arrive in a uniform windowed
+// to this dispatch's slot by a dynamic offset.
+@group(0) @binding(8) var<uniform> pc: Params;
 @group(0) @binding(0) var<storage, read_write> src: array<f32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
 @group(0) @binding(2) var<storage, read_write> info: array<u32>;

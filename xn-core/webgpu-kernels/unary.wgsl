@@ -1,7 +1,9 @@
 // Elementwise unary ops. For in-place use, bind the same buffer to src and dst.
 // `op` matches the `UnaryOp` order used by the CPU/CUDA backends.
 struct Params { n: u32, op: u32, alpha: f32 };
-var<push_constant> pc: Params;
+// WebGPU has no push constants; parameters arrive in a uniform windowed
+// to this dispatch's slot by a dynamic offset.
+@group(0) @binding(8) var<uniform> pc: Params;
 @group(0) @binding(0) var<storage, read_write> src: array<f32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
 

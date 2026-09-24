@@ -86,7 +86,14 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
 type MapResult = std::result::Result<(), wgpu::BufferAsyncError>;
 
 const MAX_BINDINGS: usize = 4;
-const PUSH_CONSTANT_SIZE: u32 = 128;
+/// Binding index the kernels read their parameters from. Above every storage
+/// binding any kernel declares, so it never collides with one.
+const PARAMS_BINDING: u32 = 8;
+/// Bytes reserved per dispatch in the parameter ring. Must be a multiple of the
+/// adapter's `min_uniform_buffer_offset_alignment`, checked at device creation.
+const PARAMS_SLOT_SIZE: u64 = 256;
+/// Dispatches a batch can record before the ring must be flushed.
+const PARAMS_RING_SLOTS: u64 = 4096;
 const WORKGROUP_SIZE: u32 = 256;
 /// The two matmul kernels, kept as named constants because the dispatch
 /// geometry below is parsed back out of them.
@@ -446,6 +453,10 @@ struct OpCtx {
     /// Buffers (dropped tensors + scratch) to recycle into the pool on the next
     /// flush, once the batch referencing them has finished executing.
     free_bufs: Vec<Buf>,
+    /// Kernel parameters for every dispatch in this batch, one
+    /// `PARAMS_SLOT_SIZE` slot each, uploaded to `params_ring` in one write at
+    /// flush. A browser has no push constants, so this is how parameters travel.
+    params: Vec<u8>,
 }
 
 impl Drop for OpCtx {
@@ -468,6 +479,9 @@ impl Drop for OpCtx {
 
 pub struct DeviceInner {
     device: wgpu::Device,
+    /// Kernel parameters for the batch in flight, one `PARAMS_SLOT_SIZE` slot
+    /// per dispatch, addressed by a dynamic offset.
+    params_ring: wgpu::Buffer,
     queue: wgpu::Queue,
     // bind_group_layouts[n] / pipeline_layouts[n] describe `n` storage bindings.
     bind_group_layouts: Vec<wgpu::BindGroupLayout>,
@@ -538,21 +552,20 @@ impl Device {
         let info = adapter.get_info();
         let device_name = format!("{} ({:?})", info.name, info.backend);
 
-        // Push constants (native feature) carry kernel parameters; f32 storage
-        // buffers hold tensor data. Request a limit that fits the largest push
-        // block (gemm: 14 u32 = 56 B) with headroom.
-        let limits =
-            wgpu::Limits { max_push_constant_size: PUSH_CONSTANT_SIZE, ..adapter.limits() };
+        // No feature or limit beyond what the adapter already reports: kernel
+        // parameters travel in a uniform, and a browser grants none of wgpu's
+        // native-only features.
+        let limits = adapter.limits();
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("xn-webgpu"),
-                required_features: wgpu::Features::PUSH_CONSTANTS,
+                required_features: wgpu::Features::empty(),
                 required_limits: limits,
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
             })
             .await
-            .map_err(wgpuerr("request_device (push-constant support required)"))?;
+            .map_err(wgpuerr("request_device"))?;
 
         // A storage-buffer bind group layout + pipeline layout for each binding
         // count. Every binding is a read_write storage buffer (info/ids buffers
@@ -572,6 +585,17 @@ impl Device {
                     },
                     count: None,
                 })
+                .chain(std::iter::once(wgpu::BindGroupLayoutEntry {
+                    binding: PARAMS_BINDING,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        // One ring buffer, windowed to this dispatch's slot.
+                        has_dynamic_offset: true,
+                        min_binding_size: std::num::NonZeroU64::new(PARAMS_SLOT_SIZE),
+                    },
+                    count: None,
+                }))
                 .collect();
             let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some(&format!("xn-bgl-{n}")),
@@ -580,14 +604,28 @@ impl Device {
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(&format!("xn-pl-{n}")),
                 bind_group_layouts: &[&bgl],
-                push_constant_ranges: &[wgpu::PushConstantRange {
-                    stages: wgpu::ShaderStages::COMPUTE,
-                    range: 0..PUSH_CONSTANT_SIZE,
-                }],
+                push_constant_ranges: &[],
             });
             bind_group_layouts.push(bgl);
             pipeline_layouts.push(pl);
         }
+
+        // A dynamic offset must be a multiple of this, and the slot size is what
+        // every offset is a multiple of. 256 satisfies every adapter seen so far;
+        // failing here beats miscomputing offsets on one that wants more.
+        let uniform_align = device.limits().min_uniform_buffer_offset_alignment as u64;
+        if !PARAMS_SLOT_SIZE.is_multiple_of(uniform_align) {
+            crate::bail!(
+                "webgpu: parameter slot size {PARAMS_SLOT_SIZE} is not a multiple of this \
+                 device's uniform offset alignment ({uniform_align})"
+            );
+        }
+        let params_ring = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("xn-params"),
+            size: PARAMS_SLOT_SIZE * PARAMS_RING_SLOTS,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let profile = std::env::var("XN_WEBGPU_PROFILE").is_ok_and(|v| !v.is_empty() && v != "0");
         let spin_us = std::env::var("XN_WEBGPU_SPIN_US")
@@ -598,12 +636,14 @@ impl Device {
 
         let inner = DeviceInner {
             device,
+            params_ring,
             queue,
             bind_group_layouts,
             pipeline_layouts,
             pipelines: Mutex::new(HashMap::new()),
             pool: Mutex::new(BufferPool::default()),
             ctx: Mutex::new(OpCtx {
+                params: Vec::new(),
                 pass: None,
                 encoder: None,
                 last_pipeline: usize::MAX,
@@ -707,13 +747,35 @@ impl Device {
                 binding: i as u32,
                 resource: b.as_entire_binding(),
             })
+            .chain(std::iter::once(wgpu::BindGroupEntry {
+                binding: PARAMS_BINDING,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &self.params_ring,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(PARAMS_SLOT_SIZE),
+                }),
+            }))
             .collect();
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(kernel),
             layout: &self.bind_group_layouts[bindings as usize],
             entries: &entries,
         });
+        if push.bytes.len() as u64 > PARAMS_SLOT_SIZE {
+            crate::bail!(
+                "webgpu: kernel {kernel} has {} bytes of parameters, slot is {PARAMS_SLOT_SIZE}",
+                push.bytes.len()
+            );
+        }
         let mut ctx = self.ctx.lock().unwrap();
+        // The ring is uploaded in one write at flush, so a full ring means
+        // flushing now rather than growing it.
+        if ctx.params.len() as u64 + PARAMS_SLOT_SIZE > PARAMS_SLOT_SIZE * PARAMS_RING_SLOTS {
+            self.flush_locked(&mut ctx)?;
+        }
+        let params_offset = ctx.params.len() as u32;
+        ctx.params.extend_from_slice(&push.bytes);
+        ctx.params.resize(params_offset as usize + PARAMS_SLOT_SIZE as usize, 0);
         self.ensure_pass(&mut ctx);
         let switch_pipeline = ctx.last_pipeline != pidx;
         ctx.last_pipeline = pidx;
@@ -721,8 +783,7 @@ impl Device {
         if switch_pipeline {
             cpass.set_pipeline(&pipeline);
         }
-        cpass.set_bind_group(0, &bind_group, &[]);
-        cpass.set_push_constants(0, &push.bytes);
+        cpass.set_bind_group(0, &bind_group, &[params_offset]);
         cpass.dispatch_workgroups(gx, gy, gz);
         drop(ctx);
         if let Some(t0) = t0 {
@@ -808,11 +869,17 @@ impl Device {
         let t0 = (self.profile && had_work).then(std::time::Instant::now);
         // The pass borrows the encoder; it has to go before `finish`.
         Self::end_pass(ctx);
+        // `write_buffer` applies at the head of the submission, so one upload
+        // here covers every dispatch recorded in this batch.
+        if !ctx.params.is_empty() {
+            self.queue.write_buffer(&self.params_ring, 0, &ctx.params);
+        }
         if ctx.open {
             let enc = ctx.encoder.take().unwrap();
             self.queue.submit(Some(enc.finish()));
             ctx.open = false;
         }
+        ctx.params.clear();
         // Drive the queue to completion so host reads and buffer recycling are
         // safe. See `wait_for_queue` for how the wait is split.
         self.wait_for_queue()?;

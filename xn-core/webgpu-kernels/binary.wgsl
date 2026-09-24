@@ -1,7 +1,9 @@
 // Elementwise binary op: dst = lhs op rhs, same shape/contiguous.
 // For `bin_assign` (dst = dst op s), bind lhs=dst and rhs=s.
 struct Params { n: u32, op: u32 };
-var<push_constant> pc: Params;
+// WebGPU has no push constants; parameters arrive in a uniform windowed
+// to this dispatch's slot by a dynamic offset.
+@group(0) @binding(8) var<uniform> pc: Params;
 @group(0) @binding(0) var<storage, read_write> lhs: array<f32>;
 @group(0) @binding(1) var<storage, read_write> rhs: array<f32>;
 @group(0) @binding(2) var<storage, read_write> dst: array<f32>;

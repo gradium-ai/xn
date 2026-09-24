@@ -2,7 +2,9 @@
 // (little-endian): only the low word is read. An index of -1 selects zeros.
 //   dst[(left*num_ids + id)*right + r] = src[(left*src_dim_size + ids[id])*right + r]
 struct Params { left_size: u32, num_ids: u32, right_size: u32, src_dim_size: u32 };
-var<push_constant> pc: Params;
+// WebGPU has no push constants; parameters arrive in a uniform windowed
+// to this dispatch's slot by a dynamic offset.
+@group(0) @binding(8) var<uniform> pc: Params;
 @group(0) @binding(0) var<storage, read_write> src: array<f32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
 @group(0) @binding(2) var<storage, read_write> ids: array<u32>;
