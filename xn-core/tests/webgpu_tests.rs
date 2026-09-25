@@ -715,3 +715,49 @@ fn q8_quantization_error_is_small() -> Result<()> {
     assert!(rel < 0.01, "q8_0 relative error {rel} is above the 1% budget");
     Ok(())
 }
+
+// `from_q8_0` parses blocks as they sit in a GGUF: a 2-byte f16 scale then 32
+// `i8` quants, per block. `from_f32` reaches the same layout by quantizing.
+// Feeding both the same weights and comparing the matmul checks the parsing,
+// which nothing else does: every other q8 test goes through `from_linear`.
+#[test]
+fn q8_from_gguf_blocks_matches_quantizing() -> Result<()> {
+    use xn::quantized::{GgmlDType, QTensor};
+    use xn::webgpu_backend::quantization::Q8Tensor;
+    let d = dev();
+    let (k, n, m) = (128usize, 32usize, 3usize);
+    let w: Vec<f32> = (0..n * k).map(|i| ((i % 71) as f32 - 35.0) * 0.013).collect();
+    let shape = xn::Shape::from((n, k));
+
+    // The file route: quantize to q8_0 blocks, then read them back as a GGUF would.
+    let qt = QTensor::quantize_f32(&w, &shape, GgmlDType::Q8_0)?;
+    let from_blocks = Q8Tensor::from_q8_0(&qt, &d)?;
+    // The dense route, for comparison.
+    let from_floats = Q8Tensor::from_f32(&d, &w, &shape)?;
+
+    let x: Vec<f32> = (0..m * k).map(|i| ((i % 37) as f32 - 18.0) * 0.021).collect();
+    let xt: Tensor<f32, Wg> = Tensor::from_vec(x, (m, k), &d)?;
+    let blocks = from_blocks.matmul_t(&xt)?.to_vec()?;
+    let floats = from_floats.matmul_t(&xt)?.to_vec()?;
+    // Same blocks either way, so this is exact rather than merely close.
+    assert_eq!(blocks, floats, "from_q8_0 and from_f32 disagree");
+    Ok(())
+}
+
+// A weight whose shape does not match the layer is a checkpoint mismatch, and
+// silently loading it would give garbage rather than an error.
+#[test]
+fn q8_from_gguf_rejects_a_wrong_shape() -> Result<()> {
+    use xn::quantized::{GgmlDType, QTensor};
+    use xn::webgpu_backend::quantization::Q8Tensor;
+    let d = dev();
+    // k = 100 is not a multiple of the 32-value block.
+    let w = vec![0.5f32; 4 * 100];
+    let qt = QTensor::quantize_f32(&w, &xn::Shape::from((4usize, 100usize)), GgmlDType::Q8_0);
+    // Either the quantizer refuses it, or `from_q8_0` does. Both are fine; what
+    // matters is that no misaligned weight reaches the kernels.
+    if let Ok(qt) = qt {
+        assert!(Q8Tensor::from_q8_0(&qt, &d).is_err(), "misaligned k should not load");
+    }
+    Ok(())
+}
