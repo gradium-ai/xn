@@ -98,6 +98,7 @@ thread_local! {
 
 static POOL: OnceLock<Pool> = OnceLock::new();
 
+/// Unreachable where `enabled()` is false, but `size` and `dispatch` still name it.
 fn pool() -> &'static Pool {
     POOL.get_or_init(|| {
         let size = crate::get_num_threads().max(1);
@@ -170,9 +171,17 @@ fn worker(shared: &'static Shared, ith: usize, nth: usize) {
 /// Whether to use the persistent pool. `XN_THREADPOOL=0` reverts to a rayon fork/join per
 /// operator, which is the escape hatch if the resident workers ever fight with something else
 /// for cores.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !matches!(std::env::var("XN_THREADPOOL").as_deref(), Ok("0")))
+}
+
+/// The pool spawns `std::thread`s, which this target has none of. `wasip1-threads` and
+/// Emscripten can spawn, so they keep it.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn enabled() -> bool {
+    false
 }
 
 /// Holds the right to drive the pool, releasing it even if the dispatch unwinds.
@@ -198,11 +207,15 @@ impl Drop for PublishGuard {
     }
 }
 
-/// Threads this pool can put on one operator, including the calling thread.
+/// Threads available to put on one operator, including the calling thread.
 ///
-/// Fixed at first use, like rayon's global pool: [`crate::set_num_threads`] after that point
-/// changes how work is chunked but cannot grow the pool.
+/// Fixed at first use with the pool, like rayon's global pool: [`crate::set_num_threads`]
+/// after that point changes how work is chunked but cannot grow it. Without the pool it is
+/// rayon's width, read afresh.
 pub fn size() -> usize {
+    if !enabled() {
+        return rayon::current_num_threads().max(1);
+    }
     pool().size
 }
 
@@ -217,7 +230,8 @@ pub fn size() -> usize {
 /// mutual exclusion.
 pub fn dispatch<F: Fn(usize, usize) + Sync>(f: F) {
     if !enabled() {
-        // `XN_THREADPOOL=0`: fan out through rayon instead, the way this used to work.
+        // Fan out through rayon, the way this used to work. A nested dispatch fans out
+        // again here rather than collapsing to `(0, 1)`; rayon copes.
         let nth = rayon::current_num_threads().max(1);
         use rayon::prelude::*;
         (0..nth).into_par_iter().for_each(|ith| f(ith, nth));
