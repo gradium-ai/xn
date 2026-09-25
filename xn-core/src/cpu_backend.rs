@@ -1257,7 +1257,7 @@ impl crate::Backend for crate::CpuDevice {
         (q, q_off): (&Self::Storage<T>, usize),
         (k, k_off): (&Self::Storage<T>, usize),
         (v, v_off): (&Self::Storage<T>, usize),
-        mask: Option<(&Self::Storage<T>, usize)>,
+        mask: Option<(&Self::Storage<T>, usize, usize)>,
         kv_batch_stride: usize,
         b: usize,
         h: usize,
@@ -1283,6 +1283,8 @@ impl crate::Backend for crate::CpuDevice {
             let qo = q_off + bi * hd + hh * d;
             let kb = k_off + bi * kv_batch_stride + hh * d;
             let vb = v_off + bi * kv_batch_stride + hh * d;
+            // This entry's row of the mask; a batch stride of 0 makes every entry read row 0.
+            let mask = mask.map(|(m, m_off, m_bs)| (m, m_off + bi * m_bs));
             let qrow = &q[qo..qo + d];
             let mut acc = [0f32; CPU_SDPA_MAX_HEAD_DIM];
             let acc = &mut acc[..d];
