@@ -6,6 +6,8 @@ static NUM_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 
 pub fn set_num_threads(num_threads: usize) {
     NUM_THREADS.store(num_threads, std::sync::atomic::Ordering::Relaxed);
+    // `set_var` panics on this target, where rayon's width comes from the embedder's pool.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     unsafe {
         std::env::set_var("RAYON_NUM_THREADS", num_threads.to_string());
     }

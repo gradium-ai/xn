@@ -13,6 +13,11 @@ fn exclusive() -> std::sync::MutexGuard<'static, ()> {
     EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Mirrors the private `threadpool::enabled()`; some guarantees below are the pool's.
+fn pool_enabled() -> bool {
+    !matches!(std::env::var("XN_THREADPOOL").as_deref(), Ok("0"))
+}
+
 #[test]
 fn every_participant_runs_exactly_once() {
     let _x = exclusive();
@@ -51,16 +56,32 @@ fn results_are_visible_to_the_caller() {
 }
 
 #[test]
-fn nested_dispatch_runs_serially_instead_of_deadlocking() {
+fn nested_dispatch_does_not_deadlock() {
     let _x = exclusive();
     let inner = AtomicU32::new(0);
     dispatch(|_, _| {
         dispatch(|ith, nth| {
-            assert_eq!((ith, nth), (0, 1), "a nested dispatch must not fan out");
+            // The pool avoids the deadlock by running serially; rayon does by nesting.
+            if pool_enabled() {
+                assert_eq!((ith, nth), (0, 1), "a nested dispatch must not fan out");
+            }
+            assert!(ith < nth, "participant {ith} of {nth} is out of range");
             inner.fetch_add(1, Ordering::Relaxed);
         });
     });
-    assert_eq!(inner.load(Ordering::Relaxed), size() as u32);
+    assert!(inner.load(Ordering::Relaxed) >= size() as u32);
+}
+
+/// Callers size work with [`size`]; a `dispatch` wider than that leaves some unclaimed.
+#[test]
+fn dispatch_width_matches_size() {
+    let _x = exclusive();
+    let seen = AtomicU32::new(0);
+    dispatch(|_, nth| {
+        assert_eq!(nth, size(), "dispatch fanned out to a width `size()` does not report");
+        seen.fetch_add(1, Ordering::Relaxed);
+    });
+    assert_eq!(seen.load(Ordering::Relaxed), size() as u32);
 }
 
 #[test]
