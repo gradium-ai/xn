@@ -1,0 +1,115 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+// q8_0 dequantize-fused GEMM for small m, subgroup-per-column variant.
+//   dst[i, j] = sum_l lhs[i, l] * W[j, l],  W held as q8_0 blocks.
+// Grid: (ceil(n / (256 / sg)), ceil(m / MR), 1); local size 256; built once
+// per MR in 1..=16 (see build.rs).
+//
+// The q8_0 twin of gemm_nt_sg.comp: one subgroup owns one weight row j, the
+// workgroup's eight subgroups share a block of MR lhs rows staged through
+// shared memory 256 k at a time (read from L2 once per workgroup, not once
+// per subgroup), each lane takes two packed words -- eight int8 weights --
+// of the row per chunk, issued before the staging barrier so the two load
+// latencies overlap, and the MR partial sums are reduced with `subgroupAdd`
+// at the end. Weight layout as in gemv_q8.comp. It is the mirror of the CUDA
+// kernels (`gemm_q8_f32_r<MR>`).
+//
+// m past MR is walked by the grid, re-reading the weight once per block; the
+// host caps that at a few blocks and dequantizes for longer prefills. Rows
+// past m and columns past n are clamped and dropped at store time.
+#ifndef MR
+#define MR 4
+#endif
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) writeonly buffer D { float dst[]; };
+layout(std430, set = 0, binding = 1) readonly buffer L { vec4 lhs4[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Q { uint qs[]; };
+layout(std430, set = 0, binding = 3) readonly buffer S { float scales[]; };
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint n;
+    uint k;
+} pc;
+
+// Words (4 weights each) per staged chunk: 256 k, eight q8_0 blocks.
+const uint KC = 64u;
+const uint LANES = 32u;
+const uint NSTAGE = (uint(MR) * KC + 255u) / 256u;  // staging loads per thread
+
+shared vec4 lsh[MR * KC];  // [row][vec4 within chunk]
+
+vec4 unpack4(uint w) {
+    int q = int(w);
+    return vec4(
+        float(bitfieldExtract(q, 0, 8)),
+        float(bitfieldExtract(q, 8, 8)),
+        float(bitfieldExtract(q, 16, 8)),
+        float(bitfieldExtract(q, 24, 8)));
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint j = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+    uint i0 = gl_WorkGroupID.y * uint(MR);
+    uint lane = gl_SubgroupInvocationID;
+
+    uint kw = pc.k >> 2u;   // packed words per row
+    uint kb = pc.k >> 5u;   // blocks per row
+
+    uint jj = min(j, pc.n - 1u);
+    uint q0 = jj * kw;
+    uint s0 = jj * kb;
+
+    float acc[MR];
+    [[unroll]] for (int r = 0; r < MR; r++) {
+        acc[r] = 0.0;
+    }
+    for (uint c0 = 0u; c0 < kw; c0 += KC) {
+        uint wa = c0 + lane;
+        uint wb = wa + LANES;
+        bool ha = lane < LANES && wa < kw;
+        bool hb = lane < LANES && wb < kw;
+        uint pa = ha ? qs[q0 + wa] : 0u;
+        uint pb = hb ? qs[q0 + wb] : 0u;
+        float da = ha ? scales[s0 + (wa >> 3u)] : 0.0;
+        float db = hb ? scales[s0 + (wb >> 3u)] : 0.0;
+        vec4 stage[NSTAGE];
+        [[unroll]] for (uint s = 0u; s < NSTAGE; s++) {
+            uint e = tid + s * 256u;
+            uint r = e / KC;
+            uint q = e % KC;
+            uint row = min(i0 + r, pc.m - 1u);
+            stage[s] = (e < uint(MR) * KC && c0 + q < kw) ? lhs4[row * kw + c0 + q] : vec4(0.0);
+        }
+        [[unroll]] for (uint s = 0u; s < NSTAGE; s++) {
+            uint e = tid + s * 256u;
+            if (e < uint(MR) * KC) {
+                lsh[e] = stage[s];
+            }
+        }
+        barrier();
+        if (ha) {
+            vec4 wv = unpack4(pa);
+            [[unroll]] for (int r = 0; r < MR; r++) {
+                acc[r] = fma(da, dot(wv, lsh[uint(r) * KC + lane]), acc[r]);
+            }
+        }
+        if (hb) {
+            vec4 wv = unpack4(pb);
+            [[unroll]] for (int r = 0; r < MR; r++) {
+                acc[r] = fma(db, dot(wv, lsh[uint(r) * KC + lane + LANES]), acc[r]);
+            }
+        }
+        barrier();
+    }
+    [[unroll]] for (int r = 0; r < MR; r++) {
+        float s = subgroupAdd(acc[r]);
+        uint ii = i0 + uint(r);
+        if (lane == 0u && ii < pc.m && j < pc.n) {
+            dst[ii * pc.n + j] = s;
+        }
+    }
+}
