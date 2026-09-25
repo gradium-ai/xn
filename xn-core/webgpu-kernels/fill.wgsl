@@ -1,6 +1,8 @@
 // Fill a buffer with a constant. Keeps zeros/full inside the recorded batch.
 struct Params { n: u32, v: f32 };
-var<push_constant> pc: Params;
+// WebGPU has no push constants; parameters arrive in a uniform windowed
+// to this dispatch's slot by a dynamic offset.
+@group(0) @binding(8) var<uniform> pc: Params;
 @group(0) @binding(0) var<storage, read_write> dst: array<f32>;
 
 @compute @workgroup_size(256)

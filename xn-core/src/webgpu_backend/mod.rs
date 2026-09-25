@@ -49,7 +49,9 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
     let def = match base {
         "fill" => (include_str!("../../webgpu-kernels/fill.wgsl"), 1),
         "unary" => (include_str!("../../webgpu-kernels/unary.wgsl"), 2),
+        "unary_inplace" => (include_str!("../../webgpu-kernels/unary_inplace.wgsl"), 1),
         "binary" => (include_str!("../../webgpu-kernels/binary.wgsl"), 3),
+        "binary_inplace" => (include_str!("../../webgpu-kernels/binary_inplace.wgsl"), 2),
         "scale_add" => (include_str!("../../webgpu-kernels/scale_add.wgsl"), 2),
         "broadcast" => (include_str!("../../webgpu-kernels/broadcast.wgsl"), 4),
         "softmax" => (include_str!("../../webgpu-kernels/softmax.wgsl"), 2),
@@ -85,8 +87,14 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
 /// What `map_async` reports back through the readback channel.
 type MapResult = std::result::Result<(), wgpu::BufferAsyncError>;
 
-const MAX_BINDINGS: usize = 4;
-const PUSH_CONSTANT_SIZE: u32 = 128;
+/// Binding index the kernels read their parameters from. Above every storage
+/// binding any kernel declares, so it never collides with one.
+const PARAMS_BINDING: u32 = 8;
+/// Bytes reserved per dispatch in the parameter ring. Must be a multiple of the
+/// adapter's `min_uniform_buffer_offset_alignment`, checked at device creation.
+const PARAMS_SLOT_SIZE: u64 = 256;
+/// Dispatches a batch can record before the ring must be flushed.
+const PARAMS_RING_SLOTS: u64 = 4096;
 const WORKGROUP_SIZE: u32 = 256;
 /// The two matmul kernels, kept as named constants because the dispatch
 /// geometry below is parsed back out of them.
@@ -351,9 +359,105 @@ impl Pc {
     }
 }
 
+/// A one-shot future completed by a wgpu callback.
+///
+/// A browser delivers GPU completion through the event loop, so the only way to
+/// wait for it is to await. `flush_async` and `read_buffer_async` are the two
+/// places that do, and this is what they await on.
+#[derive(Default)]
+struct SignalState {
+    done: bool,
+    waker: Option<std::task::Waker>,
+}
+
+struct Signal(std::sync::Arc<Mutex<SignalState>>);
+
+impl Signal {
+    /// Returns the future and the callback that completes it.
+    fn new() -> (Self, impl FnOnce() + Send + 'static) {
+        let state = std::sync::Arc::new(Mutex::new(SignalState::default()));
+        let fired = state.clone();
+        let fire = move || {
+            let mut st = fired.lock().unwrap();
+            st.done = true;
+            if let Some(w) = st.waker.take() {
+                w.wake();
+            }
+        };
+        (Signal(state), fire)
+    }
+}
+
+impl std::future::Future for Signal {
+    type Output = ();
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let mut st = self.0.lock().unwrap();
+        if st.done {
+            std::task::Poll::Ready(())
+        } else {
+            st.waker = Some(cx.waker().clone());
+            std::task::Poll::Pending
+        }
+    }
+}
+
+/// Copy a mapped readback range into a host `Vec`.
+fn copy_mapped<T: WithDType>(slice: &wgpu::BufferSlice<'_>, len: usize, bytes: usize) -> Vec<T> {
+    let mapped = slice.get_mapped_range();
+    let mut out = Vec::<T>::with_capacity(len);
+    unsafe {
+        std::ptr::copy_nonoverlapping(mapped.as_ptr(), out.as_mut_ptr() as *mut u8, bytes);
+        out.set_len(len);
+    }
+    out
+}
+
+/// Which storage bindings a kernel only reads, as a bitmask over binding index.
+///
+/// Read from the shader's own declarations rather than a table beside them: a
+/// table would drift, and being wrong here is not a compile error but a
+/// validation failure in the browser -- WebGPU rejects a buffer bound twice as
+/// writable, which native drivers accept. `gemv` binds its rhs twice, scalar and
+/// as a vec4 view, so it is exactly the case that matters.
+/// The uniform binding every kernel takes its parameters through.
+fn params_layout_entry() -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding: PARAMS_BINDING,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            // One ring buffer, windowed to this dispatch's slot.
+            has_dynamic_offset: true,
+            min_binding_size: std::num::NonZeroU64::new(PARAMS_SLOT_SIZE),
+        },
+        count: None,
+    }
+}
+
+fn read_only_mask(src: &str) -> u32 {
+    let mut mask = 0u32;
+    for decl in src.split("@group(0) @binding(").skip(1) {
+        let Some((idx, rest)) = decl.split_once(')') else { continue };
+        let Ok(i) = idx.trim().parse::<u32>() else { continue };
+        // `var<storage, read>` is read-only; `read_write` is not. The uniform
+        // binding is not a storage buffer and never appears here.
+        let head: String = rest.chars().take(40).collect();
+        if head.contains("var<storage, read>") {
+            mask |= 1 << i;
+        }
+    }
+    mask
+}
+
 struct CachedPipeline {
     pipeline: wgpu::ComputePipeline,
     bindings: u32,
+    /// Built from this kernel's read-only mask, so it is per-kernel rather than
+    /// shared across every kernel with the same binding count.
+    bgl: wgpu::BindGroupLayout,
     /// Stable index, used to skip a redundant `set_pipeline` when consecutive
     /// dispatches in the same pass use the same kernel.
     idx: usize,
@@ -446,6 +550,10 @@ struct OpCtx {
     /// Buffers (dropped tensors + scratch) to recycle into the pool on the next
     /// flush, once the batch referencing them has finished executing.
     free_bufs: Vec<Buf>,
+    /// Kernel parameters for every dispatch in this batch, one
+    /// `PARAMS_SLOT_SIZE` slot each, uploaded to `params_ring` in one write at
+    /// flush. A browser has no push constants, so this is how parameters travel.
+    params: Vec<u8>,
 }
 
 impl Drop for OpCtx {
@@ -468,10 +576,10 @@ impl Drop for OpCtx {
 
 pub struct DeviceInner {
     device: wgpu::Device,
+    /// Kernel parameters for the batch in flight, one `PARAMS_SLOT_SIZE` slot
+    /// per dispatch, addressed by a dynamic offset.
+    params_ring: wgpu::Buffer,
     queue: wgpu::Queue,
-    // bind_group_layouts[n] / pipeline_layouts[n] describe `n` storage bindings.
-    bind_group_layouts: Vec<wgpu::BindGroupLayout>,
-    pipeline_layouts: Vec<wgpu::PipelineLayout>,
     pipelines: Mutex<HashMap<String, CachedPipeline>>,
     pool: Mutex<BufferPool>,
     ctx: Mutex<OpCtx>,
@@ -498,6 +606,7 @@ impl std::fmt::Debug for Device {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn device_type_score(t: wgpu::DeviceType) -> u32 {
     match t {
         wgpu::DeviceType::DiscreteGpu => 4,
@@ -509,85 +618,106 @@ fn device_type_score(t: wgpu::DeviceType) -> u32 {
 }
 
 impl Device {
+    /// Native only: `pollster` blocks the calling thread, which a browser cannot
+    /// do. Wasm callers await [`Self::new_async`] instead.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(ordinal: usize) -> Result<Self> {
         pollster::block_on(Self::new_async(ordinal))
     }
 
-    async fn new_async(ordinal: usize) -> Result<Self> {
+    /// Kept on wasm so callers that build a device synchronously still compile,
+    /// and fail with a message rather than a missing symbol.
+    #[cfg(target_arch = "wasm32")]
+    pub fn new(_ordinal: usize) -> Result<Self> {
+        crate::bail!(
+            "webgpu: a device cannot be created synchronously in a browser; await `new_async`"
+        )
+    }
+
+    pub async fn new_async(ordinal: usize) -> Result<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
 
+        // Browsers expose no enumeration and mask the adapter name, so there is
+        // nothing to rank and `ordinal` has no meaning: ask for the
+        // high-performance adapter and take what is given.
+        #[cfg(target_arch = "wasm32")]
+        let (adapter, device_name) = {
+            let _ = ordinal;
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                })
+                .await
+                .map_err(wgpuerr("request_adapter"))?;
+            let info = adapter.get_info();
+            let name = if info.name.is_empty() {
+                format!("WebGPU ({:?})", info.backend)
+            } else {
+                format!("{} ({:?})", info.name, info.backend)
+            };
+            (adapter, name)
+        };
+
+        #[cfg(not(target_arch = "wasm32"))]
         // Rank adapters by preference (discrete > integrated > cpu). `ordinal`
         // selects among the ranked list. `XN_WEBGPU_DEVICE` overrides it with a
         // raw enumeration index.
-        let adapters = instance.enumerate_adapters(wgpu::Backends::all());
-        if adapters.is_empty() {
-            crate::bail!("webgpu: no adapters found (is a GPU driver installed?)");
-        }
-        let mut ranked: Vec<(u32, usize)> = adapters
-            .iter()
-            .enumerate()
-            .map(|(i, a)| (device_type_score(a.get_info().device_type), i))
-            .collect();
-        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        let idx = match std::env::var("XN_WEBGPU_DEVICE").ok().and_then(|v| v.parse::<usize>().ok())
-        {
-            Some(i) if i < adapters.len() => i,
-            _ => ranked.get(ordinal).map(|r| r.1).unwrap_or(ranked[0].1),
+        let (adapter, device_name) = {
+            let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+            if adapters.is_empty() {
+                crate::bail!("webgpu: no adapters found (is a GPU driver installed?)");
+            }
+            let mut ranked: Vec<(u32, usize)> = adapters
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (device_type_score(a.get_info().device_type), i))
+                .collect();
+            ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            let idx = match std::env::var("XN_WEBGPU_DEVICE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                Some(i) if i < adapters.len() => i,
+                _ => ranked.get(ordinal).map(|r| r.1).unwrap_or(ranked[0].1),
+            };
+            let adapter = adapters.into_iter().nth(idx).expect("ranked index is in range");
+            let info = adapter.get_info();
+            (adapter, format!("{} ({:?})", info.name, info.backend))
         };
-        let adapter = &adapters[idx];
-        let info = adapter.get_info();
-        let device_name = format!("{} ({:?})", info.name, info.backend);
 
-        // Push constants (native feature) carry kernel parameters; f32 storage
-        // buffers hold tensor data. Request a limit that fits the largest push
-        // block (gemm: 14 u32 = 56 B) with headroom.
-        let limits =
-            wgpu::Limits { max_push_constant_size: PUSH_CONSTANT_SIZE, ..adapter.limits() };
+        // No feature or limit beyond what the adapter already reports: kernel
+        // parameters travel in a uniform, and a browser grants none of wgpu's
+        // native-only features.
+        let limits = adapter.limits();
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("xn-webgpu"),
-                required_features: wgpu::Features::PUSH_CONSTANTS,
+                required_features: wgpu::Features::empty(),
                 required_limits: limits,
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
             })
             .await
-            .map_err(wgpuerr("request_device (push-constant support required)"))?;
+            .map_err(wgpuerr("request_device"))?;
 
-        // A storage-buffer bind group layout + pipeline layout for each binding
-        // count. Every binding is a read_write storage buffer (info/ids buffers
-        // are declared read_write in WGSL too), so a single layout per count
-        // serves every kernel with that many bindings.
-        let mut bind_group_layouts = Vec::with_capacity(MAX_BINDINGS + 1);
-        let mut pipeline_layouts = Vec::with_capacity(MAX_BINDINGS + 1);
-        for n in 0..=MAX_BINDINGS {
-            let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..n)
-                .map(|i| wgpu::BindGroupLayoutEntry {
-                    binding: i as u32,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                })
-                .collect();
-            let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some(&format!("xn-bgl-{n}")),
-                entries: &entries,
-            });
-            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some(&format!("xn-pl-{n}")),
-                bind_group_layouts: &[&bgl],
-                push_constant_ranges: &[wgpu::PushConstantRange {
-                    stages: wgpu::ShaderStages::COMPUTE,
-                    range: 0..PUSH_CONSTANT_SIZE,
-                }],
-            });
-            bind_group_layouts.push(bgl);
-            pipeline_layouts.push(pl);
+        // A dynamic offset must be a multiple of this, and the slot size is what
+        // every offset is a multiple of. 256 satisfies every adapter seen so far;
+        // failing here beats miscomputing offsets on one that wants more.
+        let uniform_align = device.limits().min_uniform_buffer_offset_alignment as u64;
+        if !PARAMS_SLOT_SIZE.is_multiple_of(uniform_align) {
+            crate::bail!(
+                "webgpu: parameter slot size {PARAMS_SLOT_SIZE} is not a multiple of this \
+                 device's uniform offset alignment ({uniform_align})"
+            );
         }
+        let params_ring = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("xn-params"),
+            size: PARAMS_SLOT_SIZE * PARAMS_RING_SLOTS,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let profile = std::env::var("XN_WEBGPU_PROFILE").is_ok_and(|v| !v.is_empty() && v != "0");
         let spin_us = std::env::var("XN_WEBGPU_SPIN_US")
@@ -598,12 +728,12 @@ impl Device {
 
         let inner = DeviceInner {
             device,
+            params_ring,
             queue,
-            bind_group_layouts,
-            pipeline_layouts,
             pipelines: Mutex::new(HashMap::new()),
             pool: Mutex::new(BufferPool::default()),
             ctx: Mutex::new(OpCtx {
+                params: Vec::new(),
                 pass: None,
                 encoder: None,
                 last_pipeline: usize::MAX,
@@ -651,11 +781,14 @@ impl Device {
         Buf { buffer, class }
     }
 
-    fn get_pipeline(&self, name: &str) -> Result<(wgpu::ComputePipeline, u32, usize)> {
+    fn get_pipeline(
+        &self,
+        name: &str,
+    ) -> Result<(wgpu::ComputePipeline, u32, wgpu::BindGroupLayout, usize)> {
         {
             let pipelines = self.pipelines.lock().unwrap();
             if let Some(p) = pipelines.get(name) {
-                return Ok((p.pipeline.clone(), p.bindings, p.idx));
+                return Ok((p.pipeline.clone(), p.bindings, p.bgl.clone(), p.idx));
             }
         }
         let (src, bindings) = kernel_src(name)
@@ -664,9 +797,32 @@ impl Device {
             label: Some(name),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(src)),
         });
+        let read_only = read_only_mask(src);
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..bindings)
+            .map(|i| wgpu::BindGroupLayoutEntry {
+                binding: i,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: read_only & (1 << i) != 0 },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            })
+            .chain(std::iter::once(params_layout_entry()))
+            .collect();
+        let bgl = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(name),
+            entries: &entries,
+        });
+        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(name),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
         let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(name),
-            layout: Some(&self.pipeline_layouts[bindings as usize]),
+            layout: Some(&layout),
             module: &module,
             entry_point: Some("main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -674,9 +830,13 @@ impl Device {
         });
         let mut pipelines = self.pipelines.lock().unwrap();
         let idx = pipelines.len();
-        let entry =
-            pipelines.entry(name.to_string()).or_insert(CachedPipeline { pipeline, bindings, idx });
-        Ok((entry.pipeline.clone(), entry.bindings, entry.idx))
+        let entry = pipelines.entry(name.to_string()).or_insert(CachedPipeline {
+            pipeline,
+            bindings,
+            bgl,
+            idx,
+        });
+        Ok((entry.pipeline.clone(), entry.bindings, entry.bgl.clone(), entry.idx))
     }
 
     /// Record a single dispatch of `kernel` (1D workgroup count).
@@ -698,7 +858,7 @@ impl Device {
             return Ok(());
         }
         let t0 = self.profile.then(std::time::Instant::now);
-        let (pipeline, bindings, pidx) = self.get_pipeline(kernel)?;
+        let (pipeline, bindings, bgl, pidx) = self.get_pipeline(kernel)?;
         assert_eq!(bindings as usize, buffers.len(), "kernel {kernel} binding count mismatch");
         let entries: Vec<wgpu::BindGroupEntry> = buffers
             .iter()
@@ -707,13 +867,35 @@ impl Device {
                 binding: i as u32,
                 resource: b.as_entire_binding(),
             })
+            .chain(std::iter::once(wgpu::BindGroupEntry {
+                binding: PARAMS_BINDING,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &self.params_ring,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(PARAMS_SLOT_SIZE),
+                }),
+            }))
             .collect();
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(kernel),
-            layout: &self.bind_group_layouts[bindings as usize],
+            layout: &bgl,
             entries: &entries,
         });
+        if push.bytes.len() as u64 > PARAMS_SLOT_SIZE {
+            crate::bail!(
+                "webgpu: kernel {kernel} has {} bytes of parameters, slot is {PARAMS_SLOT_SIZE}",
+                push.bytes.len()
+            );
+        }
         let mut ctx = self.ctx.lock().unwrap();
+        // The ring is uploaded in one write at flush, so a full ring means
+        // flushing now rather than growing it.
+        if ctx.params.len() as u64 + PARAMS_SLOT_SIZE > PARAMS_SLOT_SIZE * PARAMS_RING_SLOTS {
+            self.flush_locked(&mut ctx)?;
+        }
+        let params_offset = ctx.params.len() as u32;
+        ctx.params.extend_from_slice(&push.bytes);
+        ctx.params.resize(params_offset as usize + PARAMS_SLOT_SIZE as usize, 0);
         self.ensure_pass(&mut ctx);
         let switch_pipeline = ctx.last_pipeline != pidx;
         ctx.last_pipeline = pidx;
@@ -721,8 +903,7 @@ impl Device {
         if switch_pipeline {
             cpass.set_pipeline(&pipeline);
         }
-        cpass.set_bind_group(0, &bind_group, &[]);
-        cpass.set_push_constants(0, &push.bytes);
+        cpass.set_bind_group(0, &bind_group, &[params_offset]);
         cpass.dispatch_workgroups(gx, gy, gz);
         drop(ctx);
         if let Some(t0) = t0 {
@@ -808,26 +989,133 @@ impl Device {
         let t0 = (self.profile && had_work).then(std::time::Instant::now);
         // The pass borrows the encoder; it has to go before `finish`.
         Self::end_pass(ctx);
+        // `write_buffer` applies at the head of the submission, so one upload
+        // here covers every dispatch recorded in this batch.
+        if !ctx.params.is_empty() {
+            self.queue.write_buffer(&self.params_ring, 0, &ctx.params);
+        }
         if ctx.open {
             let enc = ctx.encoder.take().unwrap();
             self.queue.submit(Some(enc.finish()));
             ctx.open = false;
         }
+        ctx.params.clear();
         // Drive the queue to completion so host reads and buffer recycling are
-        // safe. See `wait_for_queue` for how the wait is split.
+        // safe. See `wait_for_queue` for how the wait is split. A browser cannot
+        // block, so there the batch is submitted and `flush_async` is what
+        // reaches a completion point.
+        #[cfg(not(target_arch = "wasm32"))]
         self.wait_for_queue()?;
         if let Some(t0) = t0 {
             let mut p = self.pstats.lock().unwrap();
             p.submits += 1;
             p.submit_wait_ns += t0.elapsed().as_nanos();
         }
-        if !ctx.free_bufs.is_empty() {
-            let mut pool = self.pool.lock().unwrap();
-            for b in ctx.free_bufs.drain(..) {
-                pool.free.entry(b.class).or_default().push(b);
+        // Recycling a buffer the GPU has not finished with would corrupt it, so
+        // it happens only where completion is known. On wasm this sync flush
+        // leaves them queued and `flush_async` recycles after awaiting.
+        #[cfg(not(target_arch = "wasm32"))]
+        Self::recycle(&self.pool, ctx);
+        Ok(())
+    }
+
+    /// Move buffers freed by this batch back into the pool. Only sound once the
+    /// batch that referenced them has completed.
+    fn recycle(pool: &Mutex<BufferPool>, ctx: &mut OpCtx) {
+        if ctx.free_bufs.is_empty() {
+            return;
+        }
+        let mut pool = pool.lock().unwrap();
+        for b in ctx.free_bufs.drain(..) {
+            pool.free.entry(b.class).or_default().push(b);
+        }
+    }
+
+    /// Submit any pending work and await its completion. The browser-safe
+    /// counterpart to the synchronous flush.
+    pub async fn flush_async(&self) -> Result<()> {
+        {
+            let mut ctx = self.ctx.lock().unwrap();
+            if ctx.open {
+                if !ctx.params.is_empty() {
+                    self.queue.write_buffer(&self.params_ring, 0, &ctx.params);
+                }
+                Self::end_pass(&mut ctx);
+                let enc = ctx.encoder.take().expect("open batch has an encoder");
+                self.queue.submit(Some(enc.finish()));
+                ctx.open = false;
+                ctx.params.clear();
             }
         }
+        let (signal, fire) = Signal::new();
+        self.queue.on_submitted_work_done(fire);
+        // Native needs a poll to service the callback; in a browser the event
+        // loop does it while this future is pending.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.device.poll(wgpu::PollType::Wait).map_err(wgpuerr("poll (flush_async)"))?;
+        signal.await;
+        Self::recycle(&self.pool, &mut self.ctx.lock().unwrap());
         Ok(())
+    }
+
+    /// Read `len` elements of `T` back without blocking. The browser-safe
+    /// counterpart to `read_buffer`.
+    pub async fn read_buffer_async<T: WithDType>(
+        &self,
+        buf: &wgpu::Buffer,
+        len: usize,
+    ) -> Result<Vec<T>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let bytes = len * T::BYTE_SIZE;
+        let padded = round4(bytes) as u64;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("xn-readback"),
+            size: padded,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        {
+            // Appended to the batch already pending, so the copy and the work
+            // that produced `buf` land on one submission.
+            let mut ctx = self.ctx.lock().unwrap();
+            self.begin_if_needed(&mut ctx);
+            Self::end_pass(&mut ctx);
+            ctx.encoder.as_mut().unwrap().copy_buffer_to_buffer(buf, 0, &staging, 0, padded);
+            ctx.open = true;
+        }
+        self.flush_async().await?;
+
+        let slice = staging.slice(..padded);
+        let (signal, fire) = Signal::new();
+        let status = std::sync::Arc::new(Mutex::new(None));
+        let st = status.clone();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            *st.lock().unwrap() = Some(r);
+            fire();
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        self.device.poll(wgpu::PollType::Wait).map_err(wgpuerr("poll (readback async)"))?;
+        signal.await;
+        match status.lock().unwrap().take() {
+            Some(Ok(())) => {}
+            Some(Err(e)) => return Err(wgpuerr("map_async")(e)),
+            None => crate::bail!("webgpu: readback completed without a status"),
+        }
+        let out = copy_mapped::<T>(&slice, len, bytes);
+        staging.unmap();
+        Ok(out)
+    }
+
+    /// A tensor's values on the host, without blocking.
+    pub async fn tensor_to_vec<T: WithDType>(&self, t: &crate::Tensor<T, Self>) -> Result<Vec<T>> {
+        let len = t.shape().elem_count();
+        let buffer = {
+            let storage = t.storage()?;
+            storage.buffer.clone()
+        };
+        self.read_buffer_async::<T>(&buffer, len).await
     }
 
     /// Schedule a buffer to be recycled into the pool on the next flush. Called

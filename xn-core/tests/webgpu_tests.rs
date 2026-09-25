@@ -761,3 +761,46 @@ fn q8_from_gguf_rejects_a_wrong_shape() -> Result<()> {
     }
     Ok(())
 }
+
+// -----------------------------------------------------------------------------
+// In-place ops, which bind one buffer at two bindings
+// -----------------------------------------------------------------------------
+
+// `bin_assign` dispatches `binary` with `[dst, src, dst]`, so the destination
+// buffer is bound twice in one dispatch. WebGPU's usage-scope rules constrain
+// what those two bindings may declare, and a validation failure there is a lost
+// device rather than a wrong number -- so this exercises the dispatch rather
+// than trusting the layout to be right.
+#[test]
+fn inplace_add_binds_dst_twice() -> Result<()> {
+    let d = dev();
+    let n = 512;
+    let a = iota(n);
+    let b: Vec<f32> = a.iter().map(|v| v * 2.0 - 0.5).collect();
+
+    let cpu_dst = Tensor::from_vec(a.clone(), n, &CPU)?;
+    cpu_dst.inplace_add(&Tensor::from_vec(b.clone(), n, &CPU)?)?;
+
+    let gpu_dst = Tensor::from_vec(a, n, &d)?;
+    gpu_dst.inplace_add(&Tensor::from_vec(b, n, &d)?)?;
+
+    assert_close(&cpu_dst.to_vec()?, &gpu_dst.to_vec()?, 1e-6);
+    Ok(())
+}
+
+#[test]
+fn inplace_mul_binds_dst_twice() -> Result<()> {
+    let d = dev();
+    let n = 300;
+    let a = iota(n);
+    let b: Vec<f32> = a.iter().map(|v| 0.5 - v).collect();
+
+    let cpu_dst = Tensor::from_vec(a.clone(), n, &CPU)?;
+    cpu_dst.inplace_mul(&Tensor::from_vec(b.clone(), n, &CPU)?)?;
+
+    let gpu_dst = Tensor::from_vec(a, n, &d)?;
+    gpu_dst.inplace_mul(&Tensor::from_vec(b, n, &d)?)?;
+
+    assert_close(&cpu_dst.to_vec()?, &gpu_dst.to_vec()?, 1e-6);
+    Ok(())
+}

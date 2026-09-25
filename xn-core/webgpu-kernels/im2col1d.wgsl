@@ -7,9 +7,11 @@ struct Params {
     batch: u32, in_channels: u32, in_len: u32, out_length: u32,
     kernel_size: u32, stride: u32, padding: u32, dilation: u32,
 };
-var<push_constant> pc: Params;
+// WebGPU has no push constants; parameters arrive in a uniform windowed
+// to this dispatch's slot by a dynamic offset.
+@group(0) @binding(8) var<uniform> pc: Params;
 @group(0) @binding(0) var<storage, read_write> dst: array<f32>;
-@group(0) @binding(1) var<storage, read_write> src: array<f32>;
+@group(0) @binding(1) var<storage, read> src: array<f32>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {

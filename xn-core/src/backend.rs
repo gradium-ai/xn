@@ -1,8 +1,24 @@
 use crate::Result;
 use crate::{BinaryOp, UnaryOp};
 
-pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
-    type Storage<T: crate::WithDType>: Sized + Sync + Send + 'static;
+/// `Send + Sync` on native; no bound in a browser.
+///
+/// WebGPU objects in a browser belong to the JS context that created them and are
+/// neither `Send` nor `Sync` -- wgpu models that faithfully, wrapping them in
+/// `RefCell` and raw pointers. Requiring those bounds unconditionally makes a
+/// wasm build of any GPU backend impossible. A browser build is single-threaded,
+/// so dropping them there costs nothing, and native keeps them exactly as before.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait ThreadSafe: Send + Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync + ?Sized> ThreadSafe for T {}
+#[cfg(target_arch = "wasm32")]
+pub trait ThreadSafe {}
+#[cfg(target_arch = "wasm32")]
+impl<T: ?Sized> ThreadSafe for T {}
+
+pub trait Backend: Sized + Clone + 'static + ThreadSafe + std::fmt::Debug {
+    type Storage<T: crate::WithDType>: Sized + ThreadSafe + 'static;
 
     fn name(&self) -> String;
     fn synchronize(&self) -> Result<()>;

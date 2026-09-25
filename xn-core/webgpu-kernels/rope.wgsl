@@ -1,9 +1,11 @@
 // Rotary position embedding, non-interleaved (GPT-NeoX style).
 struct Params { bh: u32, td: u32, d: u32, h: u32, cs_stride_b: u32, cos_off: u32, sin_off: u32 };
-var<push_constant> pc: Params;
-@group(0) @binding(0) var<storage, read_write> cosb: array<f32>;
-@group(0) @binding(1) var<storage, read_write> sinb: array<f32>;
-@group(0) @binding(2) var<storage, read_write> src: array<f32>;
+// WebGPU has no push constants; parameters arrive in a uniform windowed
+// to this dispatch's slot by a dynamic offset.
+@group(0) @binding(8) var<uniform> pc: Params;
+@group(0) @binding(0) var<storage, read> cosb: array<f32>;
+@group(0) @binding(1) var<storage, read> sinb: array<f32>;
+@group(0) @binding(2) var<storage, read> src: array<f32>;
 @group(0) @binding(3) var<storage, read_write> dst: array<f32>;
 
 @compute @workgroup_size(256)
