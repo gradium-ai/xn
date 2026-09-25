@@ -874,7 +874,8 @@ impl crate::Backend for crate::CpuDevice {
                     }
                 }
             }
-        } else if n_outer >= crate::get_num_threads() {
+        // The width that will actually run it; `get_num_threads` is 1 off the pool.
+        } else if n_outer >= crate::threadpool::size() {
             dst[..total]
                 .par_chunks_mut(d_a * d_b)
                 .enumerate()
