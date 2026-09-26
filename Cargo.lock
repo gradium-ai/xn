@@ -3432,6 +3432,7 @@ dependencies = [
  "ash",
  "bindgen_cuda",
  "byteorder",
+ "cc",
  "clap",
  "cudarc",
  "half",

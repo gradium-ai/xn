@@ -19,6 +19,7 @@ anyhow = "1"
 ash = "0.38"
 bindgen_cuda = "0.1.6"
 byteorder = "1"
+cc = "1"
 clap = { version = "4", features = ["derive"] }
 cudarc = { version = "0.19.9", features = ["std", "cublas", "cublaslt", "curand", "driver", "nvrtc", "f16", "cuda-version-from-build-system", "dynamic-linking"] }
 gemm = { package = "xn-gemm", version = "0.20.1", features = ["wasm-simd128-enable"] }

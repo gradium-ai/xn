@@ -48,12 +48,16 @@ tracing-chrome = { workspace = true }
 
 [build-dependencies]
 bindgen_cuda = { workspace = true, optional = true }
+cc = { workspace = true, optional = true }
 
 [features]
 default = []
 accelerate = ["dep:libc"]
 audio = ["dep:kaudio"]
 cuda = ["dep:cudarc", "dep:bindgen_cuda"]
+# KleidiAI SME2 / NEON micro-kernels for `q8_0` linears on AArch64, see `quantized::kleidiai`.
+# Needs a KleidiAI source tree (`KLEIDIAI_DIR` or a `kleidiai` sibling of this workspace).
+kleidiai = ["dep:cc"]
 metal = ["dep:metal"]
 vulkan = ["dep:ash"]
 webgpu = ["dep:wgpu", "dep:pollster"]
@@ -89,3 +93,7 @@ required-features = ["cuda"]
 [[example]]
 name = "cuda_thread_test"
 required-features = ["cuda"]
+
+[[example]]
+name = "bench_q8_kleidiai"
+required-features = ["kleidiai"]

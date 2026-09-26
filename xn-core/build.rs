@@ -17,6 +17,8 @@ fn main() {
     }
     #[cfg(feature = "vulkan")]
     build_vulkan_shaders();
+    #[cfg(feature = "kleidiai")]
+    build_kleidiai();
 }
 
 /// Compile every `vulkan-kernels/*.comp` GLSL compute shader to SPIR-V using
@@ -123,4 +125,97 @@ fn build_vulkan_shaders() {
     let dest = Path::new(&out_dir).join("vulkan_shaders.rs");
     let mut f = std::fs::File::create(&dest).expect("failed to create vulkan_shaders.rs");
     f.write_all(generated.as_bytes()).expect("failed to write vulkan_shaders.rs");
+}
+
+/// Compile the KleidiAI micro-kernels that `quantized::kleidiai` binds to.
+///
+/// KleidiAI is a source library with one hand-written routine per ISA tier, and each file has
+/// to be compiled for exactly its tier: an SME2 kernel's C wrapper refuses to build without
+/// `+sve2`, and a dotprod kernel built with `+i8mm` would silently require i8mm. So rather than
+/// running KleidiAI's CMake, which builds the whole library, this compiles the handful of
+/// files the `q8_0` path needs as one `cc::Build` per tier, with the per-file flags from
+/// KleidiAI's own `CMakeLists.txt`. Runtime dispatch between tiers is the Rust side's job.
+///
+/// The tree is located from `KLEIDIAI_DIR` if set, else a `kleidiai` sibling of the workspace
+/// this crate sits in:
+///
+/// ```text
+/// git clone --depth 1 --branch v1.24.0 https://github.com/ARM-software/kleidiai.git
+/// ```
+///
+/// Only AArch64 has kernels; on any other target the feature compiles nothing and the Rust
+/// module is `cfg`'d out. MSVC is not supported because the flags below are GCC/Clang's.
+#[cfg(feature = "kleidiai")]
+fn build_kleidiai() {
+    use std::path::{Path, PathBuf};
+
+    println!("cargo:rerun-if-env-changed=KLEIDIAI_DIR");
+    println!("cargo:rerun-if-changed=csrc/xn_kleidiai.c");
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("aarch64") {
+        return;
+    }
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        panic!("the `kleidiai` feature needs GCC or Clang: KleidiAI's kernels are GNU assembly");
+    }
+
+    let root: PathBuf = match std::env::var_os("KLEIDIAI_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => {
+            let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+            // `<workspace>/xn-core` -> `<workspace>/../kleidiai`.
+            manifest.parent().and_then(Path::parent).map(|p| p.join("kleidiai")).unwrap()
+        }
+    };
+    if !root.join("kai/kai_common.h").exists() {
+        panic!(
+            "KleidiAI sources not found at {} - clone \
+             https://github.com/ARM-software/kleidiai (v1.24.0) there or set KLEIDIAI_DIR",
+            root.display()
+        );
+    }
+    let kai = |p: &str| root.join(p);
+    let matmul = "kai/ukernels/matmul/";
+    let q8 = "kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp/";
+
+    let tier = |flags: &[&str]| {
+        let mut b = cc::Build::new();
+        b.include(&root).opt_level(3).warnings(false);
+        for f in flags {
+            b.flag(f);
+        }
+        b
+    };
+
+    // Packing routines and the CPU feature probe: plain NEON.
+    tier(&["-march=armv8-a"])
+        .file("csrc/xn_kleidiai.c")
+        .file(kai(&format!("{matmul}pack/kai_lhs_quant_pack_qai8dxp_f32.c")))
+        .file(kai(&format!("{matmul}pack/kai_rhs_pack_nxk_qsi8cxp_qsi8cx_neon.c")))
+        .compile("xn_kleidiai_base");
+
+    tier(&["-march=armv8.2-a+dotprod"])
+        .file(kai(&format!("{q8}kai_matmul_clamp_f32_qai8dxp1x8_qsi8cxp4x8_1x4_neon_dotprod.c")))
+        .file(kai(&format!("{q8}kai_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod.c")))
+        .file(kai(&format!("{q8}kai_matmul_clamp_f32_qai8dxp1x4_qsi8cxp4x4_1x4_neon_dotprod.c")))
+        .compile("xn_kleidiai_dotprod");
+
+    tier(&["-march=armv8.2-a+i8mm"])
+        .file(kai(&format!("{q8}kai_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm.c")))
+        .compile("xn_kleidiai_i8mm");
+
+    // The SME kernels are `.inst`-encoded assembly, so the assembler only needs SVE2; the
+    // `-fno-tree-*` flags are what KleidiAI itself uses for their C wrappers.
+    tier(&["-march=armv8.2-a+sve+sve2", "-fno-tree-vectorize", "-fno-tree-slp-vectorize"])
+        .file(kai("kai/kai_common_sme_asm.S"))
+        .file(kai(&format!(
+            "{q8}kai_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme2_mopa.c"
+        )))
+        .file(kai(&format!(
+            "{q8}kai_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme2_mopa_asm.S"
+        )))
+        .file(kai(&format!("{q8}kai_matmul_clamp_f32_qai8dxp1x4_qsi8cxp4vlx4_1x4vl_sme2_dot.c")))
+        .file(kai(&format!(
+            "{q8}kai_matmul_clamp_f32_qai8dxp1x4_qsi8cxp4vlx4_1x4vl_sme2_dot_asm.S"
+        )))
+        .compile("xn_kleidiai_sme2");
 }
