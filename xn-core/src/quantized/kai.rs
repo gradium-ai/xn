@@ -36,7 +36,8 @@
 //! to, but not bit-identical with, the file it came from.
 //!
 //! `XN_KAI=0` turns the whole path off; `XN_KAI=sme2|i8mm|dotprod` pins a family, for
-//! comparing them on a CPU that has more than one. Both are read once per process.
+//! comparing them on a CPU that has more than one. `XN_KAI_THREADS=N` caps how many pool
+//! threads one matmul here spreads over. All three are read once per process.
 
 use super::GgmlDType;
 use super::k_quants::{BlockQ8_0, GgmlType, QK8_0};
@@ -47,6 +48,7 @@ use std::sync::OnceLock;
 
 unsafe extern "C" {
     fn xn_kai_cpu_features() -> u32;
+    fn xn_kai_fast_cluster_cores() -> u32;
 }
 
 // Bit values of `xn_kai_cpu_features`, mirrored from `csrc/xn_kai.c`.
@@ -129,6 +131,40 @@ pub fn family() -> Option<Family> {
 pub fn active() -> bool {
     family().is_some()
 }
+
+/// Most pool threads one matmul of `family` spreads over.
+///
+/// `XN_KAI_THREADS` overrides for every family. Otherwise the NEON families are
+/// uncapped -- they scale like any other kernel on the pool -- and the SME2 family is capped
+/// at the size of the CPU's fastest cluster where the OS reports one: an SME unit is shared by
+/// the cores of a cluster, so more threads than that add nothing, and slower cores joining a
+/// static split cost the wait for the slowest. On the M5 this was tuned on that cap is 4;
+/// where nothing is known the family runs uncapped.
+fn thread_cap(family: Family) -> usize {
+    static C: OnceLock<Option<usize>> = OnceLock::new();
+    let forced = *C.get_or_init(|| {
+        std::env::var("XN_KAI_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    });
+    match (forced, family) {
+        (Some(n), _) => n,
+        (None, Family::Sme2) => {
+            static S: OnceLock<usize> = OnceLock::new();
+            // SAFETY: a pure probe with no preconditions.
+            *S.get_or_init(|| match unsafe { xn_kai_fast_cluster_cores() } {
+                0 => usize::MAX,
+                n => n as usize,
+            })
+        }
+        (None, _) => usize::MAX,
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Storage
+// ---------------------------------------------------------------------------------------------
 
 #[repr(C)]
 struct RhsPackParams {
@@ -529,17 +565,17 @@ impl Q8_0Kai {
     fn to_f32(&self) -> Vec<f32> {
         let (n, k) = (self.n, self.k);
         let mut out = vec![0f32; n * k];
-        let mut q = vec![0i8; k];
-        for (r, row) in out.chunks_mut(k).enumerate() {
+        crate::threadpool::par_chunks_mut(&mut out, k, |r, row| {
+            let mut q = vec![0i8; k];
             let scale = self.row(r, &mut q);
             for (o, &v) in row.iter_mut().zip(&q) {
                 *o = v as f32 * scale;
             }
-        }
+        });
         out
     }
 
-    /// `[n, k] x [k]^T` for one activation row.
+    /// `[n, k] x [k]^T` for one activation row, split over the pool by output column.
     #[tracing::instrument(name = "q-matmul-kai-gemv", skip_all, fields(n = self.n, k = self.k))]
     fn gemv(&self, lhs: &[f32], dst: &mut [f32]) {
         let kern = &self.kernels.gemv;
@@ -548,14 +584,14 @@ impl Q8_0Kai {
             lhs: lhs_packed.as_ptr() as usize,
             rhs: self.packed.as_ptr() as usize,
             dst: dst.as_mut_ptr() as usize,
+            m: 1,
             n: self.n,
             k: self.k,
         };
-        // SAFETY: one call covering the whole output exactly once.
-        unsafe { job.run(kern, 0, 1, 0, self.n) };
+        run_split(kern, self.kernels.family, &job);
     }
 
-    /// `[m, k] x [n, k]^T`.
+    /// `[m, k] x [n, k]^T`: pack the activation rows in parallel, then split the output.
     #[tracing::instrument(name = "q-matmul-kai-gemm", skip_all, fields(m, n = self.n, k = self.k))]
     fn gemm(&self, m: usize, lhs: &[f32], dst: &mut [f32]) {
         let kern = &self.kernels.gemm;
@@ -564,11 +600,11 @@ impl Q8_0Kai {
             lhs: lhs_packed.as_ptr() as usize,
             rhs: self.packed.as_ptr() as usize,
             dst: dst.as_mut_ptr() as usize,
+            m,
             n: self.n,
             k: self.k,
         };
-        // SAFETY: one call covering the whole output exactly once.
-        unsafe { job.run(kern, 0, m, 0, self.n) };
+        run_split(kern, self.kernels.family, &job);
     }
 }
 
@@ -649,27 +685,33 @@ impl super::QuantizedType for Q8_0Kai {
     }
 }
 
-/// Symmetric per-row int8: `q = round(w / scale)`, `scale = max|w| / 127`.
+/// Symmetric per-row int8: `q = round(w / scale)`, `scale = max|w| / 127`. Rows run over the
+/// pool since a checkpoint's worth of them adds up.
 fn requantize_rows<F>(n: usize, k: usize, row: F) -> (Vec<i8>, Vec<f32>)
 where
-    F: Fn(usize, &mut [f32]),
+    F: Fn(usize, &mut [f32]) + Sync,
 {
     let mut qdata = vec![0i8; n * k];
     let mut scales = vec![0f32; n];
-    let mut w = vec![0f32; k];
-    for (r, q) in qdata.chunks_mut(k).enumerate() {
+    let scales_ptr = scales.as_mut_ptr() as usize;
+    crate::threadpool::par_chunks_mut(&mut qdata, k, |r, q| {
+        let mut w = vec![0f32; k];
         row(r, &mut w);
         let max_abs = w.iter().fold(0f32, |acc, v| acc.max(v.abs()));
-        scales[r] = if max_abs > 0.0 { max_abs / 127.0 } else { 0.0 };
+        let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 0.0 };
         let inv = if max_abs > 0.0 { 127.0 / max_abs } else { 0.0 };
         for (o, v) in q.iter_mut().zip(&w) {
             *o = (v * inv).round().clamp(-127.0, 127.0) as i8;
         }
-    }
+        // SAFETY: each chunk index `r` is visited by exactly one worker, so the writes to
+        // `scales` are disjoint, and `scales` outlives the dispatch.
+        unsafe { *(scales_ptr as *mut f32).add(r) = scale };
+    });
     (qdata, scales)
 }
 
-/// Quantize and pack `m` activation rows for `kern`, `mr` rows per packed group.
+/// Quantize and pack `m` activation rows for `kern`, `mr` rows per packed group, groups in
+/// parallel.
 fn pack_lhs(kern: &Kernel, m: usize, k: usize, lhs: &[f32]) -> Vec<u8> {
     let (mr, kr, sr) = (kern.mr, kern.kr, kern.sr);
     // SAFETY: a size query.
@@ -677,37 +719,73 @@ fn pack_lhs(kern: &Kernel, m: usize, k: usize, lhs: &[f32]) -> Vec<u8> {
     // Zeroed so the padding rows of a partial last group hold something harmless: the kernel
     // computes them and predicates the store, so their contents only have to be finite.
     let mut packed = vec![0u8; size];
-    for g in 0..m.div_ceil(mr) {
-        let r0 = g * mr;
-        let rows = (m - r0).min(mr);
-        // SAFETY: `lhs` holds `m * k` floats and `packed` is the buffer sized for them; the
-        // groups are disjoint `mr`-row ranges of both.
-        unsafe {
-            let off = kai_get_lhs_packed_offset_lhs_quant_pack_qai8dxp_f32(r0, k, mr, kr, sr);
-            kai_run_lhs_quant_pack_qai8dxp_f32(
-                rows,
-                k,
-                mr,
-                kr,
-                sr,
-                r0,
-                lhs.as_ptr().add(r0 * k),
-                k * std::mem::size_of::<f32>(),
-                packed.as_mut_ptr().add(off) as *mut c_void,
-            );
-        }
+    let job = PackJob {
+        lhs: lhs.as_ptr() as usize,
+        packed: packed.as_mut_ptr() as usize,
+        m,
+        k,
+        mr,
+        kr,
+        sr,
+    };
+    let groups = m.div_ceil(mr);
+    if groups == 1 {
+        // SAFETY: one group, covering every row once.
+        unsafe { job.run(0) };
+    } else {
+        // SAFETY: groups are disjoint `mr`-row ranges of the input and the output.
+        crate::threadpool::par_units(groups, |g| unsafe { job.run(g) });
     }
     packed
 }
 
-/// Operands of one matmul, with the offset arithmetic the kernel's tile constants require.
-/// The pointers travel as `usize` so that splitting the output across threads, which a later
-/// commit does, needs no wrapper type.
+/// Operands of one activation packing, as addresses so the closure needs no wrapper type.
+#[derive(Clone, Copy)]
+struct PackJob {
+    lhs: usize,
+    packed: usize,
+    m: usize,
+    k: usize,
+    mr: usize,
+    kr: usize,
+    sr: usize,
+}
+
+impl PackJob {
+    /// Pack the rows of group `g`, i.e. `[g * mr, min(m, (g + 1) * mr))`.
+    ///
+    /// # Safety
+    /// `lhs` must address `m * k` floats and `packed` the buffer sized for them; no two
+    /// concurrent calls may share `g`.
+    unsafe fn run(&self, g: usize) {
+        let r0 = g * self.mr;
+        let rows = (self.m - r0).min(self.mr);
+        unsafe {
+            let off = kai_get_lhs_packed_offset_lhs_quant_pack_qai8dxp_f32(
+                r0, self.k, self.mr, self.kr, self.sr,
+            );
+            kai_run_lhs_quant_pack_qai8dxp_f32(
+                rows,
+                self.k,
+                self.mr,
+                self.kr,
+                self.sr,
+                r0,
+                (self.lhs as *const f32).add(r0 * self.k),
+                self.k * std::mem::size_of::<f32>(),
+                (self.packed as *mut u8).add(off) as *mut c_void,
+            );
+        }
+    }
+}
+
+/// Operands of one matmul, as addresses so the dispatched closure needs no wrapper type.
 #[derive(Clone, Copy)]
 struct Job {
     lhs: usize,
     rhs: usize,
     dst: usize,
+    m: usize,
     n: usize,
     k: usize,
 }
@@ -736,6 +814,58 @@ impl Job {
             )
         }
     }
+}
+
+/// The piece of the output that participant `ith` of `nth` computes, as
+/// `(m0, m1, n0, n1)`, or `None` when it has none.
+///
+/// Columns are split first, in multiples of `n_step`, so each participant streams its own
+/// panel of the weight and writes a disjoint set of `dst` columns. Rows are split too, in
+/// multiples of `m_step`, only when there are fewer column blocks than participants. Both
+/// bounds are what the kernel requires a call to start on.
+fn split(
+    ith: usize,
+    nth: usize,
+    (m_step, n_step): (usize, usize),
+    m: usize,
+    n: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    let nblocks = n.div_ceil(n_step);
+    let mblocks = m.div_ceil(m_step);
+    let nsplit = nblocks.min(nth).max(1);
+    let msplit = (nth / nsplit).min(mblocks).max(1);
+    if ith >= nsplit * msplit {
+        return None;
+    }
+    let (ni, mi) = (ith % nsplit, ith / nsplit);
+    let per_n = nblocks.div_ceil(nsplit);
+    let per_m = mblocks.div_ceil(msplit);
+    let n0 = (ni * per_n * n_step).min(n);
+    let n1 = ((ni + 1) * per_n * n_step).min(n);
+    let m0 = (mi * per_m * m_step).min(m);
+    let m1 = ((mi + 1) * per_m * m_step).min(m);
+    if n0 == n1 || m0 == m1 {
+        return None;
+    }
+    Some((m0, m1, n0, n1))
+}
+
+/// Run one kernel call per pool participant, over the piece [`split`] gives it.
+fn run_split(kern: &Kernel, family: Family, job: &Job) {
+    let cap = thread_cap(family);
+    let steps = (kern.m_step, kern.n_step);
+    if cap <= 1 || (job.n <= kern.n_step && job.m <= kern.m_step) {
+        // SAFETY: one call covering the output exactly once.
+        unsafe { job.run(kern, 0, job.m, 0, job.n) };
+        return;
+    }
+    crate::threadpool::dispatch(|ith, nth| {
+        if let Some((m0, m1, n0, n1)) = split(ith, nth.min(cap), steps, job.m, job.n) {
+            // SAFETY: the pieces are disjoint across `ith` and aligned to the kernel's steps,
+            // which `split_covers_the_output_exactly_once` checks; the caller checked bounds.
+            unsafe { job.run(kern, m0, m1, n0, n1) };
+        }
+    });
 }
 
 /// Build this storage for a freshly read `q8_0` tensor, when the gate and the CPU allow.
@@ -1041,6 +1171,42 @@ mod tests {
                 let step = row.iter().fold(0f32, |a, v| a.max(v.abs())) / 127.0;
                 for (g, w) in got[r * k..(r + 1) * k].iter().zip(row) {
                     assert!((g - w).abs() <= step / 2.0 + 1e-6, "row {r}: {g} vs {w}");
+                }
+            }
+        }
+    }
+
+    /// What the `unsafe` in `run_split` rests on: the pieces never overlap, and together they
+    /// are the whole output.
+    #[test]
+    fn split_covers_the_output_exactly_once() {
+        for (m_step, n_step) in [(1, 4), (1, 16), (4, 4), (16, 4), (8, 64)] {
+            for m in [1, 2, 7, 16, 33, 64] {
+                for n in [1, 4, 5, 64, 68, 512] {
+                    for nth in 1..=12 {
+                        let mut seen = vec![0u8; m * n];
+                        for ith in 0..nth {
+                            let Some((m0, m1, n0, n1)) = split(ith, nth, (m_step, n_step), m, n)
+                            else {
+                                continue;
+                            };
+                            assert!(m0 < m1 && m1 <= m && n0 < n1 && n1 <= n);
+                            assert_eq!(m0 % m_step, 0, "row start off the kernel's step");
+                            assert_eq!(n0 % n_step, 0, "column start off the kernel's step");
+                            for i in m0..m1 {
+                                for j in n0..n1 {
+                                    seen[i * n + j] += 1;
+                                }
+                            }
+                        }
+                        let bad = seen.iter().position(|&c| c != 1);
+                        assert!(
+                            bad.is_none(),
+                            "m={m} n={n} nth={nth} steps=({m_step},{n_step}): element {} covered {} times",
+                            bad.unwrap(),
+                            seen[bad.unwrap()]
+                        );
+                    }
                 }
             }
         }
