@@ -292,6 +292,11 @@ impl QTensor {
         // weight quantized by `QLinear::from_linear` takes a different numeric path than the
         // same weight loaded from GGUF.
         if dtype == GgmlDType::Q8_0 {
+            // KleidiAI requantizes per row anyway; from f32 that is one rounding, not two.
+            #[cfg(all(feature = "kai", target_arch = "aarch64"))]
+            if let Some(storage) = kai::q8_0_storage_f32(src, shape.dims()) {
+                return Ok(Self { storage, shape: shape.clone() });
+            }
             let mut blocks = vec![BlockQ8_0::zeros(); elem_count / QK8_0];
             BlockQ8_0::from_float(src, &mut blocks)?;
             let storage = repack::q8_0_storage_owned(blocks, shape.dims());
