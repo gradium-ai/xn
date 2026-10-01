@@ -257,6 +257,45 @@ impl std::fmt::Debug for QTensor {
     }
 }
 
+/// Splits q8_0 blocks in their on-disk layout (an `f16` scale followed by 32
+/// `i8` quants, 34 bytes per block) into the two aligned streams the GPU
+/// backends read: every quant in order, one byte each, and one `f32` scale per
+/// block. 34 is not a multiple of 4, so the packed form cannot be read as
+/// 32-bit words; the split happens once, on upload.
+pub fn split_q8_0(blocks: &[u8]) -> Result<(Vec<u8>, Vec<f32>)> {
+    const BLOCK_BYTES: usize = std::mem::size_of::<BlockQ8_0>();
+    let (blocks, rest) = blocks.as_chunks::<BLOCK_BYTES>();
+    if !rest.is_empty() {
+        crate::bail!("q8_0 data of {} bytes is not a whole number of blocks", rest.len())
+    }
+    let nb = blocks.len();
+    let mut qs = Vec::with_capacity(nb * QK8_0);
+    let mut scales = Vec::with_capacity(nb);
+    for b in blocks {
+        scales.push(half::f16::from_le_bytes([b[0], b[1]]).to_f32());
+        qs.extend_from_slice(&b[2..]);
+    }
+    Ok((qs, scales))
+}
+
+/// Quantizes `src` to q8_0 with the CPU quantizer and returns it split as
+/// [`split_q8_0`] does, so a weight quantized in process gets the same values
+/// as one read from a GGUF.
+pub fn quantize_split_q8_0(src: &[f32]) -> Result<(Vec<u8>, Vec<f32>)> {
+    if !src.len().is_multiple_of(QK8_0) {
+        crate::bail!("{} elements is not a multiple of the {QK8_0}-value q8_0 block", src.len())
+    }
+    let mut blocks = vec![BlockQ8_0::zeros(); src.len() / QK8_0];
+    BlockQ8_0::from_float(src, &mut blocks)?;
+    let mut qs = Vec::with_capacity(src.len());
+    let mut scales = Vec::with_capacity(blocks.len());
+    for block in &blocks {
+        scales.push(block.d.to_f32());
+        qs.extend(block.qs.iter().map(|&q| q as u8));
+    }
+    Ok((qs, scales))
+}
+
 fn check_shape(shape: &Shape, block_size: usize) -> Result<()> {
     let dims = shape.dims();
     if dims.is_empty() {
