@@ -9,6 +9,8 @@ pub mod avx;
 pub mod ggml_file;
 pub mod gguf_file;
 pub mod k_quants;
+#[cfg(all(feature = "kai", target_arch = "aarch64"))]
+pub mod kai;
 #[cfg(target_feature = "neon")]
 #[allow(unsafe_op_in_unsafe_fn)]
 pub mod neon;

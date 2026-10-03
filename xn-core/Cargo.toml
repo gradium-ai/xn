@@ -48,12 +48,16 @@ tracing-chrome = { workspace = true }
 
 [build-dependencies]
 bindgen_cuda = { workspace = true, optional = true }
+cc = { workspace = true, optional = true }
 
 [features]
 default = []
 accelerate = ["dep:libc"]
 audio = ["dep:kaudio"]
 cuda = ["dep:cudarc", "dep:bindgen_cuda"]
+# Arm KleidiAI micro-kernels for the quantized linears, see `quantized::kai`.
+# Needs a KleidiAI source tree: a `kleidiai` sibling of this workspace, or `KLEIDIAI_DIR`.
+kai = ["dep:cc"]
 metal = ["dep:metal"]
 vulkan = ["dep:ash"]
 webgpu = ["dep:wgpu", "dep:pollster"]
