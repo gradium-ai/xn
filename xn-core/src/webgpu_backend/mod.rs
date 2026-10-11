@@ -1022,31 +1022,42 @@ impl Device {
     /// Move buffers freed by this batch back into the pool. Only sound once the
     /// batch that referenced them has completed.
     fn recycle(pool: &Mutex<BufferPool>, ctx: &mut OpCtx) {
-        if ctx.free_bufs.is_empty() {
+        Self::recycle_bufs(pool, std::mem::take(&mut ctx.free_bufs));
+    }
+
+    fn recycle_bufs(pool: &Mutex<BufferPool>, bufs: Vec<Buf>) {
+        if bufs.is_empty() {
             return;
         }
         let mut pool = pool.lock().unwrap();
-        for b in ctx.free_bufs.drain(..) {
+        for b in bufs {
             pool.free.entry(b.class).or_default().push(b);
         }
+    }
+
+    /// Submit the pending batch, if any, without waiting for it. Returns the
+    /// buffers freed up to now: every command that uses them has been submitted,
+    /// so they may be recycled once this submission completes. Buffers freed
+    /// later may still be used by commands recorded after it.
+    fn submit_pending(&self) -> Vec<Buf> {
+        let mut ctx = self.ctx.lock().unwrap();
+        if ctx.open {
+            if !ctx.params.is_empty() {
+                self.queue.write_buffer(&self.params_ring, 0, &ctx.params);
+            }
+            Self::end_pass(&mut ctx);
+            let enc = ctx.encoder.take().expect("open batch has an encoder");
+            self.queue.submit(Some(enc.finish()));
+            ctx.open = false;
+            ctx.params.clear();
+        }
+        std::mem::take(&mut ctx.free_bufs)
     }
 
     /// Submit any pending work and await its completion. The browser-safe
     /// counterpart to the synchronous flush.
     pub async fn flush_async(&self) -> Result<()> {
-        {
-            let mut ctx = self.ctx.lock().unwrap();
-            if ctx.open {
-                if !ctx.params.is_empty() {
-                    self.queue.write_buffer(&self.params_ring, 0, &ctx.params);
-                }
-                Self::end_pass(&mut ctx);
-                let enc = ctx.encoder.take().expect("open batch has an encoder");
-                self.queue.submit(Some(enc.finish()));
-                ctx.open = false;
-                ctx.params.clear();
-            }
-        }
+        let freed = self.submit_pending();
         let (signal, fire) = Signal::new();
         self.queue.on_submitted_work_done(fire);
         // Native needs a poll to service the callback; in a browser the event
@@ -1054,7 +1065,7 @@ impl Device {
         #[cfg(not(target_arch = "wasm32"))]
         self.device.poll(wgpu::PollType::Wait).map_err(wgpuerr("poll (flush_async)"))?;
         signal.await;
-        Self::recycle(&self.pool, &mut self.ctx.lock().unwrap());
+        Self::recycle_bufs(&self.pool, freed);
         Ok(())
     }
 
@@ -1085,7 +1096,9 @@ impl Device {
             ctx.encoder.as_mut().unwrap().copy_buffer_to_buffer(buf, 0, &staging, 0, padded);
             ctx.open = true;
         }
-        self.flush_async().await?;
+        // No wait for the submission before mapping: the map resolves only once the
+        // copy has run, and the queue runs it after everything submitted before it.
+        let freed = self.submit_pending();
 
         let slice = staging.slice(..padded);
         let (signal, fire) = Signal::new();
@@ -1105,6 +1118,8 @@ impl Device {
         }
         let out = copy_mapped::<T>(&slice, len, bytes);
         staging.unmap();
+        // Everything submitted before the copy has completed.
+        Self::recycle_bufs(&self.pool, freed);
         Ok(out)
     }
 
