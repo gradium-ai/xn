@@ -987,19 +987,7 @@ impl Device {
     fn flush_locked(&self, ctx: &mut OpCtx) -> Result<()> {
         let had_work = ctx.open;
         let t0 = (self.profile && had_work).then(std::time::Instant::now);
-        // The pass borrows the encoder; it has to go before `finish`.
-        Self::end_pass(ctx);
-        // `write_buffer` applies at the head of the submission, so one upload
-        // here covers every dispatch recorded in this batch.
-        if !ctx.params.is_empty() {
-            self.queue.write_buffer(&self.params_ring, 0, &ctx.params);
-        }
-        if ctx.open {
-            let enc = ctx.encoder.take().unwrap();
-            self.queue.submit(Some(enc.finish()));
-            ctx.open = false;
-        }
-        ctx.params.clear();
+        self.submit_locked(ctx);
         // Drive the queue to completion so host reads and buffer recycling are
         // safe. See `wait_for_queue` for how the wait is split. A browser cannot
         // block, so there the batch is submitted and `flush_async` is what
@@ -1022,31 +1010,50 @@ impl Device {
     /// Move buffers freed by this batch back into the pool. Only sound once the
     /// batch that referenced them has completed.
     fn recycle(pool: &Mutex<BufferPool>, ctx: &mut OpCtx) {
-        if ctx.free_bufs.is_empty() {
+        Self::recycle_bufs(pool, std::mem::take(&mut ctx.free_bufs));
+    }
+
+    fn recycle_bufs(pool: &Mutex<BufferPool>, bufs: Vec<Buf>) {
+        if bufs.is_empty() {
             return;
         }
         let mut pool = pool.lock().unwrap();
-        for b in ctx.free_bufs.drain(..) {
+        for b in bufs {
             pool.free.entry(b.class).or_default().push(b);
         }
+    }
+
+    /// Submit the pending batch, if any, without waiting for it. Returns the
+    /// buffers freed up to now: every command that uses them has been submitted,
+    /// so they may be recycled once this submission completes. Buffers freed
+    /// later may still be used by commands recorded after it.
+    fn submit_pending(&self) -> Vec<Buf> {
+        let mut ctx = self.ctx.lock().unwrap();
+        self.submit_locked(&mut ctx);
+        std::mem::take(&mut ctx.free_bufs)
+    }
+
+    /// Submit the pending batch, if any, without waiting for it.
+    fn submit_locked(&self, ctx: &mut OpCtx) {
+        // The pass borrows the encoder; it has to go before `finish`.
+        Self::end_pass(ctx);
+        // `write_buffer` applies at the head of the submission, so one upload
+        // here covers every dispatch recorded in this batch.
+        if !ctx.params.is_empty() {
+            self.queue.write_buffer(&self.params_ring, 0, &ctx.params);
+        }
+        if ctx.open {
+            let enc = ctx.encoder.take().expect("open batch has an encoder");
+            self.queue.submit(Some(enc.finish()));
+            ctx.open = false;
+        }
+        ctx.params.clear();
     }
 
     /// Submit any pending work and await its completion. The browser-safe
     /// counterpart to the synchronous flush.
     pub async fn flush_async(&self) -> Result<()> {
-        {
-            let mut ctx = self.ctx.lock().unwrap();
-            if ctx.open {
-                if !ctx.params.is_empty() {
-                    self.queue.write_buffer(&self.params_ring, 0, &ctx.params);
-                }
-                Self::end_pass(&mut ctx);
-                let enc = ctx.encoder.take().expect("open batch has an encoder");
-                self.queue.submit(Some(enc.finish()));
-                ctx.open = false;
-                ctx.params.clear();
-            }
-        }
+        let freed = self.submit_pending();
         let (signal, fire) = Signal::new();
         self.queue.on_submitted_work_done(fire);
         // Native needs a poll to service the callback; in a browser the event
@@ -1054,7 +1061,7 @@ impl Device {
         #[cfg(not(target_arch = "wasm32"))]
         self.device.poll(wgpu::PollType::Wait).map_err(wgpuerr("poll (flush_async)"))?;
         signal.await;
-        Self::recycle(&self.pool, &mut self.ctx.lock().unwrap());
+        Self::recycle_bufs(&self.pool, freed);
         Ok(())
     }
 
@@ -1085,7 +1092,9 @@ impl Device {
             ctx.encoder.as_mut().unwrap().copy_buffer_to_buffer(buf, 0, &staging, 0, padded);
             ctx.open = true;
         }
-        self.flush_async().await?;
+        // No wait for the submission before mapping: the map resolves only once the
+        // copy has run, and the queue runs it after everything submitted before it.
+        let freed = self.submit_pending();
 
         let slice = staging.slice(..padded);
         let (signal, fire) = Signal::new();
@@ -1105,6 +1114,8 @@ impl Device {
         }
         let out = copy_mapped::<T>(&slice, len, bytes);
         staging.unmap();
+        // Everything submitted before the copy has completed.
+        Self::recycle_bufs(&self.pool, freed);
         Ok(out)
     }
 
@@ -1120,7 +1131,9 @@ impl Device {
 
     /// Schedule a buffer to be recycled into the pool on the next flush. Called
     /// from `Storage::drop`; the current (unsubmitted) batch may still reference
-    /// the buffer, so recycling waits until the next flush completes.
+    /// the buffer, so recycling waits until the next flush completes. A buffer
+    /// freed while an async flush or readback is in flight is not recycled by
+    /// it, only by the next submission after it.
     fn defer_free(&self, buf: Buf) {
         self.ctx.lock().unwrap().free_bufs.push(buf);
     }
@@ -1442,3 +1455,28 @@ fn div_ceil(n: usize, d: u32) -> u32 {
 }
 
 include!("backend_impl.rs");
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use crate::Tensor;
+
+    /// What keeps the async paths' recycling sound: a submission takes the
+    /// buffers freed before it, and leaves those freed later for a later one.
+    #[test]
+    fn a_submission_takes_only_the_buffers_freed_before_it() -> Result<()> {
+        let dev = Device::new(0)?;
+        let a: Tensor<f32, Device> = Tensor::from_vec(vec![1.0; 256], 256, &dev)?;
+        drop(a.add(&a)?);
+        let before = dev.ctx.lock().unwrap().free_bufs.len();
+        assert!(before > 0);
+        let freed = dev.submit_pending();
+        assert_eq!(freed.len(), before);
+        assert!(dev.ctx.lock().unwrap().free_bufs.is_empty());
+        // Recorded after the submission and not submitted itself.
+        drop(a.add(&a)?);
+        assert!(!dev.ctx.lock().unwrap().free_bufs.is_empty());
+        assert_eq!(freed.len(), before);
+        Ok(())
+    }
+}
