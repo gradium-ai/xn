@@ -806,15 +806,17 @@ fn inplace_mul_binds_dst_twice() -> Result<()> {
 }
 
 /// Drives a future that completes without the event loop: natively the async
-/// readback polls the device itself, so its first poll finishes it.
+/// readback polls the device itself, so its first poll finishes it. Panics
+/// rather than spinning if that ever stops being true.
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     let mut f = std::pin::pin!(f);
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-    loop {
+    for _ in 0..1000 {
         if let std::task::Poll::Ready(v) = f.as_mut().poll(&mut cx) {
             return v;
         }
     }
+    panic!("the native async readback did not complete when polled");
 }
 
 #[test]
@@ -824,8 +826,11 @@ fn async_readback_matches_sync_readback() -> Result<()> {
     let a = Tensor::from_vec(iota(n), n, &d)?;
     let b = a.add(&a)?;
     let want = b.to_vec()?;
-    // Pending work recorded after the read starts must not be disturbed by it,
-    // and buffers freed around it must come back from the pool intact.
+    // Unrelated work still pending when the read is issued is submitted with it
+    // and must not be disturbed, and buffers freed around it must come back from
+    // the pool intact. Natively nothing runs during the wait, so work recorded
+    // while a readback is in flight is covered by the unit test of
+    // `submit_pending` instead.
     let c = Tensor::from_vec(iota(n), n, &d)?.add(&a)?;
     assert_close(&block_on(d.tensor_to_vec(&b))?, &want, 0.0);
     for _ in 0..4 {
