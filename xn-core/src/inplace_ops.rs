@@ -535,12 +535,19 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         let (lhs_data, lhs_o) = lhs.storage_and_offset()?;
         let (rhs_data, rhs_o) = rhs.storage_and_offset()?;
 
-        let (lhs_batch, rhs_b_stride, m, n, k) = if lhs_b_stride == m * lhs_rs && rhs_batch == 1 {
-            // Both inputs are contiguous, treat as single batch for better performance.
-            (1, 1, lhs_batch * lhs_m, rhs_n, lhs_k)
-        } else {
-            (lhs_batch, rhs_b_stride, m, n, k)
-        };
+        // A broadcast rhs lets the lhs batch fold into M so that one gemm reads the rhs
+        // once instead of once per batch entry: when the lhs rows run contiguously
+        // across batches, and when there is a single row per batch entry (e.g. the last
+        // token of each sequence, `x.narrow(1, t - 1..t)` on a `(b, t, h)` tensor), where
+        // the batch stride is the row stride of the folded `(batch, k)` operand.
+        let (lhs_batch, rhs_b_stride, m, n, k, lhs_rs) =
+            if rhs_batch == 1 && lhs_b_stride == m * lhs_rs {
+                (1, 1, lhs_batch * lhs_m, rhs_n, lhs_k, lhs_rs)
+            } else if rhs_batch == 1 && m == 1 {
+                (1, 1, lhs_batch, rhs_n, lhs_k, lhs_b_stride)
+            } else {
+                (lhs_batch, rhs_b_stride, m, n, k, lhs_rs)
+            };
         B::gemm(
             &mut *dst,
             (&*lhs_data, lhs_o),

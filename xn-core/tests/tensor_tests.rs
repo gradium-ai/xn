@@ -2175,6 +2175,38 @@ fn test_matmul_batched_strided_impl<B: Backend>(dev: &B) -> Result<()> {
 }
 test_all_backends!(test_matmul_batched_strided, test_matmul_batched_strided_impl);
 
+fn test_matmul_last_row_view_impl<B: Backend>(dev: &B) -> Result<()> {
+    // A broadcast rhs against a view holding one row per batch entry whose batch stride
+    // is wider than the row: the last token of each sequence, `x.narrow(1, t - 1..t)` on
+    // a `(b, t, h)` tensor. Folds into a single gemm with the batch stride as the row
+    // stride; must match the contiguous computation for both matmul and matmul_t.
+    let (b, t, h, n) = (3, 4, 6, 5);
+    let x_data: Vec<f32> = (0..b * t * h).map(|i| ((i * 7 % 23) as f32) - 11.0).collect();
+    let w_data: Vec<f32> = (0..n * h).map(|i| ((i * 5 % 19) as f32) - 9.0).collect();
+    let x: Tensor<f32, B> = Tensor::from_vec(x_data, (b, t, h), dev)?;
+    let w_t: Tensor<f32, B> = Tensor::from_vec(w_data.clone(), (n, h), dev)?;
+    let w: Tensor<f32, B> = w_t.t()?.contiguous()?;
+
+    let last_view = x.narrow(1, t - 1..t)?;
+    let last_c = x.narrow(1, t - 1..t)?.contiguous()?;
+    let expected_t = last_c.matmul_t(&w_t)?.to_vec()?;
+    let expected = last_c.matmul(&w)?.to_vec()?;
+    assert_eq!(last_view.matmul_t(&w_t)?.dims(), &[b, 1, n]);
+    assert_approx_eq(&last_view.matmul_t(&w_t)?.to_vec()?, &expected_t, 1e-5);
+    assert_approx_eq(&last_view.matmul(&w)?.to_vec()?, &expected, 1e-5);
+
+    // The same through a mid-sequence row, and with a batch of one.
+    let mid_view = x.narrow(1, 1..2)?;
+    let mid_c = x.narrow(1, 1..2)?.contiguous()?;
+    assert_approx_eq(&mid_view.matmul_t(&w_t)?.to_vec()?, &mid_c.matmul_t(&w_t)?.to_vec()?, 1e-5);
+    let one = x.narrow(0, 1..2)?.contiguous()?.narrow(1, t - 1..t)?;
+    let one_c = x.narrow(0, 1..2)?.contiguous()?.narrow(1, t - 1..t)?.contiguous()?;
+    assert_approx_eq(&one.matmul_t(&w_t)?.to_vec()?, &one_c.matmul_t(&w_t)?.to_vec()?, 1e-5);
+    Ok(())
+}
+
+test_all_backends!(test_matmul_last_row_view, test_matmul_last_row_view_impl);
+
 // =============================================================================
 // rope / rope_i across the parallelism threshold
 // =============================================================================
