@@ -1662,6 +1662,23 @@ const ELEMWISE_PAR_THRESHOLD: usize = 32 * 1024;
 /// Chunk size for parallel elementwise ops; large enough that the per-chunk dispatch cost is
 /// negligible and the inner loop auto-vectorizes.
 const ELEMWISE_CHUNK: usize = 64 * 1024;
+/// Smallest chunk [`elemwise_chunk`] will cut, a quarter of [`ELEMWISE_PAR_THRESHOLD`]: a buffer
+/// barely over that threshold still reaches four threads, and no chunk is ever small enough for
+/// its dispatch to show.
+const ELEMWISE_MIN_CHUNK: usize = ELEMWISE_PAR_THRESHOLD / 4;
+
+/// Chunk size for a parallel pass over `len` elements: enough chunks to reach every thread the
+/// pool would give this work, never below [`ELEMWISE_MIN_CHUNK`] and never above
+/// [`ELEMWISE_CHUNK`], which keeps the chunks small enough to steal on a large buffer.
+///
+/// [`ELEMWISE_CHUNK`] on its own decides the chunk count from the buffer alone, so a buffer of
+/// one or two chunks runs on one or two threads however many are idle -- and `par_chunks_mut`
+/// runs a single chunk on the calling thread. Activations between a model's layers land in
+/// exactly that range.
+fn elemwise_chunk(len: usize) -> usize {
+    let threads = crate::threadpool::threads_for(len).max(1);
+    len.div_ceil(threads).clamp(ELEMWISE_MIN_CHUNK, ELEMWISE_CHUNK)
+}
 
 /// Apply a binary operation in-place: dst[i] = op(dst[i], src[i])
 #[inline(always)]
@@ -1701,7 +1718,8 @@ fn arch_unary_inplace<T: Send + Sync + 'static>(dst: &mut [T], op: UnaryOp) -> b
         return arch::unary_inplace(dst, op);
     }
     has_arch_unary::<T>(op) && {
-        crate::threadpool::par_chunks_mut(dst, ELEMWISE_CHUNK, |_, d| {
+        let chunk = elemwise_chunk(dst.len());
+        crate::threadpool::par_chunks_mut(dst, chunk, |_, d| {
             arch::unary_inplace(d, op);
         });
         true
@@ -1715,7 +1733,8 @@ fn arch_unary<T: Send + Sync + 'static>(dst: &mut [T], src: &[T], op: UnaryOp) -
         return arch::unary(dst, src, op);
     }
     has_arch_unary::<T>(op) && {
-        crate::threadpool::par_chunks_zip(dst, ELEMWISE_CHUNK, src, ELEMWISE_CHUNK, |_, d, s| {
+        let chunk = elemwise_chunk(dst.len());
+        crate::threadpool::par_chunks_zip(dst, chunk, src, chunk, |_, d, s| {
             arch::unary(d, s, op);
         });
         true
@@ -2578,5 +2597,25 @@ mod tests {
             gemm(&mut dst, &lhs, &rhs, &layout(1, (1, n + 3), (1, k), (k, 1))),
             wasm || neon
         );
+    }
+
+    /// A buffer past the parallel threshold is cut into enough chunks to reach every thread the
+    /// pool would give it, which a fixed chunk size does not do in the range activations fall in.
+    #[test]
+    fn elemwise_chunks_reach_every_thread() {
+        use super::{ELEMWISE_CHUNK, ELEMWISE_MIN_CHUNK, ELEMWISE_PAR_THRESHOLD, elemwise_chunk};
+
+        for len in [ELEMWISE_PAR_THRESHOLD, 61_440, 122_880, 8 * 1024 * 1024] {
+            let chunk = elemwise_chunk(len);
+            assert!(chunk >= ELEMWISE_MIN_CHUNK, "len {len}: chunk {chunk} under the floor");
+            assert!(chunk <= ELEMWISE_CHUNK, "len {len}: chunk {chunk} over the cap");
+            let threads = crate::threadpool::threads_for(len).max(1);
+            let want = threads.min(len / ELEMWISE_MIN_CHUNK);
+            assert!(
+                len.div_ceil(chunk) >= want,
+                "len {len}: {} chunks for {want} threads",
+                len.div_ceil(chunk)
+            );
+        }
     }
 }
