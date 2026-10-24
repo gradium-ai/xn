@@ -1,0 +1,109 @@
+#version 450
+// q8_0 dequantize-fused GEMV: the m == 1 decode path with 8-bit weights.
+//   dst[0, j] = sum_l lhs[0, l] * W[j, l],  W held as q8_0 blocks.
+// Grid: (ceil(n/TN), 1, 1); local size TPB.
+//
+// A port of webgpu-kernels/gemv_q8.wgsl. TPB threads split the k dimension,
+// each carrying TN output columns in scalar accumulators so one shared-memory
+// reduction is amortized across all of them.
+//
+// The weight is split into two buffers rather than kept as ggml's interleaved
+// 34-byte block (`f16` scale followed by 32 `i8`): 34 is not a multiple of 4,
+// so the packed form cannot be read as `uint`. The split happens once, on
+// upload (see vulkan_backend/quantization.rs).
+//
+//   qs:     row j at j * (k/4),  each uint holding 4 int8 weights
+//   scales: row j at j * (k/32), one f32 per 32-weight block
+//
+// Activations stay f32 and are read as vec4: `k` is a multiple of 32 and the
+// tensor starts at offset 0, so every row is 16-byte aligned.
+//
+// Unlike WebGPU, Vulkan does not bounds-check storage reads, so columns past
+// `n` are clamped onto the last valid column and their results discarded at
+// store time rather than read out of range.
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) writeonly buffer D { float dst[]; };
+layout(std430, set = 0, binding = 1) readonly buffer L { vec4 lhs4[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Q { uint qs[]; };
+layout(std430, set = 0, binding = 3) readonly buffer S { float scales[]; };
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint n;
+    uint k;
+} pc;
+
+const uint TPB = 64u;   // threads per workgroup, matches local_size_x
+const uint TN = 4u;     // output columns per workgroup
+
+shared float sh[TPB * TN];
+
+// Four int8 weights out of one packed word. `bitfieldExtract` on a signed
+// integer sign-extends, which is what the stored quants need.
+vec4 unpack4(uint w) {
+    int q = int(w);
+    return vec4(
+        float(bitfieldExtract(q, 0, 8)),
+        float(bitfieldExtract(q, 8, 8)),
+        float(bitfieldExtract(q, 16, 8)),
+        float(bitfieldExtract(q, 24, 8)));
+}
+
+void main() {
+    uint j0 = gl_WorkGroupID.x * TN;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint kw = pc.k >> 2u;   // packed words per row
+    uint kb = pc.k >> 5u;   // blocks per row
+
+    uint jl = pc.n - 1u;
+    uint c0 = min(j0 + 0u, jl);
+    uint c1 = min(j0 + 1u, jl);
+    uint c2 = min(j0 + 2u, jl);
+    uint c3 = min(j0 + 3u, jl);
+    uint q0 = c0 * kw;
+    uint q1 = c1 * kw;
+    uint q2 = c2 * kw;
+    uint q3 = c3 * kw;
+    uint s0 = c0 * kb;
+    uint s1 = c1 * kb;
+    uint s2 = c2 * kb;
+    uint s3 = c3 * kb;
+
+    float acc0 = 0.0;
+    float acc1 = 0.0;
+    float acc2 = 0.0;
+    float acc3 = 0.0;
+
+    for (uint w = tid; w < kw; w += TPB) {
+        vec4 a = lhs4[w];
+        // Eight words to a block, so the scale index is the word index >> 3.
+        uint bi = w >> 3u;
+        acc0 = fma(scales[s0 + bi], dot(unpack4(qs[q0 + w]), a), acc0);
+        acc1 = fma(scales[s1 + bi], dot(unpack4(qs[q1 + w]), a), acc1);
+        acc2 = fma(scales[s2 + bi], dot(unpack4(qs[q2 + w]), a), acc2);
+        acc3 = fma(scales[s3 + bi], dot(unpack4(qs[q3 + w]), a), acc3);
+    }
+
+    sh[tid * TN + 0u] = acc0;
+    sh[tid * TN + 1u] = acc1;
+    sh[tid * TN + 2u] = acc2;
+    sh[tid * TN + 3u] = acc3;
+    barrier();
+    for (uint s = TPB >> 1u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            sh[tid * TN + 0u] += sh[(tid + s) * TN + 0u];
+            sh[tid * TN + 1u] += sh[(tid + s) * TN + 1u];
+            sh[tid * TN + 2u] += sh[(tid + s) * TN + 2u];
+            sh[tid * TN + 3u] += sh[(tid + s) * TN + 3u];
+        }
+        barrier();
+    }
+    if (tid < TN) {
+        uint jj = j0 + tid;
+        if (jj < pc.n) {
+            dst[jj] = sh[tid];
+        }
+    }
+}
