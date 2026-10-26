@@ -2219,3 +2219,31 @@ fn test_strided_copies_match_cpu() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn test_conv_transpose1d_direct_matches_cpu() -> Result<()> {
+    let dev = get_device();
+    // (batch, c_in, c_out, groups, l_in, k, stride, padding, output_padding): depthwise as in an
+    // upsampling layer, one and several input positions, grouped, and padded so that the
+    // col2im path does not take them.
+    for (b, ci, co, groups, l, k, stride, pad, opad) in [
+        (1, 512, 512, 512, 1, 32, 16, 0, 0),
+        (2, 16, 16, 16, 5, 8, 4, 0, 0),
+        (1, 8, 12, 4, 7, 5, 2, 1, 1),
+        (1, 6, 4, 1, 9, 3, 1, 1, 0),
+        (2, 4, 4, 2, 3, 6, 3, 2, 0),
+    ] {
+        let x = rand_vec(b * ci * l, 31);
+        let w = rand_vec(ci * (co / groups) * k, 37);
+        let xc = Tensor::<f32, xn::CpuDevice>::from_vec(x.clone(), (b, ci, l), &xn::CPU)?;
+        let wc = Tensor::<f32, xn::CpuDevice>::from_vec(w.clone(), (ci, co / groups, k), &xn::CPU)?;
+        let want = xc.conv_transpose1d(&wc, None, stride, pad, opad, groups)?;
+        let xg = Tensor::<f32, Device>::from_vec(x, (b, ci, l), &dev)?;
+        let wg = Tensor::<f32, Device>::from_vec(w, (ci, co / groups, k), &dev)?;
+        let got = xg.conv_transpose1d(&wg, None, stride, pad, opad, groups)?;
+        assert_eq!(got.dims(), want.dims());
+        let what = format!("b={b} ci={ci} co={co} g={groups} l={l} k={k} s={stride} p={pad}");
+        assert_close(&got.to_vec()?, &want.to_vec()?, 1e-5, &what);
+    }
+    Ok(())
+}

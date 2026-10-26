@@ -199,36 +199,43 @@ __device__ void conv_transpose1d_direct_kernel(
     const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= dst_numel) return;
 
-    // dst layout: [B, C_out, L_out]
-    const size_t l_out_idx = idx % l_out;
-    const size_t c_out_idx = (idx / l_out) % c_out;
-    const size_t b_idx = idx / (l_out * c_out);
+    // The launch checks every size fits 32 bits, so the index arithmetic, which dominates
+    // this kernel, can be done in 32 bits.
+    const unsigned int i = idx;
+    const unsigned int lo = l_out, co = c_out, ci = c_in, li = l_in, ks = k_size;
+    const unsigned int st = stride, dl = dilation;
 
-    const size_t c_in_per_group = c_in / groups;
-    const size_t c_out_per_group = c_out / groups;
-    const size_t g = c_out_idx / c_out_per_group;
-    const size_t c_in_start = g * c_in_per_group;
-    const size_t c_out_in_group = c_out_idx % c_out_per_group;
+    // dst layout: [B, C_out, L_out]
+    const unsigned int l_out_idx = i % lo;
+    const unsigned int c_out_idx = (i / lo) % co;
+    const unsigned int b_idx = i / (lo * co);
+
+    const unsigned int c_in_per_group = ci / groups;
+    const unsigned int c_out_per_group = co / groups;
+    const unsigned int g = c_out_idx / c_out_per_group;
+    const unsigned int c_in_start = g * c_in_per_group;
+    const unsigned int c_out_in_group = c_out_idx % c_out_per_group;
 
     float sum = 0.0f;
 
-    for (int k = 0; k < (int)k_size; ++k) {
-        // out_l = in_l * stride + k * dilation - padding
-        // We need: in_l = (out_l + padding - k * dilation) / stride
-        int in_l_offset = (int)l_out_idx + (int)padding - k * (int)dilation;
-        if (in_l_offset < 0 || in_l_offset % (int)stride != 0) {
-            continue;
-        }
-        int in_l = in_l_offset / (int)stride;
-        if (in_l >= (int)l_in) {
-            continue;
-        }
+    // out_l = in_l * stride + k * dilation - padding, so tap k reaches this output when
+    // out_l + padding - k * dilation is a non-negative multiple of the stride. With no
+    // dilation those taps are every stride-th from (out_l + padding) % stride.
+    const int base = (int)l_out_idx + (int)padding;
+    const int k_first = dl == 1 ? base % (int)st : 0;
+    const int k_step = dl == 1 ? (int)st : 1;
+    for (int k = k_first; k < (int)ks; k += k_step) {
+        const int in_l_offset = base - k * (int)dl;
+        if (in_l_offset < 0) break;
+        if (in_l_offset % (int)st != 0) continue;
+        const unsigned int in_l = in_l_offset / (int)st;
+        if (in_l >= li) continue;
 
-        for (size_t c = 0; c < c_in_per_group; ++c) {
-            const size_t src_c = c_in_start + c;
-            const size_t src_idx = b_idx * c_in * l_in + src_c * l_in + in_l;
+        for (unsigned int c = 0; c < c_in_per_group; ++c) {
+            const unsigned int src_c = c_in_start + c;
+            const unsigned int src_idx = (b_idx * ci + src_c) * li + in_l;
             // kernel layout: [C_in, C_out/groups, K]
-            const size_t k_idx = src_c * c_out_per_group * k_size + c_out_in_group * k_size + k;
+            const unsigned int k_idx = (src_c * c_out_per_group + c_out_in_group) * ks + k;
             sum += to_float(src[src_idx]) * to_float(kernel[k_idx]);
         }
     }
