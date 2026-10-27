@@ -2084,3 +2084,39 @@ fn test_norms_match_cpu_across_widths() -> Result<()> {
     }
     Ok(())
 }
+
+/// A run of the last dim at an offset, then transposes of the last two dims, of the first and
+/// last, and of the first two, each made contiguous.
+fn strided_copies<T: xn::WithDType, B: xn::Backend>(t: &Tensor<T, B>) -> Result<Vec<Tensor<T, B>>> {
+    let r = t.rank();
+    let last = t.dims()[r - 1];
+    Ok(vec![
+        t.narrow(r - 1, last / 3..last - last / 3)?.contiguous()?,
+        t.transpose(r - 2, r - 1)?.contiguous()?,
+        t.transpose(0, r - 1)?.contiguous()?,
+        t.transpose(0, 1)?.contiguous()?,
+    ])
+}
+
+#[test]
+fn test_strided_copies_match_cpu() -> Result<()> {
+    let dev = get_device();
+    // The last has more dims than the kernels take by value.
+    let shapes: [&[usize]; 4] =
+        [&[1, 1, 1536], &[2, 3, 4, 5], &[16, 3, 8, 64], &[2, 1, 2, 1, 2, 1, 2, 1, 2, 3]];
+    for (si, shape) in shapes.iter().enumerate() {
+        let data = rand_vec(shape.iter().product(), 21 + si as u32);
+        let bf: Vec<half::bf16> = data.iter().map(|v| half::bf16::from_f32(*v)).collect();
+        let want = strided_copies(&Tensor::from_vec(data.clone(), shape.to_vec(), &xn::CPU)?)?;
+        let got = strided_copies(&Tensor::<f32, Device>::from_vec(data, shape.to_vec(), &dev)?)?;
+        let got_bf =
+            strided_copies(&Tensor::<half::bf16, Device>::from_vec(bf, shape.to_vec(), &dev)?)?;
+        for (case, ((w, g), gb)) in want.iter().zip(&got).zip(&got_bf).enumerate() {
+            let w = w.to_vec()?;
+            assert_eq!(g.to_vec()?, w, "f32 {shape:?} case {case}");
+            let w_bf: Vec<half::bf16> = w.iter().map(|v| half::bf16::from_f32(*v)).collect();
+            assert_eq!(gb.to_vec()?, w_bf, "bf16 {shape:?} case {case}");
+        }
+    }
+    Ok(())
+}
