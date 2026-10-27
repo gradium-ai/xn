@@ -10,7 +10,8 @@ its own copyright header.
 The `kai` feature of `xn-core` uses these files and nothing else:
 
 - the SME2 int8 matmul kernels, one gemm (`..._sme2_mopa`) and one gemv (`..._sme2_dot`)
-- the SME2 f32 gemm kernel (`..._f32p2vlx1biasf32_sme2_mopa`)
+- the SME2 f32 kernels, one gemm (`..._f32p2vlx1biasf32_sme2_mopa`) and one gemv
+  (`..._f32p2vlx1b_1x16vl_sme2_mla`)
 - the routines that pack their operands (`pack/`)
 - the shared header and the SME helper assembly (`kai_common.h`, `kai_common_sme_asm.S`)
 

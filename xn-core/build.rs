@@ -64,6 +64,7 @@ fn build_kai() {
         "matmul_clamp_f32_qai8dxp_qsi8cxp/kai_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme2_mopa",
         "matmul_clamp_f32_qai8dxp_qsi8cxp/kai_matmul_clamp_f32_qai8dxp1x4_qsi8cxp4vlx4_1x4vl_sme2_dot",
         "matmul_clamp_f32_f32p_f32p/kai_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa",
+        "matmul_clamp_f32_f32_f32p/kai_matmul_clamp_f32_f32_f32p2vlx1b_1x16vl_sme2_mla",
         "pack/kai_lhs_pack_f32p2vlx1_f32_sme",
         "pack/kai_rhs_pack_kxn_f32p2vlx1biasf32_f32_f32_sme",
         "pack/kai_rhs_pack_nxk_f32p2vlx1biasf32_f32_f32_sme",
