@@ -49,6 +49,54 @@ extern "C" __global__ void copy_strided_##RUST_NAME( \
     TYPENAME *dst \
 ) { copy_strided<TYPENAME>(numel, num_dims, info, src_offset, src, dst); }
 
+// As copy_strided, with the dims and strides passed by value rather than as a
+// device buffer, for up to COPY_STRIDED_MAX_DIMS dims.
+#define COPY_STRIDED_MAX_DIMS 8
+struct StridedInfo {
+  size_t dims[COPY_STRIDED_MAX_DIMS];
+  size_t strides[COPY_STRIDED_MAX_DIMS];
+};
+
+template <typename T>
+__device__ void copy_strided_v(const size_t numel, const unsigned int num_dims,
+                               const StridedInfo info,
+                               const unsigned int src_offset, const T *src,
+                               T *dst) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= numel)
+    return;
+  // Fully unrolled, so every access to `info` has a constant index and it stays
+  // in parameter space instead of being copied to local memory.
+  unsigned int rest = idx;
+  unsigned int src_idx = src_offset;
+#pragma unroll
+  for (int k = COPY_STRIDED_MAX_DIMS - 1; k >= 0; --k) {
+    if (k < num_dims) {
+      const unsigned int dk = info.dims[k];
+      src_idx += (rest % dk) * info.strides[k];
+      rest /= dk;
+    }
+  }
+  dst[idx] = src[src_idx];
+}
+
+#define COPY_STRIDED_V_OP(TYPENAME, RUST_NAME)                                 \
+  extern "C" __global__ void copy_strided_v_##RUST_NAME(                       \
+      const size_t numel, const unsigned int num_dims, const StridedInfo info, \
+      const unsigned int src_offset, const TYPENAME *src, TYPENAME *dst) {     \
+    copy_strided_v<TYPENAME>(numel, num_dims, info, src_offset, src, dst);     \
+  }
+
+#if __CUDA_ARCH__ >= 800
+COPY_STRIDED_V_OP(__nv_bfloat16, bf16)
+#endif
+#if __CUDA_ARCH__ >= 530
+COPY_STRIDED_V_OP(__half, f16)
+#endif
+COPY_STRIDED_V_OP(uint8_t, u8)
+COPY_STRIDED_V_OP(int64_t, i64)
+COPY_STRIDED_V_OP(float, f32)
+
 #if __CUDA_ARCH__ >= 800
 COPY_STRIDED_OP(__nv_bfloat16, bf16)
 #endif
