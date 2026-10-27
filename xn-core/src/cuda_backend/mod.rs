@@ -452,6 +452,21 @@ impl<T: WithDType> Storage<T> {
     }
 }
 
+/// Most dims [`crate::Backend::copy_strided`] passes by value; `COPY_STRIDED_MAX_DIMS` in
+/// `layout.cu`.
+const COPY_STRIDED_MAX_DIMS: usize = 8;
+
+/// The by-value descriptor of `copy_strided_v`, laid out as its `StridedInfo`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct StridedInfo {
+    dims: [usize; COPY_STRIDED_MAX_DIMS],
+    strides: [usize; COPY_STRIDED_MAX_DIMS],
+}
+
+// SAFETY: plain old data with the layout of the kernel's struct.
+unsafe impl cudarc::driver::DeviceRepr for StridedInfo {}
+
 /// Threads per row for the layer and RMS norm kernels: about two columns each, so a
 /// row's loads are spread over the block rather than queued on one warp. A whole
 /// number of warps, as the kernels reduce warp by warp.
@@ -1267,14 +1282,20 @@ impl crate::Backend for Device {
         // Detect 2D strided pattern: innermost dim is contiguous (stride 1),
         // and all batch dims (before the last two) are contiguous relative to each other.
         // This covers e.g. dims [A, B] with strides [2*B, 1] — rows are contiguous but spaced.
-        if n >= 2
-            && src_strides[n - 1] == 1
-            && (0..n.saturating_sub(2)).all(|i| src_strides[i] == dims[i + 1] * src_strides[i + 1])
+        // A single contiguous run at an offset is the same pattern with one row.
+        let one_run = n == 1 && src_strides[0] == 1;
+        if one_run
+            || n >= 2
+                && src_strides[n - 1] == 1
+                && (0..n.saturating_sub(2))
+                    .all(|i| src_strides[i] == dims[i + 1] * src_strides[i + 1])
         {
-            let rows = dims[n - 2];
-            let cols = dims[n - 1];
-            let src_stride = src_strides[n - 2];
-            let batch: usize = dims[..n - 2].iter().product::<usize>().max(1);
+            let (rows, cols, src_stride) = if one_run {
+                (1, dims[0], dims[0])
+            } else {
+                (dims[n - 2], dims[n - 1], src_strides[n - 2])
+            };
+            let batch: usize = dims[..n.saturating_sub(2)].iter().product::<usize>().max(1);
 
             const TILE: u32 = 32;
             const BLOCK_ROWS: u32 = 8;
@@ -1303,6 +1324,30 @@ impl crate::Backend for Device {
         }
 
         let num_dims = n;
+        // Up to its size limit the descriptor goes by value in the launch, sparing an upload
+        // per call.
+        if n <= COPY_STRIDED_MAX_DIMS {
+            let mut info = StridedInfo {
+                dims: [0; COPY_STRIDED_MAX_DIMS],
+                strides: [0; COPY_STRIDED_MAX_DIMS],
+            };
+            info.dims[..n].copy_from_slice(dims);
+            info.strides[..n].copy_from_slice(src_strides);
+            let func =
+                dst.device.get_func(&kernel_name::<T>("copy_strided_v"), PTXModule::Layout)?;
+            let cfg = LaunchConfig::for_num_elems(numel as u32);
+            let num_dims_u32 = num_dims as u32;
+            let src_offset_u32 = src_offset as u32;
+            let mut launch_args = dst.device.stream.launch_builder(&func);
+            launch_args.arg(&numel);
+            launch_args.arg(&num_dims_u32);
+            launch_args.arg(&info);
+            launch_args.arg(&src_offset_u32);
+            launch_args.arg(&src.data);
+            launch_args.arg(&mut dst.data);
+            unsafe { launch_args.launch(cfg) }?;
+            return Ok(());
+        }
         let info: Vec<usize> = dims.iter().chain(src_strides.iter()).copied().collect();
         let info_dev = dst.device.cached_htod(&info)?;
 
