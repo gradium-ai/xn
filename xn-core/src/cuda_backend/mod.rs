@@ -1,6 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 mod cublaslt;
 mod kernels;
+pub mod q8;
 pub mod quantization;
 
 use crate::{BinaryOp, DType, Result, UnaryOp, WithDType, WithDTypeF};
