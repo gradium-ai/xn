@@ -2030,3 +2030,57 @@ fn test_fp8_matmul_t_per_token() -> Result<()> {
 
     Ok(())
 }
+
+// =============================================================================
+// Kernels checked against the CPU backend
+// =============================================================================
+
+fn rand_vec(n: usize, seed: u32) -> Vec<f32> {
+    let mut s = seed | 1;
+    (0..n)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            (s as f32 / u32::MAX as f32) - 0.5
+        })
+        .collect()
+}
+
+fn assert_close(got: &[f32], want: &[f32], tol: f32, what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!((g - w).abs() <= tol * w.abs().max(1.0), "{what}: index {i}: got {g}, want {w}");
+    }
+}
+
+#[test]
+fn test_norms_match_cpu_across_widths() -> Result<()> {
+    let dev = get_device();
+    // Widths below, at and above a warp's worth of columns per thread, and not powers of two.
+    for (rows, cols) in [(1, 512), (16, 512), (3, 600), (2, 2048), (4, 64), (1, 4096), (5, 33)] {
+        let x = rand_vec(rows * cols, 7 + cols as u32);
+        let w: Vec<f32> = rand_vec(cols, 11).iter().map(|v| v + 1.0).collect();
+        let bias = rand_vec(cols, 13);
+        let cpu = |v: &[f32], s: Vec<usize>| {
+            Tensor::<f32, xn::CpuDevice>::from_vec(v.to_vec(), s, &xn::CPU)
+        };
+        let gpu = |v: &[f32], s: Vec<usize>| Tensor::<f32, Device>::from_vec(v.to_vec(), s, &dev);
+        let what = format!("{rows}x{cols}");
+        let want = cpu(&x, vec![rows, cols])?.layer_norm(
+            &cpu(&w, vec![cols])?,
+            &cpu(&bias, vec![cols])?,
+            1e-5,
+        )?;
+        let got = gpu(&x, vec![rows, cols])?.layer_norm(
+            &gpu(&w, vec![cols])?,
+            &gpu(&bias, vec![cols])?,
+            1e-5,
+        )?;
+        assert_close(&got.to_vec()?, &want.to_vec()?, 1e-4, &format!("layer_norm {what}"));
+        let want = cpu(&x, vec![rows, cols])?.rms_norm(&cpu(&w, vec![cols])?, 1e-5)?;
+        let got = gpu(&x, vec![rows, cols])?.rms_norm(&gpu(&w, vec![cols])?, 1e-5)?;
+        assert_close(&got.to_vec()?, &want.to_vec()?, 1e-4, &format!("rms_norm {what}"));
+    }
+    Ok(())
+}
