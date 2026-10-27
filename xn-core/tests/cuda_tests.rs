@@ -2247,3 +2247,37 @@ fn test_conv_transpose1d_direct_matches_cpu() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn test_q8_0_weights_match_cpu() -> Result<()> {
+    use xn::cuda_backend::q8::Q8Tensor;
+    use xn::quantized::{GgmlDType, QTensor};
+    let dev = get_device();
+    let (n, k) = (96, 512);
+    let w = rand_vec(n * k, 59);
+    let shape = xn::Shape::from((n, k));
+    let from_floats = Q8Tensor::from_f32(&dev, &w, &shape)?;
+    let from_file =
+        Q8Tensor::from_q8_0(&QTensor::quantize_f32(&w, &shape, GgmlDType::Q8_0)?, &dev)?;
+    // Both routes give the same quants and scales, and the weight back within q8_0's step.
+    let dense: Vec<f32> = from_floats.dequantize::<f32>()?.to_vec()?;
+    assert_eq!(from_file.dequantize::<f32>()?.to_vec()?, dense);
+    assert_close(&dense, &w, 1e-2, "q8_0 round trip");
+    // The matmul against the quants, in the kernel for a few rows and through a dense weight
+    // for more, matches the CPU on the dequantized weight.
+    let wc = Tensor::<f32, xn::CpuDevice>::from_vec(dense, (n, k), &xn::CPU)?;
+    for m in [1, 3, 16, 40] {
+        let x = rand_vec(m * k, 61 + m as u32);
+        let want =
+            Tensor::<f32, xn::CpuDevice>::from_vec(x.clone(), (m, k), &xn::CPU)?.matmul_t(&wc)?;
+        let got =
+            from_floats.matmul_t(&Tensor::<f32, Device>::from_vec(x.clone(), (m, k), &dev)?)?;
+        assert_close(&got.to_vec()?, &want.to_vec()?, 1e-4, &format!("f32 m={m}"));
+        let xb: Vec<half::bf16> = x.iter().map(|v| half::bf16::from_f32(*v)).collect();
+        let got =
+            from_floats.matmul_t(&Tensor::<half::bf16, Device>::from_vec(xb, (m, k), &dev)?)?;
+        let got: Vec<f32> = got.to_vec()?.into_iter().map(|v| v.to_f32()).collect();
+        assert_close(&got, &want.to_vec()?, 3e-2, &format!("bf16 m={m}"));
+    }
+    Ok(())
+}
