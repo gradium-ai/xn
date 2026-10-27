@@ -542,6 +542,308 @@ __device__ void fast_argmax(const size_t src_numel,
     }                                                                          \
   }
 
+
+static __device__ __forceinline__ float warp_reduce_max(float x) {
+#pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1) {
+    x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, mask, 32));
+  }
+  return x;
+}
+
+// Reduce over the whole block, every thread getting the result. `red` holds
+// one float per warp.
+static __device__ __forceinline__ float block_reduce_sum_all(float x,
+                                                             float *red) {
+  x = warp_reduce_sum(x);
+  if (threadIdx.x % WARP_SIZE == 0)
+    red[threadIdx.x / WARP_SIZE] = x;
+  __syncthreads();
+  float r = 0.f;
+  for (int w = 0; w < blockDim.x / WARP_SIZE; ++w)
+    r += red[w];
+  __syncthreads();
+  return r;
+}
+
+static __device__ __forceinline__ float block_reduce_max_all(float x,
+                                                             float *red) {
+  x = warp_reduce_max(x);
+  if (threadIdx.x % WARP_SIZE == 0)
+    red[threadIdx.x / WARP_SIZE] = x;
+  __syncthreads();
+  float r = -INFINITY;
+  for (int w = 0; w < blockDim.x / WARP_SIZE; ++w)
+    r = fmaxf(r, red[w]);
+  __syncthreads();
+  return r;
+}
+
+#define SDPA_THREADS 512
+#define SDPA_CHUNK 1024
+#define SDPA_MAX_D 256
+
+// Attention for one query position, see `Backend::sdpa_decode`. One block per
+// (head, batch entry). The keys are taken in chunks: each chunk's scores go to
+// shared memory, and the chunks are combined with an online softmax, so any
+// number of keys fits. Keys whose mask term is -inf are not read at all.
+template <typename T>
+__device__ void sdpa_decode(const T *q, const T *k, const T *v, const T *mask,
+                            T *dst, const int h, const int d, const int kv,
+                            const size_t kv_batch_stride,
+                            const size_t mask_batch_stride,
+                            const int has_mask, const float scale) {
+  __shared__ float qs[SDPA_MAX_D];
+  __shared__ float scores[SDPA_CHUNK];
+  __shared__ float red[SDPA_THREADS / WARP_SIZE];
+  __shared__ float accs[SDPA_THREADS];
+  const int hh = blockIdx.x;
+  const int bi = blockIdx.y;
+  const int tid = threadIdx.x;
+  const size_t hd = (size_t)h * d;
+  const T *kb = k + bi * kv_batch_stride + (size_t)hh * d;
+  const T *vb = v + bi * kv_batch_stride + (size_t)hh * d;
+  const T *mrow = has_mask ? mask + bi * mask_batch_stride : nullptr;
+  for (int i = tid; i < d; i += SDPA_THREADS)
+    qs[i] = static_cast<float>(q[bi * hd + (size_t)hh * d + i]) * scale;
+  __syncthreads();
+
+  // The weighted sum of the values splits the keys into `groups` interleaved
+  // sets, thread (g, i) summing dimension i over set g.
+  const int groups = SDPA_THREADS / d;
+  const int g = tid / d;
+  const int i = tid % d;
+  const bool sums = g < groups;
+  float m = -INFINITY, l = 0.f, acc = 0.f;
+  for (int c0 = 0; c0 < kv; c0 += SDPA_CHUNK) {
+    const int n = min(SDPA_CHUNK, kv - c0);
+    float cmax = -INFINITY;
+    for (int j = tid; j < n; j += SDPA_THREADS) {
+      float s = has_mask ? static_cast<float>(mrow[c0 + j]) : 0.f;
+      if (s != -INFINITY) {
+        const T *kr = kb + (size_t)(c0 + j) * hd;
+        float dot = 0.f;
+        for (int e = 0; e < d; ++e)
+          dot += qs[e] * static_cast<float>(kr[e]);
+        s += dot;
+      }
+      scores[j] = s;
+      cmax = fmaxf(cmax, s);
+    }
+    cmax = block_reduce_max_all(cmax, red);
+    const float m_new = fmaxf(m, cmax);
+    // A fully masked chunk changes nothing. The test is uniform over the block.
+    if (m_new == -INFINITY)
+      continue;
+    const float corr = expf(m - m_new);
+    float csum = 0.f;
+    for (int j = tid; j < n; j += SDPA_THREADS) {
+      const float p = expf(scores[j] - m_new);
+      scores[j] = p;
+      csum += p;
+    }
+    csum = block_reduce_sum_all(csum, red);
+    l = l * corr + csum;
+    if (sums) {
+      float a = 0.f;
+#pragma unroll 4
+      for (int j = g; j < n; j += groups) {
+        const float p = scores[j];
+        if (p != 0.f)
+          a += p * static_cast<float>(vb[(size_t)(c0 + j) * hd + i]);
+      }
+      acc = acc * corr + a;
+    }
+    m = m_new;
+    __syncthreads();
+  }
+  accs[tid] = sums ? acc : 0.f;
+  __syncthreads();
+  if (tid < d) {
+    float a = 0.f;
+    for (int gg = 0; gg < groups; ++gg)
+      a += accs[gg * d + tid];
+    dst[bi * hd + (size_t)hh * d + tid] =
+        static_cast<T>(l > 0.f ? a / l : 0.f);
+  }
+}
+
+// 16 bytes of T, widened to floats.
+template <typename T> struct Vec16;
+template <> struct Vec16<float> {
+  static constexpr int N = 4;
+  static __device__ __forceinline__ void load(const float *p, float *out) {
+    const float4 v = *reinterpret_cast<const float4 *>(p);
+    out[0] = v.x;
+    out[1] = v.y;
+    out[2] = v.z;
+    out[3] = v.w;
+  }
+};
+#if __CUDA_ARCH__ >= 530
+template <> struct Vec16<__half> {
+  static constexpr int N = 8;
+  static __device__ __forceinline__ void load(const __half *p, float *out) {
+    const uint4 u = *reinterpret_cast<const uint4 *>(p);
+    const __half2 *h = reinterpret_cast<const __half2 *>(&u);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const float2 f = __half22float2(h[k]);
+      out[2 * k] = f.x;
+      out[2 * k + 1] = f.y;
+    }
+  }
+};
+#endif
+#if __CUDA_ARCH__ >= 800
+template <> struct Vec16<__nv_bfloat16> {
+  static constexpr int N = 8;
+  static __device__ __forceinline__ void load(const __nv_bfloat16 *p,
+                                              float *out) {
+    const uint4 u = *reinterpret_cast<const uint4 *>(p);
+    const __nv_bfloat162 *h = reinterpret_cast<const __nv_bfloat162 *>(&u);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const float2 f = __bfloat1622float2(h[k]);
+      out[2 * k] = f.x;
+      out[2 * k + 1] = f.y;
+    }
+  }
+};
+#endif
+
+// As sdpa_decode, reading keys and values 16 bytes at a time: a key row per
+// thread for the scores, and for the weighted sum a 16-byte slice of a value
+// row per thread, `d / N` threads to a row. Needs `d` a multiple of N dividing
+// SDPA_THREADS, and rows aligned to 16 bytes.
+template <typename T>
+__device__ void sdpa_decode_vec(const T *q, const T *k, const T *v,
+                                const T *mask, T *dst, const int h,
+                                const int d, const int kv,
+                                const size_t kv_batch_stride,
+                                const size_t mask_batch_stride,
+                                const int has_mask, const float scale) {
+  constexpr int N = Vec16<T>::N;
+  __shared__ float qs[SDPA_MAX_D];
+  __shared__ float scores[SDPA_CHUNK];
+  __shared__ float red[SDPA_THREADS / WARP_SIZE];
+  __shared__ float accs[SDPA_THREADS * N];
+  const int hh = blockIdx.x;
+  const int bi = blockIdx.y;
+  const int tid = threadIdx.x;
+  const size_t hd = (size_t)h * d;
+  const T *kb = k + bi * kv_batch_stride + (size_t)hh * d;
+  const T *vb = v + bi * kv_batch_stride + (size_t)hh * d;
+  const T *mrow = has_mask ? mask + bi * mask_batch_stride : nullptr;
+  for (int i = tid; i < d; i += SDPA_THREADS)
+    qs[i] = static_cast<float>(q[bi * hd + (size_t)hh * d + i]) * scale;
+  __syncthreads();
+
+  const int slots = d / N;
+  const int groups = SDPA_THREADS / slots;
+  const int g = tid / slots;
+  const int sl = tid % slots;
+  float acc[N];
+#pragma unroll
+  for (int e = 0; e < N; ++e)
+    acc[e] = 0.f;
+  float m = -INFINITY, l = 0.f;
+  for (int c0 = 0; c0 < kv; c0 += SDPA_CHUNK) {
+    const int n = min(SDPA_CHUNK, kv - c0);
+    float cmax = -INFINITY;
+    for (int j = tid; j < n; j += SDPA_THREADS) {
+      float s = has_mask ? static_cast<float>(mrow[c0 + j]) : 0.f;
+      if (s != -INFINITY) {
+        const T *kr = kb + (size_t)(c0 + j) * hd;
+        float dot = 0.f;
+        for (int e0 = 0; e0 < d; e0 += N) {
+          float kf[N];
+          Vec16<T>::load(kr + e0, kf);
+#pragma unroll
+          for (int e = 0; e < N; ++e)
+            dot += qs[e0 + e] * kf[e];
+        }
+        s += dot;
+      }
+      scores[j] = s;
+      cmax = fmaxf(cmax, s);
+    }
+    cmax = block_reduce_max_all(cmax, red);
+    const float m_new = fmaxf(m, cmax);
+    if (m_new == -INFINITY)
+      continue;
+    const float corr = expf(m - m_new);
+    float csum = 0.f;
+    for (int j = tid; j < n; j += SDPA_THREADS) {
+      const float p = expf(scores[j] - m_new);
+      scores[j] = p;
+      csum += p;
+    }
+    csum = block_reduce_sum_all(csum, red);
+    l = l * corr + csum;
+    float a[N];
+#pragma unroll
+    for (int e = 0; e < N; ++e)
+      a[e] = 0.f;
+    for (int j = g; j < n; j += groups) {
+      const float p = scores[j];
+      if (p != 0.f) {
+        float vf[N];
+        Vec16<T>::load(vb + (size_t)(c0 + j) * hd + sl * N, vf);
+#pragma unroll
+        for (int e = 0; e < N; ++e)
+          a[e] += p * vf[e];
+      }
+    }
+#pragma unroll
+    for (int e = 0; e < N; ++e)
+      acc[e] = acc[e] * corr + a[e];
+    m = m_new;
+    __syncthreads();
+  }
+  // Sum the groups' partial rows: first `parts` interleaved sets of groups at
+  // once, then the parts.
+#pragma unroll
+  for (int e = 0; e < N; ++e)
+    accs[g * d + sl * N + e] = acc[e];
+  __syncthreads();
+  const int parts = SDPA_THREADS / d;
+  {
+    const int dim = tid % d;
+    const int part = tid / d;
+    float a = 0.f;
+    for (int gg = part; gg < groups; gg += parts)
+      a += accs[gg * d + dim];
+    scores[part * d + dim] = a;
+  }
+  __syncthreads();
+  if (tid < d) {
+    float a = 0.f;
+    for (int part = 0; part < parts; ++part)
+      a += scores[part * d + tid];
+    dst[bi * hd + (size_t)hh * d + tid] =
+        static_cast<T>(l > 0.f ? a / l : 0.f);
+  }
+}
+
+#define SDPA_DECODE_OP(TYPENAME, FN_NAME)                                      \
+  extern "C" __global__ void FN_NAME(                                          \
+      const TYPENAME *q, const TYPENAME *k, const TYPENAME *v,                 \
+      const TYPENAME *mask, TYPENAME *dst, const int h, const int d,           \
+      const int kv, const size_t kv_batch_stride,                              \
+      const size_t mask_batch_stride, const int has_mask, const float scale) { \
+    sdpa_decode<TYPENAME>(q, k, v, mask, dst, h, d, kv, kv_batch_stride,       \
+                          mask_batch_stride, has_mask, scale);                 \
+  }                                                                            \
+  extern "C" __global__ void FN_NAME##_vec(                                    \
+      const TYPENAME *q, const TYPENAME *k, const TYPENAME *v,                 \
+      const TYPENAME *mask, TYPENAME *dst, const int h, const int d,           \
+      const int kv, const size_t kv_batch_stride,                              \
+      const size_t mask_batch_stride, const int has_mask, const float scale) { \
+    sdpa_decode_vec<TYPENAME>(q, k, v, mask, dst, h, d, kv, kv_batch_stride,   \
+                              mask_batch_stride, has_mask, scale);             \
+  }
+
 #define SOFTMAX_OP(TYPENAME, ACC_TYPENAME, FN_NAME)                            \
   extern "C" __global__ void FN_NAME(const TYPENAME *src, TYPENAME *dst,       \
                                      const int n_cols) {                       \
@@ -586,6 +888,7 @@ __device__ void fast_argmax(const size_t src_numel,
 
 #if __CUDA_ARCH__ >= 800
 SOFTMAX_OP(__nv_bfloat16, float, softmax_bf16)
+SDPA_DECODE_OP(__nv_bfloat16, sdpa_decode_bf16)
 RMSNORM_OP(__nv_bfloat16, rmsnorm_bf16)
 LAYERNORM_OP(__nv_bfloat16, layernorm_bf16)
 ROPE_OP(__nv_bfloat16, rope_bf16, rope_i_bf16, rope_thd_bf16)
@@ -596,6 +899,7 @@ FAST_OP(__nv_bfloat16, fast_min_bf16, fast_max_bf16, fast_argmin_bf16,
 
 #if __CUDA_ARCH__ >= 530
 SOFTMAX_OP(__half, float, softmax_f16)
+SDPA_DECODE_OP(__half, sdpa_decode_f16)
 RMSNORM_OP(__half, rmsnorm_f16)
 LAYERNORM_OP(__half, layernorm_f16)
 ROPE_OP(__half, rope_f16, rope_i_f16, rope_thd_f16)
@@ -608,6 +912,7 @@ SUM_OP(float, sum_f32)
 SUM_OP(double, sum_f64)
 SUM_OP(uint32_t, sum_u32)
 SOFTMAX_OP(float, float, softmax_f32)
+SDPA_DECODE_OP(float, sdpa_decode_f32)
 SOFTMAX_OP(double, double, softmax_f64)
 RMSNORM_OP(float, rmsnorm_f32)
 RMSNORM_OP(double, rmsnorm_f64)

@@ -779,6 +779,73 @@ pub fn flash_attn<T: WithDType>(
 }
 
 impl crate::Backend for Device {
+    const FUSED_SDPA_DECODE: bool = true;
+    /// The kernel's query buffer in shared memory.
+    const SDPA_MAX_HEAD_DIM: usize = 256;
+
+    fn sdpa_decode<T: WithDTypeF>(
+        dst: &mut Self::Storage<T>,
+        q: (&Self::Storage<T>, usize),
+        k: (&Self::Storage<T>, usize),
+        v: (&Self::Storage<T>, usize),
+        mask: Option<(&Self::Storage<T>, usize, usize)>,
+        kv_batch_stride: usize,
+        b: usize,
+        h: usize,
+        d: usize,
+        kv: usize,
+        scale: f32,
+    ) -> Result<()> {
+        if d > Self::SDPA_MAX_HEAD_DIM {
+            crate::bail!("sdpa_decode: head dim {d} exceeds {}", Self::SDPA_MAX_HEAD_DIM)
+        }
+        // The vectorized kernel reads 16 bytes at a time, from rows that must start 16-byte
+        // aligned (allocations are) and hold whole vectors.
+        let size = std::mem::size_of::<T>();
+        let n = 16 / size;
+        let aligned = |off: usize| (off * size).is_multiple_of(16);
+        let vec = d.is_multiple_of(n)
+            && 512usize.is_multiple_of(d)
+            && (h * d).is_multiple_of(n)
+            && kv_batch_stride.is_multiple_of(n)
+            && aligned(k.1)
+            && aligned(v.1);
+        let mut kname = kernel_name::<T>("sdpa_decode");
+        if vec {
+            kname.push_str("_vec");
+        }
+        let func = dst.device.get_func(&kname, PTXModule::Reduce)?;
+        let cfg = LaunchConfig {
+            grid_dim: (h as u32, b as u32, 1),
+            block_dim: (512, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let q_view = q.0.data.slice(q.1..);
+        let k_view = k.0.data.slice(k.1..);
+        let v_view = v.0.data.slice(v.1..);
+        // Without a mask the kernel never reads its pointer; any valid one will do.
+        let (mask_view, mask_batch_stride, has_mask) = match mask {
+            Some((m, off, stride)) => (m.data.slice(off..), stride, 1i32),
+            None => (q.0.data.slice(q.1..), 0, 0i32),
+        };
+        let (h, d, kv) = (h as i32, d as i32, kv as i32);
+        let mut launch_args = dst.device.stream.launch_builder(&func);
+        launch_args.arg(&q_view);
+        launch_args.arg(&k_view);
+        launch_args.arg(&v_view);
+        launch_args.arg(&mask_view);
+        launch_args.arg(&mut dst.data);
+        launch_args.arg(&h);
+        launch_args.arg(&d);
+        launch_args.arg(&kv);
+        launch_args.arg(&kv_batch_stride);
+        launch_args.arg(&mask_batch_stride);
+        launch_args.arg(&has_mask);
+        launch_args.arg(&scale);
+        unsafe { launch_args.launch(cfg) }?;
+        Ok(())
+    }
+
     type Storage<T: WithDType> = Storage<T>;
 
     fn name(&self) -> String {
