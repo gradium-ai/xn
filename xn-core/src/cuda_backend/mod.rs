@@ -2679,7 +2679,18 @@ fn conv_transpose1d_direct<T: WithDTypeF>(
 
     let kname = format!("conv_transpose1d_direct_{}", T::DTYPE.cuda_name());
     let func = dst.device.get_func(&kname, PTXModule::Conv)?;
-    let cfg = LaunchConfig::for_num_elems(dst_numel as u32);
+    // The kernel indexes in 32 bits.
+    let largest =
+        [dst_numel, batch * in_channels * length, in_channels * out_channels * kernel_size];
+    if largest.iter().any(|&n| n > u32::MAX as usize) {
+        crate::bail!("conv_transpose1d: {largest:?} elements is too many for one launch")
+    }
+    // Small blocks, so that a small output still spreads over every multiprocessor.
+    let cfg = LaunchConfig {
+        grid_dim: ((dst_numel as u32).div_ceil(128), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
 
     // Note: dilation is fixed to 1 for now (matching CPU backend behavior)
     let dilation: usize = 1;
