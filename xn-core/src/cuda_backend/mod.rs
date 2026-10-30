@@ -452,6 +452,13 @@ impl<T: WithDType> Storage<T> {
     }
 }
 
+/// Threads per row for the layer and RMS norm kernels: about two columns each, so a
+/// row's loads are spread over the block rather than queued on one warp. A whole
+/// number of warps, as the kernels reduce warp by warp.
+fn norm_block_size(ncols: i32) -> u32 {
+    ((ncols / 2).clamp(32, 1024) as u32).next_power_of_two().min(1024)
+}
+
 fn kernel_name<T: WithDType>(base_name: &str) -> String {
     let dtype_str = match T::DTYPE {
         DType::F16 => "f16",
@@ -1469,7 +1476,7 @@ impl crate::Backend for Device {
 
         let kname = kernel_name::<T>("rmsnorm");
         let func = dst.device.get_func(&kname, PTXModule::Reduce)?;
-        let block_size = if ncols < 1024 { 32 } else { 1024 };
+        let block_size = norm_block_size(ncols);
         let cfg = LaunchConfig {
             grid_dim: (nrows as u32, 1, 1),
             block_dim: (block_size, 1, 1),
@@ -1504,7 +1511,7 @@ impl crate::Backend for Device {
 
         let kname = kernel_name::<T>("layernorm");
         let func = dst.device.get_func(&kname, PTXModule::Reduce)?;
-        let block_size = if ncols < 1024 { 32 } else { 1024 };
+        let block_size = norm_block_size(ncols);
         let cfg = LaunchConfig {
             grid_dim: (nrows as u32, 1, 1),
             block_dim: (block_size, 1, 1),
