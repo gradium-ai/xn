@@ -317,7 +317,7 @@ struct BlockMMA {
   /* Constructor */
   METAL_FUNC BlockMMA(
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
-      ushort simd_lane_id [[thread_index_in_simdgroup]])
+      ushort simd_lane_id [[thread_index_in_simdgroup]]) thread
       : tm(8 * (simd_group_id / WN)), tn(8 * (simd_group_id % WN)) {
     // Determine thread position in simdgroup matrix
     short qid = simd_lane_id / 4;
@@ -332,7 +332,7 @@ struct BlockMMA {
   }
 
   /* (BM, BK) X (BK, BN) multiply accumulate function */
-  METAL_FUNC void mma(const threadgroup T* As, const threadgroup T* Bs) {
+  METAL_FUNC void mma(const threadgroup T* As, const threadgroup T* Bs) thread {
     // Adjust for simdgroup and thread location
     As += As_offset;
     Bs += Bs_offset;
@@ -386,7 +386,7 @@ struct BlockMMA {
   }
 
   /* Store results from simdgroup_matrix results into device memory */
-  METAL_FUNC void store_result(device U* D, const int ldd) const {
+  METAL_FUNC void store_result(device U* D, const int ldd) const thread {
     // Adjust for simdgroup and thread location
     D += (sm + tm) * ldd + tn + sn;
 
@@ -410,7 +410,7 @@ struct BlockMMA {
   }
 
   METAL_FUNC void
-  store_result_safe(device U* D, const int ldd, short2 dst_tile_dims) const {
+  store_result_safe(device U* D, const int ldd, short2 dst_tile_dims) const thread {
     // Adjust for simdgroup and thread location
     D += (sm + tm) * ldd + (tn + sn);
     dst_tile_dims -= short2(tn + sn, sm + tm);
@@ -442,7 +442,7 @@ struct BlockMMA {
 
   /* Apply epilogue */
   template <typename UnaryEpilogue>
-  METAL_FUNC void apply_epilogue(thread const UnaryEpilogue& epilogue_op) {
+  METAL_FUNC void apply_epilogue(thread const UnaryEpilogue& epilogue_op) thread {
     // Loop over all simdgroup tiles
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < TM; i++) {
@@ -464,7 +464,7 @@ struct BlockMMA {
       const device U* C,
       const int ldc,
       const int fdc,
-      thread const BinaryEpilogue& epilogue_op) {
+      thread const BinaryEpilogue& epilogue_op) thread {
     // Adjust for simdgroup and thread location
     C += (sm + tm) * ldc + (tn + sn) * fdc;
 
@@ -491,7 +491,7 @@ struct BlockMMA {
       const int ldc,
       const int fdc,
       short2 dst_tile_dims,
-      thread const BinaryEpilogue& epilogue_op) {
+      thread const BinaryEpilogue& epilogue_op) thread {
     // Adjust for simdgroup and thread location
     C += (sm + tm) * ldc + (tn + sn) * fdc;
     dst_tile_dims -= short2(tn + sn, sm + tm);
@@ -532,7 +532,7 @@ struct BlockMMA {
       const device U* C,
       const int ldc,
       const int fdc,
-      thread const Epilogue& epilogue_op) const {
+      thread const Epilogue& epilogue_op) const thread {
     // Adjust for simdgroup and thread location
     C += (sm + tm) * ldc + (tn + sn) * fdc;
     D += (sm + tm) * ldd + tn + sn;
@@ -566,7 +566,7 @@ struct BlockMMA {
       const int ldc,
       const int fdc,
       short2 dst_tile_dims,
-      thread const Epilogue& epilogue_op) const {
+      thread const Epilogue& epilogue_op) const thread {
     // Adjust for simdgroup and thread location
     C += (sm + tm) * ldc + (tn + sn) * fdc;
     D += (sm + tm) * ldd + tn + sn;
