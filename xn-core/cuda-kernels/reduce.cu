@@ -844,6 +844,107 @@ __device__ void sdpa_decode_vec(const T *q, const T *k, const T *v,
                               mask_batch_stride, has_mask, scale);             \
   }
 
+// y = x @ w^T for the m <= MT rows of x, with w in q8_0: int8 quants row-major
+// [n, k] and one f16 scale per 32 quants of a row, [n, k / 32]. Each warp takes
+// NPW rows of w against every row of x, so w is read once. Each lane takes 16
+// quants, half a block, at a time; they are scaled as they are read and summed
+// in f32. Needs k a multiple of 32 and x's rows 16-byte aligned.
+template <typename T, int MT, int NPW>
+__device__ void matmul_q8(const T *x, const int8_t *wq, const __half *ws, T *y,
+                          const int m, const int n, const int k,
+                          const int ldx) {
+  constexpr int Q = 16;
+  const int lane = threadIdx.x % WARP_SIZE;
+  const int col0 =
+      (blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE) * NPW;
+  if (col0 >= n)
+    return;
+  const int kb = k / 32;
+  float acc[NPW][MT];
+#pragma unroll
+  for (int c = 0; c < NPW; ++c)
+#pragma unroll
+    for (int r = 0; r < MT; ++r)
+      acc[c][r] = 0.f;
+  for (int i0 = lane * Q; i0 < k; i0 += WARP_SIZE * Q) {
+    float wf[NPW][Q];
+#pragma unroll
+    for (int c = 0; c < NPW; ++c) {
+      if (col0 + c < n) {
+        const int4 q =
+            *reinterpret_cast<const int4 *>(wq + (size_t)(col0 + c) * k + i0);
+        const int8_t *qb = reinterpret_cast<const int8_t *>(&q);
+        const float sc = __half2float(ws[(size_t)(col0 + c) * kb + i0 / 32]);
+#pragma unroll
+        for (int e = 0; e < Q; ++e)
+          wf[c][e] = sc * static_cast<float>(qb[e]);
+      } else {
+#pragma unroll
+        for (int e = 0; e < Q; ++e)
+          wf[c][e] = 0.f;
+      }
+    }
+#pragma unroll
+    for (int r = 0; r < MT; ++r) {
+      if (r < m) {
+        float xf[Q];
+#pragma unroll
+        for (int h = 0; h < Q; h += Vec16<T>::N)
+          Vec16<T>::load(x + (size_t)r * ldx + i0 + h, xf + h);
+#pragma unroll
+        for (int c = 0; c < NPW; ++c)
+#pragma unroll
+          for (int e = 0; e < Q; ++e)
+            acc[c][r] += wf[c][e] * xf[e];
+      }
+    }
+  }
+#pragma unroll
+  for (int c = 0; c < NPW; ++c)
+#pragma unroll
+    for (int r = 0; r < MT; ++r)
+      acc[c][r] = warp_reduce_sum(acc[c][r]);
+  if (lane == 0) {
+#pragma unroll
+    for (int c = 0; c < NPW; ++c)
+#pragma unroll
+      for (int r = 0; r < MT; ++r)
+        if (r < m && col0 + c < n)
+          y[(size_t)r * n + col0 + c] = static_cast<T>(acc[c][r]);
+  }
+}
+
+// q8_0 weights, laid out as for matmul_q8, to a dense [n, k] matrix.
+template <typename T>
+__device__ void dequant_q8(const int8_t *wq, const __half *ws, T *out,
+                           const size_t numel, const int k) {
+  const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+  if (i >= numel)
+    return;
+  const size_t row = i / k;
+  const int col = i % k;
+  const float sc = __half2float(ws[row * (k / 32) + col / 32]);
+  out[i] = static_cast<T>(sc * static_cast<float>(wq[i]));
+}
+
+#define MATMUL_Q8_OP_M(TYPENAME, FN_NAME, MT)                                  \
+  extern "C" __global__ void FN_NAME##_m##MT(                                  \
+      const TYPENAME *x, const int8_t *wq, const __half *ws, TYPENAME *y,      \
+      const int m, const int n, const int k, const int ldx) {                  \
+    matmul_q8<TYPENAME, MT, 2>(x, wq, ws, y, m, n, k, ldx);                    \
+  }
+#define MATMUL_Q8_OP(TYPENAME, FN_NAME, DEQUANT_NAME)                          \
+  MATMUL_Q8_OP_M(TYPENAME, FN_NAME, 1)                                         \
+  MATMUL_Q8_OP_M(TYPENAME, FN_NAME, 2)                                         \
+  MATMUL_Q8_OP_M(TYPENAME, FN_NAME, 4)                                         \
+  MATMUL_Q8_OP_M(TYPENAME, FN_NAME, 8)                                         \
+  MATMUL_Q8_OP_M(TYPENAME, FN_NAME, 16)                                        \
+  extern "C" __global__ void DEQUANT_NAME(const int8_t *wq, const __half *ws,  \
+                                          TYPENAME *out, const size_t numel,   \
+                                          const int k) {                       \
+    dequant_q8<TYPENAME>(wq, ws, out, numel, k);                               \
+  }
+
 #define SOFTMAX_OP(TYPENAME, ACC_TYPENAME, FN_NAME)                            \
   extern "C" __global__ void FN_NAME(const TYPENAME *src, TYPENAME *dst,       \
                                      const int n_cols) {                       \
@@ -889,6 +990,7 @@ __device__ void sdpa_decode_vec(const T *q, const T *k, const T *v,
 #if __CUDA_ARCH__ >= 800
 SOFTMAX_OP(__nv_bfloat16, float, softmax_bf16)
 SDPA_DECODE_OP(__nv_bfloat16, sdpa_decode_bf16)
+MATMUL_Q8_OP(__nv_bfloat16, matmul_q8_bf16, dequant_q8_bf16)
 RMSNORM_OP(__nv_bfloat16, rmsnorm_bf16)
 LAYERNORM_OP(__nv_bfloat16, layernorm_bf16)
 ROPE_OP(__nv_bfloat16, rope_bf16, rope_i_bf16, rope_thd_bf16)
@@ -900,6 +1002,7 @@ FAST_OP(__nv_bfloat16, fast_min_bf16, fast_max_bf16, fast_argmin_bf16,
 #if __CUDA_ARCH__ >= 530
 SOFTMAX_OP(__half, float, softmax_f16)
 SDPA_DECODE_OP(__half, sdpa_decode_f16)
+MATMUL_Q8_OP(__half, matmul_q8_f16, dequant_q8_f16)
 RMSNORM_OP(__half, rmsnorm_f16)
 LAYERNORM_OP(__half, layernorm_f16)
 ROPE_OP(__half, rope_f16, rope_i_f16, rope_thd_f16)
@@ -913,6 +1016,7 @@ SUM_OP(double, sum_f64)
 SUM_OP(uint32_t, sum_u32)
 SOFTMAX_OP(float, float, softmax_f32)
 SDPA_DECODE_OP(float, sdpa_decode_f32)
+MATMUL_Q8_OP(float, matmul_q8_f32, dequant_q8_f32)
 SOFTMAX_OP(double, double, softmax_f64)
 RMSNORM_OP(float, rmsnorm_f32)
 RMSNORM_OP(double, rmsnorm_f64)
