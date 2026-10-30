@@ -2085,6 +2085,105 @@ fn test_norms_match_cpu_across_widths() -> Result<()> {
     Ok(())
 }
 
+/// Which keys an attention mask keeps: whether it has a row per batch entry, and
+/// `keep(row, key)`.
+type MaskSpec<'a> = Option<(bool, &'a dyn Fn(usize, usize) -> bool)>;
+
+/// The fused CUDA kernel against the CPU one, on a prefix of a longer cache. `mask` is
+/// `None`, a row shared by the batch, or one row per batch entry.
+fn check_sdpa_cuda<T: xn::WithDTypeF>(
+    b: usize,
+    h: usize,
+    d: usize,
+    kv: usize,
+    cache_kv: usize,
+    mask: MaskSpec,
+    tol: f32,
+) -> Result<()> {
+    let dev = get_device();
+    let to_t = |v: Vec<f32>| v.into_iter().map(T::from_f32).collect::<Vec<T>>();
+    // Round through T once, so both backends see the same inputs.
+    let rt = |v: Vec<f32>| to_t(v).into_iter().map(|x| x.to_f32()).collect::<Vec<f32>>();
+    let q = rt(rand_vec(b * h * d, 1));
+    let kc = rt(rand_vec(b * cache_kv * h * d, 2));
+    let vc = rt(rand_vec(b * cache_kv * h * d, 3));
+    let (mask_data, mask_shape) = match mask {
+        None => (None, vec![]),
+        Some((per_row, keep)) => {
+            let rows = if per_row { b } else { 1 };
+            let data = (0..rows * kv)
+                .map(|i| if keep(i / kv, i % kv) { 0.0 } else { f32::NEG_INFINITY })
+                .collect::<Vec<f32>>();
+            (Some(data), vec![rows, 1, 1, kv])
+        }
+    };
+    let scale = 1.0 / (d as f32).sqrt();
+
+    let cpu = &xn::CPU;
+    let qc: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(q.clone(), (b, 1, h, d), cpu)?;
+    let kcc: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(kc.clone(), (b, cache_kv, h, d), cpu)?;
+    let vcc: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(vc.clone(), (b, cache_kv, h, d), cpu)?;
+    let mc = match &mask_data {
+        Some(m) => {
+            Some(Tensor::<f32, xn::CpuDevice>::from_vec(m.clone(), mask_shape.clone(), cpu)?)
+        }
+        None => None,
+    };
+    let want =
+        qc.sdpa_decode(&kcc.narrow(1, 0..kv)?, &vcc.narrow(1, 0..kv)?, mc.as_ref(), scale)?;
+
+    let qg: Tensor<T, Device> = Tensor::from_vec(to_t(q), (b, 1, h, d), &dev)?;
+    let kg: Tensor<T, Device> = Tensor::from_vec(to_t(kc), (b, cache_kv, h, d), &dev)?;
+    let vg: Tensor<T, Device> = Tensor::from_vec(to_t(vc), (b, cache_kv, h, d), &dev)?;
+    let mg = match mask_data {
+        Some(m) => Some(Tensor::<T, Device>::from_vec(to_t(m), mask_shape, &dev)?),
+        None => None,
+    };
+    let got = qg.sdpa_decode(&kg.narrow(1, 0..kv)?, &vg.narrow(1, 0..kv)?, mg.as_ref(), scale)?;
+    assert_eq!(got.dims(), &[b, 1, h * d]);
+    let got: Vec<f32> = got.to_vec()?.into_iter().map(|x| x.to_f32()).collect();
+    let what = format!("{:?} b={b} h={h} d={d} kv={kv} cache={cache_kv}", T::DTYPE);
+    assert_close(&got, &want.to_vec()?, tol, &what);
+    Ok(())
+}
+
+#[test]
+fn test_sdpa_decode_matches_cpu() -> Result<()> {
+    let all = None;
+    for (b, h, d, kv, cache) in [
+        (1, 8, 64, 1, 1),
+        (1, 8, 64, 300, 1000),
+        // more keys than one chunk of the kernel, and not a multiple of it
+        (1, 8, 64, 2500, 4096),
+        (2, 4, 128, 77, 128),
+        (1, 2, 256, 50, 64),
+        (1, 12, 32, 1024, 1024),
+        (3, 1, 8, 5, 9),
+        // head dims the 16-byte kernel cannot take: the scalar one runs these
+        (2, 3, 12, 40, 50),
+        (1, 2, 96, 1500, 1600),
+    ] {
+        check_sdpa_cuda::<f32>(b, h, d, kv, cache, all, 1e-5)?;
+        check_sdpa_cuda::<half::bf16>(b, h, d, kv, cache, all, 1e-2)?;
+        check_sdpa_cuda::<half::f16>(b, h, d, kv, cache, all, 2e-3)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn test_sdpa_decode_masked_matches_cpu() -> Result<()> {
+    // The oldest half dropped, sliding-window style.
+    let window = |_: usize, j: usize| j >= 1300;
+    check_sdpa_cuda::<f32>(1, 8, 64, 2600, 3000, Some((false, &window)), 1e-5)?;
+    // A whole chunk of keys masked, then a few kept.
+    let late = |_: usize, j: usize| j >= 2000 || j.is_multiple_of(7) && j > 1100;
+    check_sdpa_cuda::<f32>(1, 8, 64, 2100, 2100, Some((false, &late)), 1e-5)?;
+    // One row of terms per batch entry, each hiding its own padding.
+    let padded = |row: usize, j: usize| j >= 3 * row;
+    check_sdpa_cuda::<f32>(3, 4, 64, 40, 64, Some((true, &padded)), 1e-5)?;
+    check_sdpa_cuda::<half::bf16>(3, 4, 64, 40, 64, Some((true, &padded)), 1e-2)
+}
+
 /// A run of the last dim at an offset, then transposes of the last two dims, of the first and
 /// last, and of the first two, each made contiguous.
 fn strided_copies<T: xn::WithDType, B: xn::Backend>(t: &Tensor<T, B>) -> Result<Vec<Tensor<T, B>>> {
