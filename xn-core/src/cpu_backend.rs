@@ -3,6 +3,8 @@ use crate::{BinaryOp, DType, Result, UnaryOp, WithDType, WithDTypeF};
 use half::{bf16, f16};
 use std::any::Any;
 
+pub mod packed;
+
 const USE_IM2COL_CONV1D: bool = true;
 const USE_COL2IM_CONV1D_TR: bool = true;
 
