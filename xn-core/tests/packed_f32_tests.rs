@@ -16,7 +16,10 @@ fn snapshot_bias_tail_rows_and_concurrent_workspaces() -> xn::Result<()> {
     let mut bias: Vec<f32> = (0..n).map(|i| i as f32 * 0.01).collect();
     let original_bias = bias.clone();
     let packed = PackedF32::try_new(&weights, n, k, Some(&bias))?;
+    #[cfg(xn_kai)]
     assert_eq!(packed.is_some(), xn::quantized::kai::active());
+    #[cfg(not(xn_kai))]
+    assert!(packed.is_none());
     let Some(packed) = packed else {
         return Ok(());
     };
