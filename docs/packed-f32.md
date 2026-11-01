@@ -59,3 +59,17 @@ The native test exercises padded/odd dimensions, biases, mutation of original
 weights, changing row counts, empty input, invalid lengths and simultaneous calls
 with independent workspaces against a scalar reference. Hardware without SME2
 validates construction/fallback but cannot validate native arithmetic.
+
+## Application evidence
+
+The [Phonon integration study](https://github.com/rudrakshkarpe/xn-ptts/blob/perf/mimi-packed-backend/benchmarks/mimi-backend/m4-pro-2026-11-01/README.md)
+includes paired flags-on/off measurements, component traces, raw request arrivals,
+concurrent-stream runs, waveform comparisons and memory measurements on Apple M4
+Pro. Its selected adapter combines packed linears with a shape-limited initial
+convolution: median whole-first-frame latency improves 6–9% on three texts, about
+0.3 ms, at the cost of 31 MiB of retained packed weights. These are combined
+application results, not a guarantee for this primitive or other models. Tail
+behavior is mixed; broadly replacing convolutions regressed performance.
+
+Ordinary backend dispatch remains unchanged. Applications should select operators
+and fallback policy from measurements of their own complete workload.
