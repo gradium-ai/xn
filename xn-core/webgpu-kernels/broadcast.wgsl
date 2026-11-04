@@ -1,14 +1,15 @@
 // General strided broadcast binary op. `info` packs, per dimension:
 //   [dims (num_dims), lhs_strides (num_dims), rhs_strides (num_dims)]
-// A broadcast dimension has stride 0. Destination is contiguous row-major.
-struct Params { numel: u32, num_dims: u32, op: u32 };
+// A broadcast dimension has stride 0. Destination is contiguous row-major. `info` is in the
+// parameter slot, after the three scalars padded to a vec4 (see PARAMS_INFO_MAX in the backend).
+struct Params { numel: u32, num_dims: u32, op: u32, pad: u32, info: array<vec4<u32>, 15> };
 // WebGPU has no push constants; parameters arrive in a uniform windowed
 // to this dispatch's slot by a dynamic offset.
 @group(0) @binding(8) var<uniform> pc: Params;
 @group(0) @binding(0) var<storage, read> lhs: array<f32>;
 @group(0) @binding(1) var<storage, read> rhs: array<f32>;
 @group(0) @binding(2) var<storage, read_write> dst: array<f32>;
-@group(0) @binding(3) var<storage, read> info: array<u32>;
+fn info(i: u32) -> u32 { return pc.info[i >> 2u][i & 3u]; }
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -20,11 +21,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var rem = idx;
     for (var d = 0u; d < nd; d = d + 1u) {
         let di = nd - 1u - d;
-        let dimv = info[di];
+        let dimv = info(di);
         let coord = rem % dimv;
         rem = rem / dimv;
-        li = li + coord * info[nd + di];
-        ri = ri + coord * info[2u * nd + di];
+        li = li + coord * info(nd + di);
+        ri = ri + coord * info(2u * nd + di);
     }
     let a = lhs[li];
     let b = rhs[ri];

@@ -417,11 +417,58 @@ fn broadcast_ops() -> Result<()> {
     Ok(())
 }
 
+/// `[2, 1.., 1, 3]` of the given rank, with strides that are not row-major once transposed.
+fn ranked(rank: usize) -> Vec<usize> {
+    let mut dims = vec![1usize; rank];
+    dims[0] = 2;
+    dims[rank - 1] = 3;
+    dims
+}
+
+/// Dims and strides travel in the dispatch's parameter slot, up to `PARAMS_INFO_MAX` values:
+/// 20 dims for broadcast (three arrays) and 30 for copy_strided (two). Past that the host path
+/// takes over, so every rank must agree with the CPU.
+#[test]
+fn shape_info_ranks_match_cpu() -> Result<()> {
+    for rank in [2usize, 3, 4, 5, 6, 19, 20, 21, 29, 30, 31] {
+        let dims = ranked(rank);
+        let n: usize = dims.iter().product();
+        let wg: Tensor<f32, Wg> = Tensor::from_vec(iota(n), dims.clone(), &dev())?;
+        let cpu: Tensor<f32, _> = Tensor::from_vec(iota(n), dims.clone(), &CPU)?;
+        // copy_strided: a transposed view made contiguous, and a narrowed one.
+        assert_close(
+            &cpu.transpose(0, rank - 1)?.contiguous()?.to_vec()?,
+            &wg.transpose(0, rank - 1)?.contiguous()?.to_vec()?,
+            1e-6,
+        );
+        assert_close(
+            &cpu.narrow(rank - 1, 1..3)?.contiguous()?.to_vec()?,
+            &wg.narrow(rank - 1, 1..3)?.contiguous()?.to_vec()?,
+            1e-6,
+        );
+        // broadcast: a row with every other dim 1, then a column.
+        let mut row_dims = vec![1usize; rank];
+        row_dims[rank - 1] = 3;
+        let row = vec![10.0f32, 20.0, 30.0];
+        let rw: Tensor<f32, Wg> = Tensor::from_vec(row.clone(), row_dims.clone(), &dev())?;
+        let rc: Tensor<f32, _> = Tensor::from_vec(row, row_dims, &CPU)?;
+        assert_close(&cpu.broadcast_add(&rc)?.to_vec()?, &wg.broadcast_add(&rw)?.to_vec()?, 1e-6);
+        assert_close(&cpu.broadcast_mul(&rc)?.to_vec()?, &wg.broadcast_mul(&rw)?.to_vec()?, 1e-6);
+        let mut col_dims = vec![1usize; rank];
+        col_dims[0] = 2;
+        let col = vec![1.0f32, 2.0];
+        let cw: Tensor<f32, Wg> = Tensor::from_vec(col.clone(), col_dims.clone(), &dev())?;
+        let cc: Tensor<f32, _> = Tensor::from_vec(col, col_dims, &CPU)?;
+        assert_close(&cpu.broadcast_sub(&cc)?.to_vec()?, &wg.broadcast_sub(&cw)?.to_vec()?, 1e-6);
+    }
+    Ok(())
+}
+
 #[test]
 fn many_broadcasts_in_one_batch() -> Result<()> {
-    // Long unflushed chain: hundreds of dispatches (each with its own `info`
-    // scratch buffer) accumulate into one command batch before a single
-    // readback flushes them, exercising the deferred scratch/buffer recycling.
+    // Long unflushed chain: hundreds of dispatches (each with its own slot in the
+    // parameter ring) accumulate into one command batch before a single readback
+    // flushes them, exercising the deferred buffer recycling.
     let d = dev();
     let n = 1024usize;
     let base: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();

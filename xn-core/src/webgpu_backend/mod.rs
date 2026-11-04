@@ -53,7 +53,7 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
         "binary" => (include_str!("../../webgpu-kernels/binary.wgsl"), 3),
         "binary_inplace" => (include_str!("../../webgpu-kernels/binary_inplace.wgsl"), 2),
         "scale_add" => (include_str!("../../webgpu-kernels/scale_add.wgsl"), 2),
-        "broadcast" => (include_str!("../../webgpu-kernels/broadcast.wgsl"), 4),
+        "broadcast" => (include_str!("../../webgpu-kernels/broadcast.wgsl"), 3),
         "softmax" => (include_str!("../../webgpu-kernels/softmax.wgsl"), 2),
         "rmsnorm" => (include_str!("../../webgpu-kernels/rmsnorm.wgsl"), 3),
         "layernorm" => (include_str!("../../webgpu-kernels/layernorm.wgsl"), 4),
@@ -63,7 +63,7 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
         "reduce_arg" => (include_str!("../../webgpu-kernels/reduce_arg.wgsl"), 2),
         "transpose" => (include_str!("../../webgpu-kernels/transpose.wgsl"), 2),
         "copy2d" => (include_str!("../../webgpu-kernels/copy2d.wgsl"), 2),
-        "copy_strided" => (include_str!("../../webgpu-kernels/copy_strided.wgsl"), 3),
+        "copy_strided" => (include_str!("../../webgpu-kernels/copy_strided.wgsl"), 2),
         "index_select" => (include_str!("../../webgpu-kernels/index_select.wgsl"), 3),
         "causality_mask" => (include_str!("../../webgpu-kernels/causality_mask.wgsl"), 1),
         "scatter_set" => (include_str!("../../webgpu-kernels/scatter_set.wgsl"), 3),
@@ -93,6 +93,12 @@ const PARAMS_BINDING: u32 = 8;
 /// Bytes reserved per dispatch in the parameter ring. Must be a multiple of the
 /// adapter's `min_uniform_buffer_offset_alignment`, checked at device creation.
 const PARAMS_SLOT_SIZE: u64 = 256;
+/// Header bytes ahead of the `info` array in the kernels that carry one (copy_strided and
+/// broadcast): their scalar parameters, padded to a whole `vec4<u32>`.
+const PARAMS_INFO_HEADER: usize = 16;
+/// `u32` values of dims and strides a dispatch can carry in its parameter slot, after the header.
+/// A kernel declares them as `array<vec4<u32>, PARAMS_INFO_MAX / 4>`.
+const PARAMS_INFO_MAX: usize = (PARAMS_SLOT_SIZE as usize - PARAMS_INFO_HEADER) / 4;
 /// Dispatches a batch can record before the ring must be flushed.
 const PARAMS_RING_SLOTS: u64 = 4096;
 const WORKGROUP_SIZE: u32 = 256;
@@ -356,6 +362,15 @@ impl Pc {
     }
     fn usize(self, v: usize) -> Self {
         self.u32(v as u32)
+    }
+    /// Pad to `PARAMS_INFO_HEADER` bytes, then append `values`: the layout of a kernel's
+    /// `array<vec4<u32>, _>` parameter.
+    fn info(mut self, values: impl Iterator<Item = u32>) -> Self {
+        self.bytes.resize(PARAMS_INFO_HEADER, 0);
+        for v in values {
+            self.bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        self
     }
 }
 

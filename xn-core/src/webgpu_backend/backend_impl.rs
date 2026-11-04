@@ -617,20 +617,18 @@ impl crate::Backend for Device {
         if numel == 0 {
             return Ok(());
         }
-        if let Some(dt) = float_suffix::<T>() {
-            let info: Vec<u32> =
-                dims.iter().chain(src_strides.iter()).map(|&v| v as u32).collect();
-            let scratch = dst.device.alloc_buffer(info.len() * 4);
-            dst.device.write_buffer_u32(&scratch, &info);
-            let push = Pc::new().usize(numel).usize(dims.len()).usize(src_offset);
-            let res = dst.device.dispatch(
+        // The dims and strides travel in the dispatch's parameter slot, so there is no scratch
+        // buffer to allocate, upload and bind. A rank too large for the slot takes the host path.
+        let dt = float_suffix::<T>().filter(|_| 2 * dims.len() <= PARAMS_INFO_MAX);
+        if let Some(dt) = dt {
+            let info = dims.iter().chain(src_strides.iter()).map(|&v| v as u32);
+            let push = Pc::new().usize(numel).usize(dims.len()).usize(src_offset).info(info);
+            dst.device.dispatch(
                 &format!("copy_strided_{dt}"),
-                &[&src.buffer, &dst.buffer, &scratch],
+                &[&src.buffer, &dst.buffer],
                 &push,
                 div_ceil(numel, WORKGROUP_SIZE),
-            );
-            dst.device.defer_free(scratch);
-            res
+            )
         } else {
             let n = dims.len();
             let s = src.to_host()?;
@@ -702,24 +700,19 @@ impl crate::Backend for Device {
         if numel == 0 {
             return Ok(());
         }
-        if let Some(dt) = float_suffix::<T>() {
-            let info: Vec<u32> = dst_shape
-                .iter()
-                .chain(lhs_strides.iter())
-                .chain(rhs_strides.iter())
-                .map(|&v| v as u32)
-                .collect();
-            let scratch = dst.device.alloc_buffer(info.len() * 4);
-            dst.device.write_buffer_u32(&scratch, &info);
-            let push = Pc::new().usize(numel).usize(dst_shape.len()).u32(binary_op_code(op));
-            let res = dst.device.dispatch(
+        // As in `copy_strided`: the shape and strides ride in the parameter slot.
+        let dt = float_suffix::<T>().filter(|_| 3 * dst_shape.len() <= PARAMS_INFO_MAX);
+        if let Some(dt) = dt {
+            let info =
+                dst_shape.iter().chain(lhs_strides.iter()).chain(rhs_strides.iter()).map(|&v| v as u32);
+            let push =
+                Pc::new().usize(numel).usize(dst_shape.len()).u32(binary_op_code(op)).info(info);
+            dst.device.dispatch(
                 &format!("broadcast_{dt}"),
-                &[&lhs.buffer, &rhs.buffer, &dst.buffer, &scratch],
+                &[&lhs.buffer, &rhs.buffer, &dst.buffer],
                 &push,
                 div_ceil(numel, WORKGROUP_SIZE),
-            );
-            dst.device.defer_free(scratch);
-            res
+            )
         } else {
             let n = dst_shape.len();
             let l = lhs.to_host()?;
