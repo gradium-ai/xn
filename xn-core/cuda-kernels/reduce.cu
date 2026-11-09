@@ -94,7 +94,8 @@ __device__ void layernorm(const T *x, T *dst, const T *alpha, const T *beta,
       s_sum[warp_id] = mean_var;
     }
     __syncthreads();
-    mean_var = s_sum[lane_id];
+    mean_var = lane_id < block_size / WARP_SIZE ? s_sum[lane_id]
+                                                : make_float2(0.f, 0.f);
     mean_var = warp_reduce_sum(mean_var);
   }
 
@@ -159,7 +160,7 @@ __device__ void rmsnorm(const T *x, T *dst, const T *alpha, const int ncols,
       s_sum[warp_id] = tmp;
     }
     __syncthreads();
-    tmp = s_sum[lane_id];
+    tmp = lane_id < block_size / WARP_SIZE ? s_sum[lane_id] : 0.f;
     tmp = warp_reduce_sum(tmp);
   }
 
