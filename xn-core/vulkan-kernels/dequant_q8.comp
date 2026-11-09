@@ -1,0 +1,29 @@
+#version 450
+// q8_0 weight back to f32: dst[i] = qs[i] * scales[i / 32], four weights per
+// thread out of one packed word. Used ahead of the tiled f32 GEMM for long
+// prefills, where re-streaming the int8 weight once per 32 rows would cost
+// more than one f32 copy.
+// Grid: (ceil(numel / 4 / 256), 1, 1); local size 256.
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) writeonly buffer D { vec4 dst4[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Q { uint qs[]; };
+layout(std430, set = 0, binding = 2) readonly buffer S { float scales[]; };
+
+layout(push_constant) uniform PC {
+    uint words;
+} pc;
+
+void main() {
+    uint w = gl_GlobalInvocationID.x;
+    if (w >= pc.words) {
+        return;
+    }
+    int q = int(qs[w]);
+    float d = scales[w >> 3u];
+    dst4[w] = d * vec4(
+        float(bitfieldExtract(q, 0, 8)),
+        float(bitfieldExtract(q, 8, 8)),
+        float(bitfieldExtract(q, 16, 8)),
+        float(bitfieldExtract(q, 24, 8)));
+}

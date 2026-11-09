@@ -1,0 +1,64 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// q8_0 dequantize-fused GEMV, subgroup-per-column variant.
+//   dst[0, j] = sum_l lhs[0, l] * W[j, l],  W held as q8_0 blocks.
+// Grid: (ceil(n / (256 / subgroup_size)), 1, 1); local size 256.
+//
+// The same weight layout as gemv_q8.comp (see there), with a different
+// decomposition: one subgroup owns one output column, its lanes stride over
+// the row's packed words so each iteration is one contiguous, coalesced load
+// per subgroup, and the partial sums are reduced with `subgroupAdd` instead
+// of a shared-memory tree. That removes the six barrier rounds gemv_q8.comp
+// pays after a loop that, at k = 1024, is only four iterations long, and
+// puts eight independent weight streams in flight per workgroup instead of
+// four. It is the mirror of the CUDA kernel (`gemm_q8_f32_r1`).
+//
+// The host dispatches `256 / subgroup_size` columns per workgroup, which
+// assumes the driver packs full subgroups from consecutive invocations -- true
+// of every desktop driver, and checked on the host side by requiring the
+// reported subgroup size to divide 256. gemv_q8.comp is the fallback when
+// subgroup arithmetic is unavailable.
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) writeonly buffer D { float dst[]; };
+layout(std430, set = 0, binding = 1) readonly buffer L { vec4 lhs4[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Q { uint qs[]; };
+layout(std430, set = 0, binding = 3) readonly buffer S { float scales[]; };
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint n;
+    uint k;
+} pc;
+
+vec4 unpack4(uint w) {
+    int q = int(w);
+    return vec4(
+        float(bitfieldExtract(q, 0, 8)),
+        float(bitfieldExtract(q, 8, 8)),
+        float(bitfieldExtract(q, 16, 8)),
+        float(bitfieldExtract(q, 24, 8)));
+}
+
+void main() {
+    uint j = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+
+    uint kw = pc.k >> 2u;   // packed words per row
+    uint kb = pc.k >> 5u;   // blocks per row
+
+    // Columns past n read the last valid column and are dropped at store
+    // time: Vulkan storage reads are not bounds-checked.
+    uint jj = min(j, pc.n - 1u);
+    uint q0 = jj * kw;
+    uint s0 = jj * kb;
+
+    float acc = 0.0;
+    for (uint w = lane; w < kw; w += gl_SubgroupSize) {
+        acc = fma(scales[s0 + (w >> 3u)], dot(unpack4(qs[q0 + w]), lhs4[w]), acc);
+    }
+    acc = subgroupAdd(acc);
+    if (lane == 0u && j < pc.n) {
+        dst[j] = acc;
+    }
+}
