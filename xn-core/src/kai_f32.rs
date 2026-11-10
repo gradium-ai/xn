@@ -1,8 +1,10 @@
 //! Arm KleidiAI's SME2 kernels for f32 matmuls, behind the `kai` feature.
 //!
 //! The arithmetic is f32 multiply-adds like the NEON path's, so the results differ from it
-//! only by the order of the sums. Both operands are packed into KleidiAI's layout on every
-//! call, into buffers kept per thread. Used when [`crate::quantized::kai::active`] holds. With
+//! only by the order of the sums. The generic GEMM packs both operands into KleidiAI's layout
+//! on every call, into buffers kept per thread. The explicit [`PackedF32`] operator instead
+//! owns a packed weight snapshot and accepts caller-owned scratch. Used when
+//! [`crate::quantized::kai::active`] holds. With
 //! `accelerate` on, Accelerate takes the f32 matmuls it supports, and only the layouts it
 //! hands back to the generic gemm reach this.
 //!
@@ -122,6 +124,132 @@ fn grow(buf: &mut Vec<f32>, bytes: usize) -> *mut c_void {
         buf.resize(len, 0.0);
     }
     buf.as_mut_ptr().cast()
+}
+
+/// Immutable packed weights for dense `X @ W^T + bias` products.
+/// See [`crate::cpu_backend::packed`] for lifetime and fallback semantics.
+pub struct PackedF32 {
+    weights: Vec<f32>,
+    n: usize,
+    k: usize,
+    mr: usize,
+    nr: usize,
+    kr: usize,
+    sr: usize,
+}
+
+impl PackedF32 {
+    /// Snapshot `[outputs, inputs]` weights and optional `[outputs]` bias.
+    /// Returns `None` when SME2 is unavailable or disabled through `XN_KAI`.
+    pub fn try_new(
+        weights: &[f32],
+        outputs: usize,
+        inputs: usize,
+        bias: Option<&[f32]>,
+    ) -> crate::Result<Option<Self>> {
+        crate::cpu_backend::packed::validate(weights, outputs, inputs, bias)?;
+        if !crate::quantized::kai::active() {
+            return Ok(None);
+        }
+        let (n, k) = (outputs, inputs);
+        let zeros;
+        let bias = match bias {
+            Some(b) => b,
+            None => {
+                zeros = vec![0.; n];
+                &zeros
+            }
+        };
+        // SAFETY: CPU support, nonzero dimensions and source lengths are checked above.
+        // The matching size query bounds the destination of this synchronous pack call.
+        unsafe {
+            let mr = kai_get_mr_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
+            let nr = kai_get_nr_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
+            let kr = kai_get_kr_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
+            let sr = kai_get_sr_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
+            let bytes = kai_get_rhs_packed_size_rhs_pack_nxk_f32p2vlx1biasf32_f32_f32_sme(n, k);
+            let mut packed = vec![0f32; bytes.div_ceil(4)];
+            kai_run_rhs_pack_nxk_f32p2vlx1biasf32_f32_f32_sme(
+                1,
+                n,
+                k,
+                nr,
+                kr,
+                sr,
+                k * 4,
+                weights.as_ptr().cast(),
+                bias.as_ptr().cast(),
+                std::ptr::null(),
+                packed.as_mut_ptr().cast(),
+                0,
+                std::ptr::null(),
+            );
+            Ok(Some(Self { weights: packed, n, k, mr, nr, kr, sr }))
+        }
+    }
+
+    /// Exact bytes retained by the packed representation, excluding scratch.
+    pub fn packed_bytes(&self) -> usize {
+        self.weights.len() * 4
+    }
+
+    /// Compute dense row-major `[rows, inputs]` into `[rows, outputs]`.
+    /// Zero rows are accepted. All slice lengths must match exactly. Input packing
+    /// is reused through caller-owned scratch; the weights are never repacked.
+    pub fn matmul(
+        &self,
+        input: &[f32],
+        rows: usize,
+        output: &mut [f32],
+        scratch: &mut crate::cpu_backend::packed::PackedF32Scratch,
+    ) -> crate::Result<()> {
+        if rows.checked_mul(self.k) != Some(input.len())
+            || rows.checked_mul(self.n) != Some(output.len())
+        {
+            crate::bail!("packed f32 input/output dimensions do not match");
+        }
+        if rows == 0 {
+            return Ok(());
+        }
+        // SAFETY: slice lengths were checked before native access. The immutable RHS
+        // belongs to this operator, and the exclusive scratch/output borrows prevent races.
+        // A thread with a different SME vector length must not use this packed layout.
+        unsafe {
+            if self.mr != kai_get_mr_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa()
+                || self.nr != kai_get_nr_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa()
+            {
+                crate::bail!("SME vector length differs from packed weights");
+            }
+            let bytes = kai_get_lhs_packed_size_lhs_pack_f32p2vlx1_f32_sme(
+                rows, self.k, self.mr, self.kr, self.sr,
+            );
+            let packed = grow(&mut scratch.lhs, bytes);
+            kai_run_lhs_pack_f32p2vlx1_f32_sme(
+                rows,
+                self.k,
+                self.mr,
+                self.kr,
+                self.sr,
+                0,
+                input.as_ptr().cast(),
+                self.k * 4,
+                packed,
+            );
+            kai_run_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa(
+                rows,
+                self.n,
+                self.k,
+                packed,
+                self.weights.as_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                self.n * 4,
+                4,
+                f32::NAN,
+                f32::NAN,
+            );
+        }
+        Ok(())
+    }
 }
 
 /// `dst[b] = lhs[b] @ rhs[b]` with the same stride conventions as `gemm_`, element strides
