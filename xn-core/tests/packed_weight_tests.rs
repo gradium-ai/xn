@@ -31,10 +31,14 @@ fn values(len: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-/// Whether f32 products reach the cache: not with Accelerate, which runs them in BLAS. xn-gemm
-/// and KleidiAI's kernels both keep a parameter packed there.
+/// Whether f32 products reach the gemm, and with it the cache: not with Accelerate, which runs
+/// them in BLAS, nor where KleidiAI's kernels take them.
 fn products_reach_the_cache() -> bool {
-    !cfg!(feature = "accelerate")
+    #[cfg(xn_kai)]
+    let kai = xn::quantized::kai::active();
+    #[cfg(not(xn_kai))]
+    let kai = false;
+    !cfg!(feature = "accelerate") && !kai
 }
 
 fn tensor(shape: &[usize], seed: u64) -> Result<CpuTensor<f32>> {

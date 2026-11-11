@@ -1,30 +1,28 @@
 //! Arm KleidiAI's SME2 kernels for f32 matmuls, behind the `kai` feature.
 //!
 //! The arithmetic is f32 multiply-adds like the NEON path's, so the results differ from it
-//! only by the order of the sums. Both operands are packed into KleidiAI's layout, into
-//! buffers kept per thread. Used when [`crate::quantized::kai::active`] holds. With
-//! `accelerate` on, Accelerate takes the f32 matmuls it supports, and only the layouts it
-//! hands back to the generic gemm reach this.
+//! only by the order of the sums. Operands are packed into KleidiAI's layout, into buffers kept
+//! per thread, apart from the parameters below. Used when [`crate::quantized::kai::active`]
+//! holds. With `accelerate` on, Accelerate takes the f32 matmuls it supports, except a declared
+//! parameter times a smaller operand, which comes here first; the layouts Accelerate hands back
+//! to the generic gemm reach this too.
 //!
-//! A model parameter is packed once, not on every call: an operand inside the span the caller
-//! declared with `gemm::packed_cache::with_constant` (a linear layer's weight, a convolution's
-//! kernel; see [`crate::cpu_backend::parameter`]) keeps its packed copy in that cache, as
-//! xn-gemm's packed panels do, under the same budget, `GEMM_PACKED_LHS_CACHE_MB`. Packing moves,
-//! not what is computed, so results are bit for bit those of packing per call.
+//! A model parameter is packed once, not on every call: an operand that is exactly the span the
+//! caller declared with `gemm::packed_cache::with_constant` (a linear layer's weight, a
+//! convolution's kernel; see [`crate::cpu_backend::parameter`]) is packed the first time it is
+//! seen and kept. The copies are shared by every thread, since a caller may run each request on
+//! a new one, and count against the budget of `gemm`'s own packed cache,
+//! `GEMM_PACKED_LHS_CACHE_MB` (0 turns this off), as a separate tally; past it, the least
+//! recently used go first. Packing moves, not what is computed, so results are bit for bit
+//! those of packing per call.
 //!
 //! A one-row matmul stays on the NEON path: it reads each weight once, so packing the weight
 //! first would cost as much as the matmul itself.
 
 use std::cell::RefCell;
 use std::ffi::c_void;
-
-/// What a KleidiAI panel is keyed on in `gemm::packed_cache`, in the place of xn-gemm's `kc`.
-/// That is a k-chunk and never this large, so a panel packed here never matches one xn-gemm
-/// packed from the same operand, nor a packed lhs a packed rhs.
-const LHS_PANEL: usize = usize::MAX;
-const RHS_PANEL: usize = usize::MAX - 1;
-/// A cache line, which is more than the kernels need.
-const PANEL_ALIGN: usize = 64;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, Mutex, PoisonError};
 
 unsafe extern "C" {
     fn kai_get_mr_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa() -> usize;
@@ -138,9 +136,121 @@ fn grow(buf: &mut Vec<f32>, bytes: usize) -> *mut c_void {
     buf.as_mut_ptr().cast()
 }
 
+/// Which operand a [`Panel`] was packed as: the two packers lay the same matrix out differently.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Lhs,
+    Rhs,
+}
+
+/// A parameter packed for the kernel. Its bytes count as held until the last user drops it.
+struct Panel(Vec<f32>);
+
+impl Drop for Panel {
+    fn drop(&mut self) {
+        HELD.fetch_sub(self.0.len() * std::mem::size_of::<f32>(), Relaxed);
+    }
+}
+
+/// What a panel's layout depends on: the operand's address, side, shape and strides.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Key {
+    ptr: usize,
+    side: Side,
+    rows: usize,
+    k: usize,
+    rs: usize,
+    cs: usize,
+}
+
+/// A cached [`Panel`], with a sample of the operand's contents that tells apart one freed and
+/// declared again at the same address.
+struct Entry {
+    key: Key,
+    fingerprint: [u32; 8],
+    last_use: u64,
+    panel: Arc<Panel>,
+}
+
+/// The parameters packed so far, shared by every thread. When the budget is spent, the least
+/// recently used go first.
+struct Cache {
+    entries: Vec<Entry>,
+    clock: u64,
+}
+
+static PANELS: Mutex<Cache> = Mutex::new(Cache { entries: Vec::new(), clock: 0 });
+
+/// Bytes of packed parameters held. They count against the budget of `gemm`'s own packed
+/// cache, as a separate tally.
+static HELD: AtomicUsize = AtomicUsize::new(0);
+
+/// Claims `bytes` against the budget, or fails having claimed nothing.
+fn reserve(bytes: usize) -> bool {
+    let budget = gemm::packed_cache::budget_bytes();
+    HELD.fetch_update(Relaxed, Relaxed, |held| held.checked_add(bytes).filter(|&t| t <= budget))
+        .is_ok()
+}
+
+/// Whether the operand spanning `span` is exactly the parameter declared on this thread.
+fn declared(span: &[f32]) -> bool {
+    !span.is_empty()
+        && gemm::packed_cache::constant()
+            == gemm::packed_cache::Constant::new(span.as_ptr(), span.len())
+}
+
+/// Eight elements spread over `x`, as bits.
+fn fingerprint(x: &[f32]) -> [u32; 8] {
+    let last = x.len() - 1;
+    std::array::from_fn(|i| x[i * last / 7].to_bits())
+}
+
+/// The packed copy of the parameter spanning `span`, calling `pack` to fill a new one of
+/// `bytes` if none is cached. `None` when it cannot fit in the budget even with every other
+/// entry evicted. Packing runs under the lock, so two threads never pack the same parameter.
+fn panel(
+    span: &[f32],
+    key: Key,
+    bytes: usize,
+    pack: impl FnOnce(*mut c_void),
+) -> Option<Arc<Panel>> {
+    let print = fingerprint(span);
+    let mut cache = PANELS.lock().unwrap_or_else(PoisonError::into_inner);
+    cache.clock += 1;
+    let clock = cache.clock;
+    if let Some(e) = cache.entries.iter_mut().find(|e| e.key == key && e.fingerprint == print) {
+        e.last_use = clock;
+        return Some(Arc::clone(&e.panel));
+    }
+    // An old copy at this address holds other contents now.
+    cache.entries.retain(|e| e.key != key);
+    let len = bytes.div_ceil(std::mem::size_of::<f32>());
+    let bytes = len * std::mem::size_of::<f32>();
+    while cache.entries.len() >= gemm::packed_cache::MAX_ENTRIES || !reserve(bytes) {
+        let oldest = (0..cache.entries.len()).min_by_key(|&i| cache.entries[i].last_use)?;
+        cache.entries.swap_remove(oldest);
+    }
+    // Built before packing, so the claim above is given back if the packer unwinds.
+    let mut panel = Panel(vec![0f32; len]);
+    pack(panel.0.as_mut_ptr().cast());
+    let panel = Arc::new(panel);
+    cache.entries.push(Entry { key, fingerprint: print, last_use: clock, panel: panel.clone() });
+    Some(panel)
+}
+
+/// The panels cached for an operand at `span`'s address with its current contents. Other tests
+/// may leave panels for operands since freed, at the same address but with other contents.
+#[cfg(test)]
+fn panels_for(span: &[f32]) -> usize {
+    let (ptr, print) = (span.as_ptr() as usize, fingerprint(span));
+    let cache = PANELS.lock().unwrap_or_else(PoisonError::into_inner);
+    cache.entries.iter().filter(|e| e.key.ptr == ptr && e.fingerprint == print).count()
+}
+
 /// `dst[b] = lhs[b] @ rhs[b]` with the same stride conventions as `gemm_`, element strides
 /// given as `(column, row)`. Returns `false`, having done nothing, for a layout or size the
-/// kernels do not take.
+/// kernels do not take, or, with `only_declared`, unless an operand is a declared parameter it
+/// keeps packed and the other is the smaller.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gemm(
     dst: &mut [f32],
@@ -152,6 +262,7 @@ pub(crate) fn gemm(
     (dst_cs, dst_rs): (usize, usize),
     (lhs_cs, lhs_rs): (usize, usize),
     (rhs_cs, rhs_rs): (usize, usize),
+    only_declared: bool,
 ) -> bool {
     if m < 2 || n == 0 || k == 0 || batch == 0 || !crate::quantized::kai::active() {
         return false;
@@ -174,16 +285,16 @@ pub(crate) fn gemm(
         return false;
     };
     // Every element the kernels read or write has to be inside the slices.
-    let lhs_end = (batch - 1) * lhs_b_stride
-        + match lhs_layout {
-            Lhs::MxK(s) => (m - 1) * s + k,
-            Lhs::KxM(s) => (k - 1) * s + m,
-        };
-    let rhs_end = (batch - 1) * rhs_b_stride
-        + match layout {
-            Rhs::KxN(s) => (k - 1) * s + n,
-            Rhs::NxK(s) => (n - 1) * s + k,
-        };
+    let lhs_one = match lhs_layout {
+        Lhs::MxK(s) => (m - 1) * s + k,
+        Lhs::KxM(s) => (k - 1) * s + m,
+    };
+    let rhs_one = match layout {
+        Rhs::KxN(s) => (k - 1) * s + n,
+        Rhs::NxK(s) => (n - 1) * s + k,
+    };
+    let lhs_end = (batch - 1) * lhs_b_stride + lhs_one;
+    let rhs_end = (batch - 1) * rhs_b_stride + rhs_one;
     let dst_end = (batch - 1) * m * n + (m - 1) * dst_rs + n;
     if lhs.len() < lhs_end || rhs.len() < rhs_end || dst.len() < dst_end || dst_rs < n {
         return false;
@@ -192,12 +303,23 @@ pub(crate) fn gemm(
     if batch > 1 && dst_rs != n {
         return false;
     }
+    // An operand shared by every batch entry that is the declared parameter, if any.
+    let shared_lhs = (batch == 1 || lhs_b_stride == 0) && declared(&lhs[..lhs_one]);
+    let shared_rhs = (batch == 1 || rhs_b_stride == 0) && declared(&rhs[..rhs_one]);
+    // Only where packing the other operand per call costs less than the declared one would:
+    // a weight times a few rows, not a kernel slid over a long signal, where packing the
+    // windows outweighs what keeping the kernel packed saves.
+    let worth =
+        (shared_lhs && batch * rhs_one < lhs_one) || (shared_rhs && batch * lhs_one < rhs_one);
+    if only_declared && !worth {
+        return false;
+    }
 
     SCRATCH.with_borrow_mut(|s| {
         // SAFETY: the getters have no preconditions; the packers write at most the sizes their
-        // own queries return, into buffers grown to that size or cached panels allocated at
-        // it; and every operand offset was checked against its slice above. That a cached
-        // operand's bytes do not change is what the caller vouched for with `with_constant`.
+        // own queries return, into buffers grown to that size or panels allocated at it; and
+        // every operand offset was checked against its slice above. That a cached operand's
+        // bytes do not change is what the caller vouched for with `with_constant`.
         unsafe {
             let mr = kai_get_mr_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
             let nr = kai_get_nr_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
@@ -218,51 +340,7 @@ pub(crate) fn gemm(
                     kai_get_rhs_packed_size_rhs_pack_nxk_f32p2vlx1biasf32_f32_f32_sme(n, k)
                 }
             };
-            // A cached panel for an operand that is the same in every batch entry, if the
-            // caller declared it constant and has used it before; `None` packs it per call.
-            // The lhs is `m` by `k` and the rhs, a weight's usual side, is taken as `n` by `k`.
-            let lhs_panel = (batch == 1 || lhs_b_stride == 0)
-                .then(|| {
-                    gemm::packed_cache::get(
-                        lhs.as_ptr(),
-                        m,
-                        k,
-                        lhs_rs as isize,
-                        lhs_cs as isize,
-                        LHS_PANEL,
-                        mr,
-                        lhs_size,
-                        PANEL_ALIGN,
-                    )
-                })
-                .flatten();
-            let rhs_panel = (batch == 1 || rhs_b_stride == 0)
-                .then(|| {
-                    gemm::packed_cache::get(
-                        rhs.as_ptr(),
-                        n,
-                        k,
-                        rhs_cs as isize,
-                        rhs_rs as isize,
-                        RHS_PANEL,
-                        nr,
-                        rhs_size,
-                        PANEL_ALIGN,
-                    )
-                })
-                .flatten();
-            let lhs_packed = match &lhs_panel {
-                Some(p) => p.ptr.cast(),
-                None => grow(&mut s.lhs, lhs_size),
-            };
-            let rhs_packed = match &rhs_panel {
-                Some(p) => p.ptr.cast(),
-                None => grow(&mut s.rhs, rhs_size),
-            };
-            // A panel filled by an earlier call is used as is.
-            let lhs_ready = lhs_panel.as_ref().is_some_and(|p| p.filled);
-            let rhs_ready = rhs_panel.as_ref().is_some_and(|p| p.filled);
-            let pack_rhs = |rhs: *const f32| match layout {
+            let pack_rhs = |rhs: *const f32, out: *mut c_void| match layout {
                 Rhs::KxN(st) => kai_run_rhs_pack_kxn_f32p2vlx1biasf32_f32_f32_sme(
                     1,
                     n,
@@ -274,7 +352,7 @@ pub(crate) fn gemm(
                     rhs.cast(),
                     bias,
                     std::ptr::null(),
-                    rhs_packed,
+                    out,
                     0,
                     std::ptr::null(),
                 ),
@@ -289,48 +367,80 @@ pub(crate) fn gemm(
                     rhs.cast(),
                     bias,
                     std::ptr::null(),
-                    rhs_packed,
+                    out,
                     0,
                     std::ptr::null(),
                 ),
             };
-            for b in 0..batch {
-                if !rhs_ready && (b == 0 || rhs_b_stride != 0) {
-                    pack_rhs(rhs.as_ptr().add(b * rhs_b_stride));
-                    // Only an operand shared by every batch entry has a panel, and it is
-                    // packed here, at the first.
-                    if let Some(p) = &rhs_panel {
-                        p.mark_filled();
-                    }
-                }
-                if !lhs_ready && (b == 0 || lhs_b_stride != 0) {
-                    let src = &lhs[b * lhs_b_stride..];
-                    let (ptr, stride) = match lhs_layout {
-                        Lhs::MxK(st) => (src.as_ptr(), st),
-                        Lhs::KxM(st) => {
-                            s.lhs_t.resize(m * k, 0.0);
-                            for (p, col) in src.chunks(st).take(k).enumerate() {
-                                for (i, &x) in col[..m].iter().enumerate() {
-                                    s.lhs_t[i * k + p] = x;
-                                }
+            // A kxm lhs is transposed into `lhs_t` first, since the packer takes mxk.
+            let pack_lhs = |src: &[f32], lhs_t: &mut Vec<f32>, out: *mut c_void| {
+                let (ptr, stride) = match lhs_layout {
+                    Lhs::MxK(st) => (src.as_ptr(), st),
+                    Lhs::KxM(st) => {
+                        lhs_t.resize(m * k, 0.0);
+                        for (p, col) in src.chunks(st).take(k).enumerate() {
+                            for (i, &x) in col[..m].iter().enumerate() {
+                                lhs_t[i * k + p] = x;
                             }
-                            (s.lhs_t.as_ptr(), k)
                         }
-                    };
-                    kai_run_lhs_pack_f32p2vlx1_f32_sme(
-                        m,
-                        k,
-                        mr,
-                        kr,
-                        sr,
-                        0,
-                        ptr.cast(),
-                        stride * f,
-                        lhs_packed,
-                    );
-                    if let Some(p) = &lhs_panel {
-                        p.mark_filled();
+                        (lhs_t.as_ptr(), k)
                     }
+                };
+                kai_run_lhs_pack_f32p2vlx1_f32_sme(
+                    m,
+                    k,
+                    mr,
+                    kr,
+                    sr,
+                    0,
+                    ptr.cast(),
+                    stride * f,
+                    out,
+                );
+            };
+            // The declared parameter's panel, packed on its first use and then kept; `None`
+            // packs it per call, as any other operand.
+            let lhs_t = &mut s.lhs_t;
+            let lhs_panel = shared_lhs
+                .then(|| {
+                    let key = Key {
+                        ptr: lhs.as_ptr() as usize,
+                        side: Side::Lhs,
+                        rows: m,
+                        k,
+                        rs: lhs_rs,
+                        cs: lhs_cs,
+                    };
+                    panel(&lhs[..lhs_one], key, lhs_size, |out| pack_lhs(lhs, lhs_t, out))
+                })
+                .flatten();
+            let rhs_panel = shared_rhs
+                .then(|| {
+                    let key = Key {
+                        ptr: rhs.as_ptr() as usize,
+                        side: Side::Rhs,
+                        rows: n,
+                        k,
+                        rs: rhs_rs,
+                        cs: rhs_cs,
+                    };
+                    panel(&rhs[..rhs_one], key, rhs_size, |out| pack_rhs(rhs.as_ptr(), out))
+                })
+                .flatten();
+            let lhs_packed = match &lhs_panel {
+                Some(p) => p.0.as_ptr().cast(),
+                None => grow(&mut s.lhs, lhs_size).cast_const(),
+            };
+            let rhs_packed = match &rhs_panel {
+                Some(p) => p.0.as_ptr().cast(),
+                None => grow(&mut s.rhs, rhs_size).cast_const(),
+            };
+            for b in 0..batch {
+                if rhs_panel.is_none() && (b == 0 || rhs_b_stride != 0) {
+                    pack_rhs(rhs.as_ptr().add(b * rhs_b_stride), rhs_packed.cast_mut());
+                }
+                if lhs_panel.is_none() && (b == 0 || lhs_b_stride != 0) {
+                    pack_lhs(&lhs[b * lhs_b_stride..], &mut s.lhs_t, lhs_packed.cast_mut());
                 }
                 kai_run_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa(
                     m,
@@ -449,6 +559,7 @@ mod tests {
                 (1, dst_rs),
                 (lhs_cs, lhs_rs),
                 (rhs_cs, rhs_rs),
+                false,
             );
             if !crate::quantized::kai::active() {
                 assert!(!ran);
@@ -475,20 +586,21 @@ mod tests {
         lhs[0] = f32::NAN;
         let rhs = vec![1f32; k * n];
         let mut dst = vec![0f32; m * n];
-        if !gemm(&mut dst, &lhs, &rhs, (m, n, k), 1, (0, 0), (1, n), (1, k), (1, n)) {
+        if !gemm(&mut dst, &lhs, &rhs, (m, n, k), 1, (0, 0), (1, n), (1, k), (1, n), false) {
             return;
         }
         assert!(dst[..n].iter().all(|x| x.is_nan()), "{:?}", &dst[..n]);
         assert!(dst[n..].iter().all(|&x| x == k as f32));
     }
 
-    /// An operand declared constant is packed once and then served from the cache, on either
-    /// side, in either layout, and shared over a batch, with the same bits as packing it per
-    /// call. An undeclared one is never cached.
+    /// An operand declared constant is packed on its first use and then served from the cache,
+    /// on either side, in either layout, shared over a batch and by other threads, with the
+    /// same bits as packing it per call. An undeclared one is never cached, and new contents at
+    /// a cached address are packed again.
     #[test]
     fn a_declared_operand_is_packed_once() {
         use gemm::packed_cache;
-        if !crate::quantized::kai::active() {
+        if !crate::quantized::kai::active() || packed_cache::budget_bytes() == 0 {
             return;
         }
         // (m, n, k, batch, the lhs is the constant, kxm lhs, kxn rhs)
@@ -503,50 +615,82 @@ mod tests {
             (9, 33, 17, 1, true, true, false),
         ];
         for (m, n, k, batch, constant_lhs, kxm, kxn) in cases {
+            let what = format!("m={m} n={n} k={k}");
             let (lhs_cs, lhs_rs) = if kxm { (m, 1) } else { (1, k) };
             let (rhs_cs, rhs_rs) = if kxn { (1, n) } else { (k, 1) };
             // The constant is the same for every batch entry, the other operand is not.
             let (lb, rb) = if constant_lhs { (0, n * k) } else { (m * k, 0) };
-            let lhs = uniform(0x5EED + m as u64, m * k * if constant_lhs { 1 } else { batch });
-            let rhs = uniform(0xF00D + n as u64, n * k * if constant_lhs { batch } else { 1 });
-            let run = || {
+            let mut lhs = uniform(0x5EED + m as u64, m * k * if constant_lhs { 1 } else { batch });
+            let mut rhs = uniform(0xF00D + n as u64, n * k * if constant_lhs { batch } else { 1 });
+            let run = |lhs: &[f32], rhs: &[f32]| {
                 let mut dst = vec![f32::NAN; batch * m * n];
                 let layouts = ((1, n), (lhs_cs, lhs_rs), (rhs_cs, rhs_rs));
                 let (d, l, r) = layouts;
-                assert!(gemm(&mut dst, &lhs, &rhs, (m, n, k), batch, (lb, rb), d, l, r));
+                assert!(gemm(&mut dst, lhs, rhs, (m, n, k), batch, (lb, rb), d, l, r, false));
                 dst.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
             };
-            let panels = packed_cache::stats().1;
-            let per_call = run();
-            assert_eq!(run(), per_call);
-            if !packed_cache::enabled() {
-                assert_eq!(packed_cache::stats().1, panels, "an undeclared operand was cached");
-            }
             let constant = if constant_lhs {
                 packed_cache::Constant::new(lhs.as_ptr(), lhs.len())
             } else {
                 packed_cache::Constant::new(rhs.as_ptr(), rhs.len())
             };
-            // The first call only notes the operand, the second packs it into the cache, and
-            // later ones use that copy.
+            let held = |lhs: &[f32], rhs: &[f32]| panels_for(if constant_lhs { lhs } else { rhs });
+            let per_call = run(&lhs, &rhs);
+            assert_eq!(run(&lhs, &rhs), per_call, "{what}");
+            assert_eq!(held(&lhs, &rhs), 0, "{what}: an undeclared operand was cached");
             packed_cache::with_constant(constant, || {
-                for call in 0..4 {
-                    assert_eq!(run(), per_call, "m={m} n={n} k={k}, call {call}");
+                for call in 0..3 {
+                    assert_eq!(run(&lhs, &rhs), per_call, "{what}, call {call}");
+                    assert_eq!(held(&lhs, &rhs), 1, "{what}, call {call}: one panel");
                 }
             });
-            if packed_cache::budget_bytes() > 0 {
-                let held = packed_cache::stats().1;
-                assert_eq!(held, panels + 1, "m={m} n={n} k={k}: one panel for the constant");
-            }
+            // Another thread reads the same panel.
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    packed_cache::with_constant(constant, || {
+                        assert_eq!(run(&lhs, &rhs), per_call, "{what}, another thread");
+                    })
+                });
+            });
+            assert_eq!(held(&lhs, &rhs), 1, "{what}: shared by the other thread");
+            // New contents at the same address, as when a parameter is freed and another
+            // allocated there, are packed again.
+            let changed = if constant_lhs { &mut lhs } else { &mut rhs };
+            changed.iter_mut().for_each(|x| *x = 1.0 - *x);
+            let per_call = run(&lhs, &rhs);
+            packed_cache::with_constant(constant, || {
+                assert_eq!(run(&lhs, &rhs), per_call, "{what}, new contents");
+            });
+            assert_eq!(held(&lhs, &rhs), 1, "{what}: packed again");
         }
-        packed_cache::clear();
+    }
+
+    /// With `only_declared`, it takes a declared parameter times a smaller operand, and leaves
+    /// an undeclared product, or one whose other operand is the larger, to the caller.
+    #[test]
+    fn only_declared_takes_a_parameter_times_a_smaller_operand() {
+        use gemm::packed_cache::{Constant, with_constant};
+        // `x @ W^T`: `m` rows of `x` against an `n` by `k` weight.
+        let (n, k) = (64, 32);
+        let weight = uniform(0xBEEF, n * k);
+        let declared = Constant::new(weight.as_ptr(), weight.len());
+        for (m, takes) in [(4, true), (n - 1, true), (n, false), (3 * n, false)] {
+            let x = uniform(0xCAFE + m as u64, m * k);
+            let mut dst = vec![0f32; m * n];
+            let mut run =
+                || gemm(&mut dst, &x, &weight, (m, n, k), 1, (0, 0), (1, n), (1, k), (k, 1), true);
+            assert!(!run(), "m={m}: undeclared");
+            let ran = with_constant(declared, run);
+            assert_eq!(ran, takes && crate::quantized::kai::active(), "m={m}");
+        }
     }
 
     #[test]
     fn declines_what_it_does_not_take() {
         let (lhs, rhs, mut dst) = (vec![1f32; 64], vec![1f32; 64], vec![0f32; 64]);
-        let run =
-            |dst: &mut [f32], m, d, l, r| gemm(dst, &lhs, &rhs, (m, 4, 4), 1, (0, 0), d, l, r);
+        let run = |dst: &mut [f32], m, d, l, r| {
+            gemm(dst, &lhs, &rhs, (m, 4, 4), 1, (0, 0), d, l, r, false)
+        };
         // One row, a strided lhs column, an rhs strided both ways, a strided dst column.
         assert!(!run(&mut dst, 1, (1, 4), (1, 4), (1, 4)));
         assert!(!run(&mut dst, 4, (1, 4), (2, 8), (1, 4)));
@@ -555,7 +699,7 @@ mod tests {
         // A dst too short for the rows.
         assert!(!run(&mut dst[..10], 4, (1, 4), (1, 4), (1, 4)));
         // Padded dst rows in a batch.
-        assert!(!gemm(&mut dst, &lhs, &rhs, (4, 4, 4), 2, (16, 0), (1, 5), (1, 4), (1, 4)));
+        assert!(!gemm(&mut dst, &lhs, &rhs, (4, 4, 4), 2, (16, 0), (1, 5), (1, 4), (1, 4), false));
         assert!(!dst.iter().any(|&x| x != 0.0));
     }
 }
