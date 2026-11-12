@@ -188,8 +188,16 @@ static HELD: AtomicUsize = AtomicUsize::new(0);
 /// Claims `bytes` against the budget, or fails having claimed nothing.
 fn reserve(bytes: usize) -> bool {
     let budget = gemm::packed_cache::budget_bytes();
-    HELD.fetch_update(Relaxed, Relaxed, |held| held.checked_add(bytes).filter(|&t| t <= budget))
-        .is_ok()
+    let mut held = HELD.load(Relaxed);
+    loop {
+        let Some(total) = held.checked_add(bytes).filter(|&total| total <= budget) else {
+            return false;
+        };
+        match HELD.compare_exchange_weak(held, total, Relaxed, Relaxed) {
+            Ok(_) => return true,
+            Err(actual) => held = actual,
+        }
+    }
 }
 
 /// Whether the operand spanning `span` is exactly the parameter declared on this thread.
