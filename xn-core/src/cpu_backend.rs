@@ -743,6 +743,26 @@ impl crate::Backend for crate::CpuDevice {
         // Accelerate comes before the target kernels of `gemm_`, even for one row: it runs on
         // the matrix unit, which beats the direct `x @ W^T` kernel at every shape but the
         // tiniest. Only the layouts it cannot take reach them.
+        //
+        // The exception is a parameter KleidiAI keeps packed, times an operand smaller than it:
+        // both run on the matrix unit, and KleidiAI then packs only the small one per call.
+        #[cfg(xn_kai)]
+        if !gemm::packed_cache::constant().is_empty() {
+            let layout = arch::Gemm {
+                m,
+                n,
+                k,
+                batch: lhs_b,
+                lhs_b_stride,
+                rhs_b_stride,
+                dst: (dst_cs, dst_rs),
+                lhs: (lhs_cs, lhs_rs),
+                rhs: (rhs_cs, rhs_rs),
+            };
+            if arch::kai_declared(dst, &lhs[lhs_o..], &rhs[rhs_o..], &layout) {
+                return Ok(());
+            }
+        }
         let (lda, transa) = if (rhs_cs == 1 || n == 1) && (rhs_rs == n || k == 1) {
             (n as i32, b'N')
         } else if rhs_cs == k && rhs_rs == 1 {
@@ -2369,6 +2389,7 @@ mod arch {
                 g.dst,
                 g.lhs,
                 g.rhs,
+                false,
             ) {
                 return true;
             }
@@ -2439,6 +2460,27 @@ mod arch {
     pub(super) fn conv1d<T: 'static>(dst: &mut [T], src: &[T], w: &[T], s: &Conv1d) -> bool {
         match (as_f32_mut(dst), as_f32(src), as_f32(w)) {
             (Some(dst), Some(src), Some(w)) => imp::conv1d(dst, src, w, s),
+            _ => false,
+        }
+    }
+
+    /// [`gemm`] on KleidiAI's kernels, only when an operand is a declared parameter they keep
+    /// packed.
+    #[cfg(all(xn_kai, feature = "accelerate"))]
+    pub(super) fn kai_declared<T: 'static>(dst: &mut [T], lhs: &[T], rhs: &[T], g: &Gemm) -> bool {
+        match (as_f32_mut(dst), as_f32(lhs), as_f32(rhs)) {
+            (Some(dst), Some(lhs), Some(rhs)) => crate::kai_f32::gemm(
+                dst,
+                lhs,
+                rhs,
+                (g.m, g.n, g.k),
+                g.batch,
+                (g.lhs_b_stride, g.rhs_b_stride),
+                g.dst,
+                g.lhs,
+                g.rhs,
+                true,
+            ),
             _ => false,
         }
     }
