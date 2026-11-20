@@ -749,3 +749,148 @@ fn conv_transpose1d_cmp() -> Result<()> {
     }
     Ok(())
 }
+
+// q8_0 weights on the GPU.
+//
+// The oracle here cannot be the f32 matmul directly: quantizing to 8 bits is
+// lossy, so these compare against the *dequantized* weight rather than the
+// original. That isolates the kernel from the quantizer -- a wrong unpack,
+// scale index or reduction shows up immediately, while the ~0.4% the
+// quantizer itself costs does not.
+
+/// Round-trip a weight through q8_0 on the host, mirroring what the GPU
+/// upload does, so tests can multiply by exactly the weight the kernel sees.
+fn q8_roundtrip(w: &[f32]) -> Vec<f32> {
+    use xn::quantized::GgmlType;
+    use xn::quantized::k_quants::BlockQ8_0;
+    let mut blocks = vec![BlockQ8_0::zeros(); w.len() / 32];
+    BlockQ8_0::from_float(w, &mut blocks).unwrap();
+    let mut out = vec![0f32; w.len()];
+    BlockQ8_0::to_float(&blocks, &mut out).unwrap();
+    out
+}
+
+fn cmp_q8_matmul(m: usize, k: usize, n: usize) -> Result<()> {
+    use xn::Shape;
+    use xn::vulkan_backend::quantization::Q8Tensor;
+    let d = dev();
+
+    // Spread of magnitudes across blocks so per-block scales actually differ.
+    let w: Vec<f32> = (0..n * k)
+        .map(|i| ((i % 71) as f32 - 35.0) * 0.013 * (1.0 + (i / k) as f32 * 0.1))
+        .collect();
+    let x: Vec<f32> = (0..m * k).map(|i| ((i % 53) as f32 - 26.0) * 0.021).collect();
+
+    let wq = Q8Tensor::from_f32(&d, &w, &Shape::from((n, k)))?;
+    let xt: Tensor<f32, Vk> = Tensor::from_vec(x.clone(), (m, k), &d)?;
+    let got = wq.matmul_t(&xt)?.to_vec()?;
+
+    // Reference: the dequantized weight, multiplied on the CPU backend.
+    let wd = q8_roundtrip(&w);
+    let wt: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(wd, (n, k), &CPU)?;
+    let xc: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(x, (m, k), &CPU)?;
+    let want = xc.matmul_t(&wt)?.to_vec()?;
+
+    assert_eq!(got.len(), want.len(), "m={m} k={k} n={n}");
+    // f32 accumulation in a different order than the CPU reference.
+    assert_close(&want, &got, 1e-4);
+    Ok(())
+}
+
+#[test]
+fn q8_matmul_decode() -> Result<()> {
+    // m == 1 takes the gemv_q8 path.
+    for (k, n) in [(32, 4), (64, 1), (256, 7), (1024, 256), (1536, 512)] {
+        cmp_q8_matmul(1, k, n)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn q8_matmul_rows() -> Result<()> {
+    // 2..=16 takes gemm_q8, including partial row and column tiles.
+    for (m, k, n) in [(2, 64, 8), (3, 256, 5), (4, 512, 64), (6, 1024, 130), (16, 128, 33)] {
+        cmp_q8_matmul(m, k, n)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn q8_matmul_row_blocks() -> Result<()> {
+    // m > 16 walks m in blocks of 32 (gemm_q8_sg_r32 with a 2D grid),
+    // including partial last blocks and the 125-row voice prompt.
+    for (m, k, n) in [(17, 64, 4), (30, 288, 96), (33, 128, 33), (64, 512, 128), (125, 1024, 96)] {
+        cmp_q8_matmul(m, k, n)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn q8_matmul_batched_shape() -> Result<()> {
+    use xn::Shape;
+    use xn::vulkan_backend::quantization::Q8Tensor;
+    // Leading dims are flattened into m and restored on the output.
+    let (b, t, k, n) = (2usize, 3usize, 128usize, 16usize);
+    let d = dev();
+    let w: Vec<f32> = (0..n * k).map(|i| ((i % 29) as f32 - 14.0) * 0.02).collect();
+    let x: Vec<f32> = (0..b * t * k).map(|i| ((i % 37) as f32 - 18.0) * 0.011).collect();
+    let wq = Q8Tensor::from_f32(&d, &w, &Shape::from((n, k)))?;
+    let xt: Tensor<f32, Vk> = Tensor::from_vec(x.clone(), (b, t, k), &d)?;
+    let out = wq.matmul_t(&xt)?;
+    assert_eq!(out.dims(), &[b, t, n]);
+
+    let wd = q8_roundtrip(&w);
+    let wt: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(wd, (n, k), &CPU)?;
+    let xc: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(x, (b, t, k), &CPU)?;
+    assert_close(&xc.matmul_t(&wt)?.to_vec()?, &out.to_vec()?, 1e-4);
+    Ok(())
+}
+
+#[test]
+fn q8_gguf_blocks_match_in_process_quantization() -> Result<()> {
+    // Uploading a QTensor's q8_0 blocks must give the same weight as
+    // quantizing the f32 data in process.
+    use xn::Shape;
+    use xn::quantized::{GgmlDType, QTensor};
+    use xn::vulkan_backend::quantization::Q8Tensor;
+    let (k, n, m) = (256usize, 24usize, 3usize);
+    let d = dev();
+    let w: Vec<f32> = (0..n * k).map(|i| ((i % 67) as f32 - 33.0) * 0.019).collect();
+    let x: Vec<f32> = (0..m * k).map(|i| ((i % 41) as f32 - 20.0) * 0.027).collect();
+    let qt = QTensor::quantize_f32(&w, &Shape::from((n, k)), GgmlDType::Q8_0)?;
+    let from_blocks = Q8Tensor::from_qtensor(&d, &qt)?;
+    let from_f32 = Q8Tensor::from_f32(&d, &w, &Shape::from((n, k)))?;
+    let xt: Tensor<f32, Vk> = Tensor::from_vec(x, (m, k), &d)?;
+    assert_eq!(from_blocks.matmul_t(&xt)?.to_vec()?, from_f32.matmul_t(&xt)?.to_vec()?);
+    Ok(())
+}
+
+#[test]
+fn q8_linear_matches_dequantized() -> Result<()> {
+    // The BackendQ entry point, bias included: quantizing a Linear and running
+    // it must match running the dequantized weight through the f32 path.
+    use xn::BackendQ;
+    use xn::nn::Linear;
+    use xn::vulkan_backend::quantization::Q8F32;
+    let d = dev();
+    let (k, n, m) = (256usize, 64usize, 2usize);
+    let w: Vec<f32> = (0..n * k).map(|i| ((i % 61) as f32 - 30.0) * 0.017).collect();
+    let bias: Vec<f32> = (0..n).map(|i| i as f32 * 0.01).collect();
+
+    let wt: Tensor<f32, Vk> = Tensor::from_vec(w.clone(), (n, k), &d)?;
+    let bt: Tensor<f32, Vk> = Tensor::from_vec(bias.clone(), (n,), &d)?;
+    let lin = Linear::new(wt).with_bias(bt);
+    let q = Q8F32::from_linear(lin)?;
+
+    let x: Vec<f32> = (0..m * k).map(|i| ((i % 43) as f32 - 21.0) * 0.03).collect();
+    let xt: Tensor<f32, Vk> = Tensor::from_vec(x.clone(), (m, k), &d)?;
+    let got = q.forward(&xt)?.to_vec()?;
+
+    let wd = q8_roundtrip(&w);
+    let wc: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(wd, (n, k), &CPU)?;
+    let bc: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(bias, (n,), &CPU)?;
+    let xc: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(x, (m, k), &CPU)?;
+    let want = xc.matmul_t(&wc)?.broadcast_add(&bc)?.to_vec()?;
+    assert_close(&want, &got, 1e-4);
+    Ok(())
+}

@@ -225,3 +225,21 @@ fn sgemm_q8_0_simd128_matches_vec_dot() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn q8_0_split_streams_match_in_process_quantization() -> Result<()> {
+    // The GPU backends upload q8_0 as two streams; splitting a GGUF's blocks
+    // and quantizing the f32 data in process must give the same streams.
+    use xn::Shape;
+    use xn::quantized::{QTensor, quantize_split_q8_0, split_q8_0};
+    let w: Vec<f32> = (0..24 * 256).map(|i| ((i % 67) as f32 - 33.0) * 0.019).collect();
+    let qt = QTensor::quantize_f32(&w, &Shape::from((24, 256)), GgmlDType::Q8_0)?;
+    let (qs_a, scales_a) = split_q8_0(&qt.data()?)?;
+    let (qs_b, scales_b) = quantize_split_q8_0(&w)?;
+    assert_eq!(qs_a, qs_b);
+    assert_eq!(scales_a, scales_b);
+    assert_eq!(qs_a.len(), 24 * 256);
+    assert_eq!(scales_a.len(), 24 * 256 / 32);
+    assert!(split_q8_0(&qt.data()?[..33]).is_err());
+    Ok(())
+}
