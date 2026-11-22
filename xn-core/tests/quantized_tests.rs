@@ -120,7 +120,12 @@ fn qlinear_3d_input() -> Result<()> {
 // Exercises the SIMD `sgemm_q8_0_q8_0` kernels by computing a row-major
 // reference with `BlockQ8_0::vec_dot` and comparing it against the
 // column-major output of sgemm.
-#[cfg(any(target_feature = "neon", target_feature = "avx", target_feature = "simd128"))]
+#[cfg(any(
+    target_feature = "neon",
+    target_arch = "x86",
+    target_arch = "x86_64",
+    target_feature = "simd128"
+))]
 #[allow(clippy::type_complexity)]
 fn check_sgemm_q8_0_matches_vec_dot(
     sgemm: fn(
@@ -195,7 +200,12 @@ fn check_sgemm_q8_0_matches_vec_dot(
 // A spread of shapes that exercises every tile case in the cpp-style
 // dispatch (1×1 up to 4×2 / 2×4) plus odd remainders, so both the inner
 // kernel and the recursive `mnpack` walk are covered.
-#[cfg(any(target_feature = "neon", target_feature = "avx", target_feature = "simd128"))]
+#[cfg(any(
+    target_feature = "neon",
+    target_arch = "x86",
+    target_arch = "x86_64",
+    target_feature = "simd128"
+))]
 const SGEMM_TEST_SHAPES: &[(usize, usize, usize)] =
     &[(1, 32, 1), (3, 32, 5), (7, 64, 11), (5, 128, 8), (8, 32, 3), (16, 96, 17), (32, 64, 33)];
 
@@ -208,9 +218,14 @@ fn sgemm_q8_0_neon_matches_vec_dot() -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_feature = "avx")]
+// The AVX2 kernels are compiled into every x86 build and chosen when the CPU has them, so this
+// runs on a baseline `x86-64` build too. It is skipped only on a CPU without AVX2 and FMA.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[test]
 fn sgemm_q8_0_avx_matches_vec_dot() -> Result<()> {
+    if !xn::quantized::avx2_fma() {
+        return Ok(());
+    }
     for &(m, k, n) in SGEMM_TEST_SHAPES {
         check_sgemm_q8_0_matches_vec_dot(xn::quantized::avx::sgemm_q8_0_q8_0, m, k, n)?;
     }
@@ -222,6 +237,32 @@ fn sgemm_q8_0_avx_matches_vec_dot() -> Result<()> {
 fn sgemm_q8_0_simd128_matches_vec_dot() -> Result<()> {
     for &(m, k, n) in SGEMM_TEST_SHAPES {
         check_sgemm_q8_0_matches_vec_dot(xn::quantized::simd128::sgemm_q8_0_q8_0, m, k, n)?;
+    }
+    Ok(())
+}
+
+// The SIMD `vec_dot` this CPU dispatches to matches the generic one within rounding on q8_0 and
+// q4_0 (the generic path sums in a different order).
+#[test]
+fn simd_vec_dot_matches_generic() -> Result<()> {
+    use xn::quantized::k_quants::{BlockQ4_0, BlockQ8_0, GgmlType};
+    let mut rng = StdRng::seed_from_u64(7);
+    for k in [32, 64, 256, 1024] {
+        let a = randn_vec(&mut rng, k, 0.0, 1.0);
+        let b = randn_vec(&mut rng, k, 0.0, 1.0);
+        let blocks = k / 32;
+        let mut a8 = vec![BlockQ8_0::zeros(); blocks];
+        let mut a4 = vec![BlockQ4_0::zeros(); blocks];
+        let mut b8 = vec![BlockQ8_0::zeros(); blocks];
+        BlockQ8_0::from_float(&a, &mut a8)?;
+        BlockQ4_0::from_float(&a, &mut a4)?;
+        BlockQ8_0::from_float(&b, &mut b8)?;
+        let fast = BlockQ8_0::vec_dot(k, &a8, &b8)?;
+        let slow = BlockQ8_0::vec_dot_unopt(k, &a8, &b8)?;
+        assert!((fast - slow).abs() <= 1e-3 * slow.abs().max(1.0), "q8_0 k={k}: {fast} vs {slow}");
+        let fast = BlockQ4_0::vec_dot(k, &a4, &b8)?;
+        let slow = BlockQ4_0::vec_dot_unopt(k, &a4, &b8)?;
+        assert!((fast - slow).abs() <= 1e-3 * slow.abs().max(1.0), "q4_0 k={k}: {fast} vs {slow}");
     }
     Ok(())
 }

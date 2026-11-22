@@ -272,8 +272,11 @@ impl GgmlType for BlockQ4_0 {
     // https://github.com/ggerganov/llama.cpp/blob/b5ffb2849d23afe73647f68eec7b68187af09be6/ggml.c#L2361C10-L2361C122
     #[allow(unreachable_code)]
     fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> Result<f32> {
-        #[cfg(target_feature = "avx")]
-        return super::avx::vec_dot_q4_0_q8_0(n, xs, ys);
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if super::avx2_fma() {
+            // SAFETY: the CPU has AVX2 and FMA, checked just above.
+            return unsafe { super::avx::vec_dot_q4_0_q8_0(n, xs, ys) };
+        }
 
         #[cfg(target_feature = "neon")]
         return super::neon::vec_dot_q4_0_q8_0(n, xs, ys);
@@ -662,8 +665,11 @@ impl GgmlType for BlockQ8_0 {
 
     #[allow(unreachable_code)]
     fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> Result<f32> {
-        #[cfg(target_feature = "avx")]
-        return super::avx::vec_dot_q8_0_q8_0(n, xs, ys);
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if super::avx2_fma() {
+            // SAFETY: the CPU has AVX2 and FMA, checked just above.
+            return unsafe { super::avx::vec_dot_q8_0_q8_0(n, xs, ys) };
+        }
 
         #[cfg(target_feature = "neon")]
         return super::neon::vec_dot_q8_0_q8_0(n, xs, ys);
@@ -699,12 +705,32 @@ impl GgmlType for BlockQ8_0 {
         n: usize,
         k: usize,
     ) -> Result<()> {
-        #[cfg(any(target_feature = "avx", target_feature = "neon", target_feature = "simd128",))]
-        if k.is_multiple_of(QK8_0) {
+        #[cfg(any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_feature = "neon",
+            target_feature = "simd128"
+        ))]
+        if k.is_multiple_of(QK8_0) && sgemm_q8_0_available() {
             return matmul_q8_0_sgemm(lhs_b, rhs_t, dst, m, n, k);
         }
         matmul_by_row::<Self>(lhs_b, rhs_t, dst, m, n, k)
     }
+}
+
+// Whether this CPU can run the sgemm kernel this build has. NEON and simd128 are compile-time
+// targets; the x86 kernel needs AVX2 and FMA, which are checked when it runs.
+#[cfg(any(
+    target_arch = "x86",
+    target_arch = "x86_64",
+    target_feature = "neon",
+    target_feature = "simd128"
+))]
+fn sgemm_q8_0_available() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    return super::avx2_fma();
+    #[allow(unreachable_code)]
+    true
 }
 
 // Q8_0 matmul backed by the cache-tiling AVX/NEON/simd128 sgemm kernels.
@@ -716,7 +742,12 @@ impl GgmlType for BlockQ8_0 {
 // swap roles: pass `rhs_t` as sgemm-A, `lhs_b` as sgemm-B, and call
 // sgemm with `(m', n') = (n, m)` and `ldc = n`. Then sgemm's
 // `c[n * i + j]` lines up with `dst[i * n + j]`.
-#[cfg(any(target_feature = "avx", target_feature = "neon", target_feature = "simd128"))]
+#[cfg(any(
+    target_arch = "x86",
+    target_arch = "x86_64",
+    target_feature = "neon",
+    target_feature = "simd128"
+))]
 #[tracing::instrument(name = "q-matmul-q8-0-sgemm", skip_all, fields(m = m, n = n, k = k))]
 fn matmul_q8_0_sgemm(
     lhs_b: &[BlockQ8_0],
@@ -767,7 +798,12 @@ fn matmul_q8_0_sgemm(
 // # Safety
 // `a` and `b` must address at least `n * k_blocks` and `m * k_blocks` `BlockQ8_0`s, `c` at
 // least `m * n` floats, and no two concurrent calls may share an `ith`.
-#[cfg(any(target_feature = "avx", target_feature = "neon", target_feature = "simd128"))]
+#[cfg(any(
+    target_arch = "x86",
+    target_arch = "x86_64",
+    target_feature = "neon",
+    target_feature = "simd128"
+))]
 #[allow(clippy::too_many_arguments)]
 unsafe fn sgemm_q8_0_tile(
     a: usize,
@@ -780,7 +816,7 @@ unsafe fn sgemm_q8_0_tile(
     nth: usize,
 ) {
     unsafe {
-        #[cfg(target_feature = "avx")]
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         super::avx::sgemm_q8_0_q8_0_raw(
             n,
             m,
@@ -794,7 +830,10 @@ unsafe fn sgemm_q8_0_tile(
             ith,
             nth,
         );
-        #[cfg(all(target_feature = "neon", not(target_feature = "avx")))]
+        #[cfg(all(
+            target_feature = "neon",
+            not(any(target_arch = "x86", target_arch = "x86_64"))
+        ))]
         super::neon::sgemm_q8_0_q8_0_raw(
             n,
             m,
@@ -810,7 +849,7 @@ unsafe fn sgemm_q8_0_tile(
         );
         #[cfg(all(
             target_feature = "simd128",
-            not(target_feature = "avx"),
+            not(any(target_arch = "x86", target_arch = "x86_64")),
             not(target_feature = "neon"),
         ))]
         super::simd128::sgemm_q8_0_q8_0_raw(
@@ -884,8 +923,11 @@ impl GgmlType for BlockQ2K {
 
     #[allow(unreachable_code)]
     fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> Result<f32> {
-        #[cfg(target_feature = "avx")]
-        return super::avx::vec_dot_q2k_q8k(n, xs, ys);
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if super::avx2_fma() {
+            // SAFETY: the CPU has AVX2 and FMA, checked just above.
+            return unsafe { super::avx::vec_dot_q2k_q8k(n, xs, ys) };
+        }
 
         #[cfg(target_feature = "neon")]
         return super::neon::vec_dot_q2k_q8k(n, xs, ys);
@@ -1060,8 +1102,11 @@ impl GgmlType for BlockQ3K {
 
     #[allow(unreachable_code)]
     fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> Result<f32> {
-        #[cfg(target_feature = "avx")]
-        return super::avx::vec_dot_q3k_q8k(n, xs, ys);
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if super::avx2_fma() {
+            // SAFETY: the CPU has AVX2 and FMA, checked just above.
+            return unsafe { super::avx::vec_dot_q3k_q8k(n, xs, ys) };
+        }
 
         #[cfg(target_feature = "neon")]
         return super::neon::vec_dot_q3k_q8k(n, xs, ys);
@@ -1322,8 +1367,11 @@ impl GgmlType for BlockQ4K {
 
     #[allow(unreachable_code)]
     fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> Result<f32> {
-        #[cfg(target_feature = "avx")]
-        return super::avx::vec_dot_q4k_q8k(n, xs, ys);
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if super::avx2_fma() {
+            // SAFETY: the CPU has AVX2 and FMA, checked just above.
+            return unsafe { super::avx::vec_dot_q4k_q8k(n, xs, ys) };
+        }
 
         #[cfg(target_feature = "neon")]
         return super::neon::vec_dot_q4k_q8k(n, xs, ys);
@@ -1511,8 +1559,11 @@ impl GgmlType for BlockQ5K {
 
     #[allow(unreachable_code)]
     fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> Result<f32> {
-        #[cfg(target_feature = "avx")]
-        return super::avx::vec_dot_q5k_q8k(n, xs, ys);
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if super::avx2_fma() {
+            // SAFETY: the CPU has AVX2 and FMA, checked just above.
+            return unsafe { super::avx::vec_dot_q5k_q8k(n, xs, ys) };
+        }
 
         #[cfg(target_feature = "neon")]
         return super::neon::vec_dot_q5k_q8k(n, xs, ys);
@@ -1728,8 +1779,11 @@ impl GgmlType for BlockQ6K {
 
     #[allow(unreachable_code)]
     fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> Result<f32> {
-        #[cfg(target_feature = "avx")]
-        return super::avx::vec_dot_q6k_q8k(n, xs, ys);
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if super::avx2_fma() {
+            // SAFETY: the CPU has AVX2 and FMA, checked just above.
+            return unsafe { super::avx::vec_dot_q6k_q8k(n, xs, ys) };
+        }
 
         #[cfg(target_feature = "neon")]
         return super::neon::vec_dot_q6k_q8k(n, xs, ys);
@@ -1911,8 +1965,11 @@ impl GgmlType for BlockQ8K {
 
     #[allow(unreachable_code)]
     fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> Result<f32> {
-        #[cfg(target_feature = "avx")]
-        return super::avx::vec_dot_q8k_q8k(n, xs, ys);
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if super::avx2_fma() {
+            // SAFETY: the CPU has AVX2 and FMA, checked just above.
+            return unsafe { super::avx::vec_dot_q8k_q8k(n, xs, ys) };
+        }
 
         #[cfg(target_feature = "neon")]
         return super::neon::vec_dot_q8k_q8k(n, xs, ys);
