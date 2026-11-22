@@ -69,8 +69,12 @@ pub mod webgpu_backend;
 #[cfg(feature = "webgpu")]
 pub use webgpu_backend::Device as WebGpuDevice;
 
+/// Whether the AVX2/FMA quantized kernels run on this CPU (detected at run time).
 pub fn with_avx() -> bool {
-    cfg!(target_feature = "avx")
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    return quantized::avx2_fma();
+    #[allow(unreachable_code)]
+    false
 }
 
 pub fn with_neon() -> bool {

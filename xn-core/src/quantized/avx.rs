@@ -10,16 +10,23 @@ use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
-#[inline(always)]
-pub(crate) unsafe fn sum_i16_pairs_float(x: __m256i) -> __m256 {
-    unsafe {
-        let ones = _mm256_set1_epi16(1);
-        let summed_pairs = _mm256_madd_epi16(ones, x);
-        _mm256_cvtepi32_ps(summed_pairs)
-    }
+// One F16C instruction. `f16::to_f32` cannot inline here: it checks for F16C on every call.
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn f16_to_f32(x: f16) -> f32 {
+    _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(x.to_bits() as i32)))
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(crate) unsafe fn sum_i16_pairs_float(x: __m256i) -> __m256 {
+    let ones = _mm256_set1_epi16(1);
+    let summed_pairs = _mm256_madd_epi16(ones, x);
+    _mm256_cvtepi32_ps(summed_pairs)
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
 pub(crate) unsafe fn mul_sum_us8_pairs_float(ax: __m256i, sy: __m256i) -> __m256 {
     unsafe {
         let dot = _mm256_maddubs_epi16(ax, sy);
@@ -27,18 +34,18 @@ pub(crate) unsafe fn mul_sum_us8_pairs_float(ax: __m256i, sy: __m256i) -> __m256
     }
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
 pub(crate) unsafe fn hsum_float_8(x: __m256) -> f32 {
-    unsafe {
-        let res = _mm256_extractf128_ps(x, 1);
-        let res = _mm_add_ps(res, _mm256_castps256_ps128(x));
-        let res = _mm_add_ps(res, _mm_movehl_ps(res, res));
-        let res = _mm_add_ss(res, _mm_movehdup_ps(res));
-        _mm_cvtss_f32(res)
-    }
+    let res = _mm256_extractf128_ps(x, 1);
+    let res = _mm_add_ps(res, _mm256_castps256_ps128(x));
+    let res = _mm_add_ps(res, _mm_movehl_ps(res, res));
+    let res = _mm_add_ss(res, _mm_movehdup_ps(res));
+    _mm_cvtss_f32(res)
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
 pub(crate) unsafe fn bytes_from_nibbles_32(rsi: *const u8) -> __m256i {
     unsafe {
         let tmp = _mm_loadu_si128(rsi as *const __m128i);
@@ -49,7 +56,8 @@ pub(crate) unsafe fn bytes_from_nibbles_32(rsi: *const u8) -> __m256i {
     }
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
 pub(crate) unsafe fn mul_sum_i8_pairs_float(x: __m256i, y: __m256i) -> __m256 {
     unsafe {
         let ax = _mm256_sign_epi8(x, x);
@@ -58,8 +66,12 @@ pub(crate) unsafe fn mul_sum_i8_pairs_float(x: __m256i, y: __m256i) -> __m256 {
     }
 }
 
-#[inline(always)]
-pub(crate) fn vec_dot_q4_0_q8_0(n: usize, xs: &[BlockQ4_0], ys: &[BlockQ8_0]) -> Result<f32> {
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(crate) unsafe fn vec_dot_q4_0_q8_0(
+    n: usize,
+    xs: &[BlockQ4_0],
+    ys: &[BlockQ8_0],
+) -> Result<f32> {
     let qk = QK8_0;
     if !n.is_multiple_of(QK8_0) {
         crate::bail!("vec_dot_q4_0_q8_0: {n} is not divisible by {qk}")
@@ -67,7 +79,7 @@ pub(crate) fn vec_dot_q4_0_q8_0(n: usize, xs: &[BlockQ4_0], ys: &[BlockQ8_0]) ->
     unsafe {
         let mut acc = _mm256_setzero_ps();
         for (x, y) in xs.iter().zip(ys.iter()) {
-            let d = _mm256_set1_ps(f16::to_f32(x.d) * f16::to_f32(y.d));
+            let d = _mm256_set1_ps(f16_to_f32(x.d) * f16_to_f32(y.d));
             let bx = bytes_from_nibbles_32(x.qs.as_ptr());
             let off = _mm256_set1_epi8(8);
             let bx = _mm256_sub_epi8(bx, off);
@@ -79,8 +91,12 @@ pub(crate) fn vec_dot_q4_0_q8_0(n: usize, xs: &[BlockQ4_0], ys: &[BlockQ8_0]) ->
     }
 }
 
-#[inline(always)]
-pub(crate) fn vec_dot_q8_0_q8_0(n: usize, xs: &[BlockQ8_0], ys: &[BlockQ8_0]) -> Result<f32> {
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(crate) unsafe fn vec_dot_q8_0_q8_0(
+    n: usize,
+    xs: &[BlockQ8_0],
+    ys: &[BlockQ8_0],
+) -> Result<f32> {
     let qk = QK8_0;
     if !n.is_multiple_of(QK8_0) {
         crate::bail!("vec_dot_q8_0_q8_0: {n} is not divisible by {qk}")
@@ -88,7 +104,7 @@ pub(crate) fn vec_dot_q8_0_q8_0(n: usize, xs: &[BlockQ8_0], ys: &[BlockQ8_0]) ->
     unsafe {
         let mut acc = _mm256_setzero_ps();
         for (x, y) in xs.iter().zip(ys.iter()) {
-            let d = _mm256_set1_ps(f16::to_f32(x.d) * f16::to_f32(y.d));
+            let d = _mm256_set1_ps(f16_to_f32(x.d) * f16_to_f32(y.d));
             let bx = _mm256_loadu_si256(x.qs.as_ptr() as *const __m256i);
             let by = _mm256_loadu_si256(y.qs.as_ptr() as *const __m256i);
             let q = mul_sum_i8_pairs_float(bx, by);
@@ -125,6 +141,9 @@ pub fn sgemm_q8_0_q8_0(
     ith: usize,
     nth: usize,
 ) -> Result<()> {
+    if !super::avx2_fma() {
+        crate::bail!("sgemm_q8_0_q8_0: this CPU lacks AVX2 and FMA")
+    }
     if nth == 0 {
         crate::bail!("sgemm_q8_0_q8_0: nth must be > 0")
     }
@@ -166,6 +185,7 @@ pub fn sgemm_q8_0_q8_0(
 /// Raw-pointer entry point for `sgemm_q8_0_q8_0` used by the parallel
 /// `BlockQ8_0::matmul` override. The caller is responsible for bounds and
 /// for ensuring different `ith` values write to disjoint output tiles.
+#[target_feature(enable = "avx2,fma,f16c")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sgemm_q8_0_q8_0_raw(
     m: usize,
@@ -198,11 +218,13 @@ struct TinyBlasQ0Avx {
 
 impl TinyBlasQ0Avx {
     #[inline]
+    #[target_feature(enable = "avx2,fma,f16c")]
     unsafe fn matmul(&self, m: usize, n: usize) {
         self.mnpack(0, m, 0, n)
     }
 
     #[inline(never)]
+    #[target_feature(enable = "avx2,fma,f16c")]
     unsafe fn mnpack(&self, m0: usize, m: usize, n0: usize, n: usize) {
         let mr = (m - m0).min(4);
         let nr = (n - n0).min(4);
@@ -266,6 +288,7 @@ impl TinyBlasQ0Avx {
     }
 
     #[inline(never)]
+    #[target_feature(enable = "avx2,fma,f16c")]
     unsafe fn gemm<const RM: usize, const RN: usize>(
         &self,
         m0: usize,
@@ -299,7 +322,7 @@ impl TinyBlasQ0Avx {
                         // int8×int8 dot product into the unsigned form
                         // supported by `vpmaddubsw`.
                         let dot = mul_sum_i8_pairs_float(av, bv);
-                        let scale = _mm256_set1_ps(f16::to_f32(a.d) * f16::to_f32(b.d));
+                        let scale = _mm256_set1_ps(f16_to_f32(a.d) * f16_to_f32(b.d));
                         *cv = _mm256_fmadd_ps(scale, dot, *cv);
                     }
                 }
@@ -313,7 +336,8 @@ impl TinyBlasQ0Avx {
     }
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
 unsafe fn get_scale_shuffle(i: usize) -> __m128i {
     const K_SHUFFLE: [u8; 128] = [
         0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3,
@@ -325,7 +349,8 @@ unsafe fn get_scale_shuffle(i: usize) -> __m128i {
     unsafe { _mm_loadu_si128((K_SHUFFLE.as_ptr() as *const __m128i).add(i)) }
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
 unsafe fn get_scale_shuffle_k4(i: usize) -> __m256i {
     const K_SHUFFLE: [u8; 256] = [
         0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
@@ -342,7 +367,8 @@ unsafe fn get_scale_shuffle_k4(i: usize) -> __m256i {
     unsafe { _mm256_loadu_si256((K_SHUFFLE.as_ptr() as *const __m256i).add(i)) }
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
 unsafe fn get_scale_shuffle_q3k(i: usize) -> __m256i {
     const K_SHUFFLE: [u8; 128] = [
         0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
@@ -354,8 +380,8 @@ unsafe fn get_scale_shuffle_q3k(i: usize) -> __m256i {
     unsafe { _mm256_loadu_si256((K_SHUFFLE.as_ptr() as *const __m256i).add(i)) }
 }
 
-#[inline(always)]
-pub(crate) fn vec_dot_q6k_q8k(n: usize, xs: &[BlockQ6K], ys: &[BlockQ8K]) -> Result<f32> {
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(crate) unsafe fn vec_dot_q6k_q8k(n: usize, xs: &[BlockQ6K], ys: &[BlockQ8K]) -> Result<f32> {
     let qk = QK_K;
     if !n.is_multiple_of(qk) {
         crate::bail!("vec_dot_q6k_8k: {n} is not divisible by {qk}")
@@ -367,7 +393,7 @@ pub(crate) fn vec_dot_q6k_q8k(n: usize, xs: &[BlockQ6K], ys: &[BlockQ8K]) -> Res
         let m32s = _mm256_set1_epi8(32);
         let mut acc = _mm256_setzero_ps();
         for (x, y) in xs.iter().zip(ys.iter()) {
-            let d = y.d * x.d.to_f32();
+            let d = y.d * f16_to_f32(x.d);
             let mut q4 = x.ql.as_ptr();
             let mut qh = x.qh.as_ptr();
             let mut q8 = y.qs.as_ptr();
@@ -442,13 +468,14 @@ pub(crate) fn vec_dot_q6k_q8k(n: usize, xs: &[BlockQ6K], ys: &[BlockQ8K]) -> Res
     }
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
 unsafe fn mm256_set_m128i(a: __m128i, b: __m128i) -> __m256i {
-    unsafe { _mm256_insertf128_si256(_mm256_castsi128_si256(b), a, 1) }
+    _mm256_insertf128_si256(_mm256_castsi128_si256(b), a, 1)
 }
 
-#[inline(always)]
-pub(crate) fn vec_dot_q2k_q8k(n: usize, xs: &[BlockQ2K], ys: &[BlockQ8K]) -> Result<f32> {
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(crate) unsafe fn vec_dot_q2k_q8k(n: usize, xs: &[BlockQ2K], ys: &[BlockQ8K]) -> Result<f32> {
     if !n.is_multiple_of(QK_K) {
         crate::bail!("vec_dot_q2k_q8k: {n} is not divisible by {QK_K}")
     }
@@ -460,8 +487,8 @@ pub(crate) fn vec_dot_q2k_q8k(n: usize, xs: &[BlockQ2K], ys: &[BlockQ8K]) -> Res
         let mut acc = _mm256_setzero_ps();
 
         for (x, y) in xs.iter().zip(ys.iter()) {
-            let d = y.d * x.d.to_f32();
-            let dmin = -y.d * x.dmin.to_f32();
+            let d = y.d * f16_to_f32(x.d);
+            let dmin = -y.d * f16_to_f32(x.dmin);
 
             let mut q2 = x.qs.as_ptr();
             let mut q8 = y.qs.as_ptr();
@@ -526,8 +553,8 @@ pub(crate) fn vec_dot_q2k_q8k(n: usize, xs: &[BlockQ2K], ys: &[BlockQ8K]) -> Res
     }
 }
 
-#[inline(always)]
-pub(crate) fn vec_dot_q3k_q8k(n: usize, xs: &[BlockQ3K], ys: &[BlockQ8K]) -> Result<f32> {
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(crate) unsafe fn vec_dot_q3k_q8k(n: usize, xs: &[BlockQ3K], ys: &[BlockQ8K]) -> Result<f32> {
     if !n.is_multiple_of(QK_K) {
         crate::bail!("vec_dot_q3k_q8k: {n} is not divisible by {QK_K}")
     }
@@ -544,7 +571,7 @@ pub(crate) fn vec_dot_q3k_q8k(n: usize, xs: &[BlockQ3K], ys: &[BlockQ8K]) -> Res
 
         let mut acc = _mm256_setzero_ps();
         for (x, y) in xs.iter().zip(ys.iter()) {
-            let d = y.d * x.d.to_f32();
+            let d = y.d * f16_to_f32(x.d);
 
             let mut q3 = x.qs.as_ptr();
             let mut q8 = y.qs.as_ptr();
@@ -658,8 +685,8 @@ pub(crate) fn vec_dot_q3k_q8k(n: usize, xs: &[BlockQ3K], ys: &[BlockQ8K]) -> Res
     }
 }
 
-#[inline(always)]
-pub(crate) fn vec_dot_q4k_q8k(n: usize, xs: &[BlockQ4K], ys: &[BlockQ8K]) -> Result<f32> {
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(crate) unsafe fn vec_dot_q4k_q8k(n: usize, xs: &[BlockQ4K], ys: &[BlockQ8K]) -> Result<f32> {
     if !n.is_multiple_of(QK_K) {
         crate::bail!("vec_dot_q4k_q8k: {n} is not divisible by {QK_K}")
     }
@@ -675,8 +702,8 @@ pub(crate) fn vec_dot_q4k_q8k(n: usize, xs: &[BlockQ4K], ys: &[BlockQ8K]) -> Res
         let mut acc_m = _mm_setzero_ps();
 
         for (x, y) in xs.iter().zip(ys.iter()) {
-            let d = y.d * x.d.to_f32();
-            let dmin = -y.d * x.dmin.to_f32();
+            let d = y.d * f16_to_f32(x.d);
+            let dmin = -y.d * f16_to_f32(x.dmin);
 
             LittleEndian::read_u32_into(&x.scales, &mut utmp[0..3]);
 
@@ -742,8 +769,8 @@ pub(crate) fn vec_dot_q4k_q8k(n: usize, xs: &[BlockQ4K], ys: &[BlockQ8K]) -> Res
     }
 }
 
-#[inline(always)]
-pub(crate) fn vec_dot_q5k_q8k(n: usize, xs: &[BlockQ5K], ys: &[BlockQ8K]) -> Result<f32> {
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(crate) unsafe fn vec_dot_q5k_q8k(n: usize, xs: &[BlockQ5K], ys: &[BlockQ8K]) -> Result<f32> {
     if !n.is_multiple_of(QK_K) {
         crate::bail!("vec_dot_q5k_q8k: {n} is not divisible by {QK_K}")
     }
@@ -761,8 +788,8 @@ pub(crate) fn vec_dot_q5k_q8k(n: usize, xs: &[BlockQ5K], ys: &[BlockQ8K]) -> Res
         let mut summs = 0.0;
 
         for (x, y) in xs.iter().zip(ys.iter()) {
-            let d = y.d * x.d.to_f32();
-            let dmin = -y.d * x.dmin.to_f32();
+            let d = y.d * f16_to_f32(x.d);
+            let dmin = -y.d * f16_to_f32(x.dmin);
 
             LittleEndian::read_u32_into(&x.scales, &mut utmp[0..3]);
 
@@ -854,8 +881,8 @@ pub(crate) fn vec_dot_q5k_q8k(n: usize, xs: &[BlockQ5K], ys: &[BlockQ8K]) -> Res
     }
 }
 
-#[inline(always)]
-pub(crate) fn vec_dot_q8k_q8k(n: usize, xs: &[BlockQ8K], ys: &[BlockQ8K]) -> Result<f32> {
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(crate) unsafe fn vec_dot_q8k_q8k(n: usize, xs: &[BlockQ8K], ys: &[BlockQ8K]) -> Result<f32> {
     let qk = QK_K;
     if !n.is_multiple_of(qk) {
         crate::bail!("vec_dot_q8k_8k: {n} is not divisible by {qk}")

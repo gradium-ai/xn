@@ -3,7 +3,8 @@ use crate::{Result, Shape};
 use k_quants::*;
 use std::borrow::Cow;
 
-#[cfg(target_feature = "avx")]
+// Compiled on every x86 build; its kernels run only when [`avx2_fma`] says the CPU has them.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[allow(unsafe_op_in_unsafe_fn)]
 pub mod avx;
 pub mod ggml_file;
@@ -21,6 +22,18 @@ pub mod simd128;
 #[allow(unsafe_op_in_unsafe_fn)]
 pub mod utils;
 use half::{bf16, f16};
+
+/// Whether the AVX2/FMA kernels in [`avx`] may run (they also use F16C, which every AVX2
+/// CPU has): detected once at run time, so a baseline x86-64 build still uses them on a CPU
+/// that has them. `is_x86_feature_detected!` is a compile-time `true` when the build already
+/// targets these features.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+pub fn avx2_fma() -> bool {
+    std::is_x86_feature_detected!("avx2")
+        && std::is_x86_feature_detected!("fma")
+        && std::is_x86_feature_detected!("f16c")
+}
 
 pub use k_quants::GgmlType;
 
